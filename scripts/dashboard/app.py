@@ -49,16 +49,19 @@ class RunSummary:
     run_id: str
     name: str
     stage: str
+    kind: str
     latest_checkpoint: str | None
     modified_at: datetime
     metrics: dict[str, float]
     tensorboard_root: str | None
+    event_file: Path | None = None
 
     def to_payload(self) -> dict:
         return {
             "id": self.run_id,
             "name": self.name,
             "stage": self.stage,
+            "kind": self.kind,
             "latest_checkpoint": self.latest_checkpoint,
             "modified_at": self.modified_at.isoformat(),
             "metrics": self.metrics,
@@ -192,9 +195,11 @@ def _iter_run_roots() -> Iterable[Path]:
     for event_file in OUT_ROOT.rglob("events.out.tfevents.*"):
         candidates.add(event_file.parent)
     for ckpt_dir in OUT_ROOT.rglob("checkpoints"):
-        candidates.add(ckpt_dir.parent)
-        if ckpt_dir.parent.parent != OUT_ROOT:
-            candidates.add(ckpt_dir.parent.parent)
+        if ckpt_dir.parent.exists():
+            candidates.add(ckpt_dir.parent)
+        parent = ckpt_dir.parent.parent
+        if parent != OUT_ROOT and parent.exists():
+            candidates.add(parent)
     return sorted(candidates)
 
 
@@ -237,36 +242,91 @@ def _load_scalars(event_path: Path) -> dict[str, list[dict]]:
     return series
 
 
+def _latest_mlx_checkpoint_dir(root: Path) -> Path | None:
+    ckpt_root = root / "checkpoints"
+    if not ckpt_root.exists():
+        return None
+    candidates = [p for p in ckpt_root.iterdir() if p.is_dir() and p.name.startswith("step_")]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _load_mlx_metadata(root: Path) -> dict | None:
+    latest_dir = _latest_mlx_checkpoint_dir(root)
+    if latest_dir is None:
+        return None
+    state = _read_json(latest_dir / "state.json") or {}
+    config = _read_json(latest_dir / "config.json") or {}
+    args = state.get("args", {}) if isinstance(state, dict) else {}
+    model = config if isinstance(config, dict) else {}
+    return {
+        "step": state.get("step"),
+        "seen_tokens": state.get("seen_tokens"),
+        "checkpoint_dir": str(latest_dir.relative_to(REPO_ROOT)),
+        "task": args.get("task"),
+        "preset": args.get("preset"),
+        "dtype": args.get("dtype"),
+        "seq_len": args.get("seq_len"),
+        "batch_size": args.get("batch_size"),
+        "accum_steps": args.get("accum_steps"),
+        "learning_rate": args.get("learning_rate"),
+        "epochs": args.get("epochs"),
+        "max_steps": args.get("max_steps"),
+        "model": {
+            "hidden_size": model.get("hidden_size"),
+            "num_hidden_layers": model.get("num_hidden_layers"),
+            "num_attention_heads": model.get("num_attention_heads"),
+            "num_key_value_heads": model.get("num_key_value_heads"),
+            "vocab_size": model.get("vocab_size"),
+        },
+    }
+
+
+def _build_run_summary(root: Path) -> RunSummary | None:
+    if not root.exists():
+        return None
+    latest = _latest_checkpoint(root)
+    event_file = _find_event_file(root)
+    mlx = _load_mlx_metadata(root)
+    if not latest and not event_file and not mlx:
+        return None
+    metrics: dict[str, float] = {}
+    if event_file:
+        scalars = _load_scalars(event_file)
+        for key, values in scalars.items():
+            if values:
+                metrics[key] = values[-1]["value"]
+    if mlx:
+        if mlx.get("step") is not None:
+            metrics["step"] = float(mlx["step"])
+        if mlx.get("seen_tokens") is not None:
+            metrics["seen_tokens"] = float(mlx["seen_tokens"])
+    try:
+        modified = datetime.fromtimestamp(root.stat().st_mtime)
+    except FileNotFoundError:
+        return None
+    stage = mlx.get("task") if mlx and mlx.get("task") else _infer_stage(root)
+    return RunSummary(
+        run_id=str(root.relative_to(REPO_ROOT)),
+        name=root.name,
+        stage=stage,
+        kind="mlx" if mlx else "torch",
+        latest_checkpoint=str(latest.relative_to(REPO_ROOT)) if latest else None,
+        modified_at=modified,
+        metrics=metrics,
+        tensorboard_root=str(event_file.parent.relative_to(REPO_ROOT)) if event_file else None,
+        event_file=event_file,
+    )
+
+
 def _summaries() -> list[RunSummary]:
     runs: list[RunSummary] = []
     for root in _iter_run_roots():
-        if not root.exists():
-            continue
-        latest = _latest_checkpoint(root)
-        event_file = _find_event_file(root)
-        if not latest and not event_file:
-            continue
-        metrics: dict[str, float] = {}
-        if event_file:
-            scalars = _load_scalars(event_file)
-            for key, values in scalars.items():
-                if values:
-                    metrics[key] = values[-1]["value"]
-        try:
-            modified = datetime.fromtimestamp(root.stat().st_mtime)
-        except FileNotFoundError:
-            continue
-        runs.append(
-            RunSummary(
-                run_id=str(root.relative_to(REPO_ROOT)),
-                name=root.name,
-                stage=_infer_stage(root),
-                latest_checkpoint=str(latest.relative_to(REPO_ROOT)) if latest else None,
-                modified_at=modified,
-                metrics=metrics,
-                tensorboard_root=str(event_file.parent.relative_to(REPO_ROOT)) if event_file else None,
-            )
-        )
+        summary = _build_run_summary(root)
+        if summary:
+            runs.append(summary)
     runs.sort(key=lambda r: r.modified_at, reverse=True)
     return runs
 
@@ -289,6 +349,16 @@ def _load_configs() -> list[dict]:
             }
         )
     return configs
+
+
+def _read_json(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def create_app() -> Flask:
@@ -342,6 +412,20 @@ def create_app() -> Flask:
     @app.route("/api/runs")
     def runs():
         return jsonify([run.to_payload() for run in _summaries()])
+
+    @app.route("/api/runs/<path:run_id>")
+    def run_detail(run_id: str):
+        run_path = (REPO_ROOT / run_id).resolve()
+        if REPO_ROOT not in run_path.parents and run_path != REPO_ROOT:
+            return jsonify({"error": "Run path outside repository"}), 400
+        summary = _build_run_summary(run_path)
+        if not summary:
+            return jsonify({"error": "Run not found"}), 404
+        scalars: dict[str, list[dict]] = {}
+        if summary.event_file:
+            scalars = _load_scalars(summary.event_file)
+        mlx = _load_mlx_metadata(run_path)
+        return jsonify({"run": summary.to_payload(), "mlx": mlx, "scalars": scalars})
 
     @app.route("/api/runs/<path:run_id>/scalars")
     def run_scalars(run_id: str):
