@@ -26,6 +26,7 @@ DATASET_ROOT = REPO_ROOT / "dataset"
 OUT_ROOT = REPO_ROOT / "out"
 CONFIG_ROOT = REPO_ROOT / "configs" / "dashboard"
 JOBS_ROOT = OUT_ROOT / "dashboard_jobs"
+JOBS_DB_PATH = JOBS_ROOT / "jobs.json"
 
 
 DATA_EXTS = {".jsonl", ".json", ".csv", ".txt"}
@@ -384,6 +385,57 @@ def _ensure_jobs_root() -> None:
     JOBS_ROOT.mkdir(parents=True, exist_ok=True)
 
 
+def _persist_jobs_locked() -> None:
+    _ensure_jobs_root()
+    payload = {job_id: job.to_payload() for job_id, job in _JOBS.items()}
+    tmp = JOBS_DB_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(JOBS_DB_PATH)
+
+
+def _persist_jobs() -> None:
+    with _JOBS_LOCK:
+        _persist_jobs_locked()
+
+
+def _load_jobs_from_disk() -> None:
+    _ensure_jobs_root()
+    if not JOBS_DB_PATH.exists():
+        return
+    try:
+        raw = json.loads(JOBS_DB_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not isinstance(raw, dict):
+        return
+    loaded: dict[str, TrainingJob] = {}
+    for job_id, item in raw.items():
+        if not isinstance(job_id, str) or not isinstance(item, dict):
+            continue
+        try:
+            loaded[job_id] = TrainingJob(
+                job_id=job_id,
+                config_path=str(item.get("config_path") or ""),
+                stage=str(item.get("stage") or ""),
+                kind=str(item.get("kind") or ""),
+                command=list(item.get("command") or []),
+                run_id=item.get("run_id"),
+                log_path=str(item.get("log_path") or ""),
+                created_at=str(item.get("created_at") or ""),
+                started_at=item.get("started_at"),
+                finished_at=item.get("finished_at"),
+                pid=item.get("pid"),
+                return_code=item.get("return_code"),
+                state=str(item.get("state") or "queued"),
+                stop_requested=bool(item.get("stop_requested") or False),
+            )
+        except Exception:
+            continue
+    with _JOBS_LOCK:
+        _JOBS.clear()
+        _JOBS.update(loaded)
+
+
 def _tail_text(path: Path, *, max_bytes: int = 96_000) -> str:
     if not path.exists():
         return ""
@@ -543,6 +595,7 @@ def _watch_process(job_id: str, proc: subprocess.Popen) -> None:
             job.state = "canceled"
         else:
             job.state = "succeeded" if code == 0 else "failed"
+        _persist_jobs_locked()
 
 
 def _start_subprocess(job: "TrainingJob", cmd: list[str], env: dict[str, str]) -> None:
@@ -550,6 +603,12 @@ def _start_subprocess(job: "TrainingJob", cmd: list[str], env: dict[str, str]) -
     log_path = _resolve_repo_path(job.log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_handle = log_path.open("a", encoding="utf-8")
+    header = f"[dashboard] job_id={job.job_id} stage={job.stage} created_at={job.created_at}\n"
+    try:
+        log_handle.write(header)
+        log_handle.flush()
+    except Exception:
+        pass
 
     def preexec() -> None:
         os.setsid()
@@ -569,6 +628,7 @@ def _start_subprocess(job: "TrainingJob", cmd: list[str], env: dict[str, str]) -
         except Exception:
             with _JOBS_LOCK:
                 _JOBS.pop(job.job_id, None)
+                _persist_jobs_locked()
             raise
     finally:
         log_handle.close()
@@ -577,6 +637,7 @@ def _start_subprocess(job: "TrainingJob", cmd: list[str], env: dict[str, str]) -
         job.pid = proc.pid
         job.started_at = _now()
         job.state = "running"
+        _persist_jobs_locked()
     threading.Thread(target=_watch_process, args=(job.job_id, proc), daemon=True).start()
 
 
@@ -761,6 +822,7 @@ def create_app() -> Flask:
         template_folder=str(BASE_DIR / "templates"),
         static_folder=str(BASE_DIR / "static"),
     )
+    _load_jobs_from_disk()
 
     @app.route("/")
     def index() -> str:
@@ -768,7 +830,9 @@ def create_app() -> Flask:
 
     @app.route("/static/<path:filename>")
     def static_assets(filename: str):  # type: ignore[override]
-        return send_from_directory(app.static_folder, filename)
+        res = send_from_directory(app.static_folder, filename, max_age=0)
+        res.headers["Cache-Control"] = "no-store, max-age=0"
+        return res
 
     @app.route("/api/overview")
     def overview():
@@ -886,16 +950,43 @@ def create_app() -> Flask:
             proc = _JOB_PROCS.get(job_id)
             if job:
                 job.stop_requested = True
+                _persist_jobs_locked()
         if not job:
             return jsonify({"error": "Job not found"}), 404
+        pid = None
         if proc and proc.poll() is None:
-            try:
+            pid = proc.pid
+        elif job.pid:
+            pid = int(job.pid)
+
+        if pid:
+            def _send(sig: int) -> None:
                 if os.name != "nt":
-                    os.killpg(proc.pid, signal.SIGTERM)
-                else:
-                    proc.terminate()
-            except Exception:
-                pass
+                    try:
+                        os.killpg(pid, sig)
+                        return
+                    except Exception:
+                        pass
+                try:
+                    os.kill(pid, sig)
+                except Exception:
+                    pass
+
+            # Prefer SIGINT because scripts/run_mlx.sh traps INT.
+            _send(signal.SIGINT)
+            time.sleep(0.6)
+            if _pid_alive(pid):
+                _send(signal.SIGTERM)
+            time.sleep(0.6)
+            if _pid_alive(pid):
+                _send(signal.SIGKILL)
+
+            with _JOBS_LOCK:
+                job = _JOBS.get(job_id)
+                if job and job.pid and not _pid_alive(int(job.pid)):
+                    job.state = "canceled"
+                    job.finished_at = _now()
+                    _persist_jobs_locked()
         return jsonify(job.to_payload())
 
     return app

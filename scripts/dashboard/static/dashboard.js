@@ -463,9 +463,17 @@ async function refreshAll() {
 }
 
 async function refreshRunsAndJobs() {
-  const [jobs, runs] = await Promise.all([fetchJSON('/api/jobs'), fetchJSON('/api/runs')]);
-  renderJobs(jobs);
-  renderRuns(runs);
+  const [jobsRes, runsRes] = await Promise.allSettled([fetchJSON('/api/jobs'), fetchJSON('/api/runs')]);
+  if (jobsRes.status === 'fulfilled') {
+    renderJobs(jobsRes.value);
+  } else {
+    renderJobs([]);
+  }
+  if (runsRes.status === 'fulfilled') {
+    renderRuns(runsRes.value);
+  } else {
+    renderRuns([]);
+  }
 }
 
 function setupNav() {
@@ -517,6 +525,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupSnapshotBuilder();
   setupRunsPanel();
   await refreshAll();
-  await refreshRunsAndJobs();
+  refreshRunsAndJobs().catch(() => {});
   startAutoRefresh();
 });
