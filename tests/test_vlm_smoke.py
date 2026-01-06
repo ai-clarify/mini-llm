@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
 import torch
 from PIL import Image
 from torch.utils.data import DataLoader
@@ -12,6 +13,12 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+pytest.importorskip(
+    "mlx.core",
+    reason="libmlx.so not available in the current environment; skipping VLM smoke tests.",
+    exc_type=ImportError,
+)
 
 from dataset.vlm_dataset import VLMDataset
 from model.model_vlm import VLMConfig

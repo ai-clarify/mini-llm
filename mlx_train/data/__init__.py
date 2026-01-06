@@ -58,6 +58,33 @@ def shuffle_stream(
     yield from buf
 
 
+def _encode_sample(obj: Dict[str, Any], *, tokenizer, task: str) -> List[int]:
+    if "ids" in obj:
+        return [int(t) for t in cast(Sequence[Any], obj["ids"])]
+
+    if task == "pretrain":
+        if "text" in obj:
+            text = str(obj["text"])
+        elif "conversations" in obj:
+            conversations = cast(Sequence[Dict[str, Any]], obj["conversations"])
+            text = tokenizer.apply_chat_template(conversations, tokenize=False, add_generation_prompt=False)
+        else:
+            text = json.dumps(obj, ensure_ascii=False)
+        return tokenizer.encode(text, add_special_tokens=False)
+
+    if task == "sft":
+        if "conversations" not in obj:
+            raise ValueError("SFT task expects JSONL lines with a `conversations` field.")
+        prompt = tokenizer.apply_chat_template(
+            cast(Sequence[Dict[str, Any]], obj["conversations"]),
+            tokenize=False,
+            add_generation_prompt=False,
+        )
+        return tokenizer.encode(prompt, add_special_tokens=False)
+
+    raise ValueError(f"Unknown task: {task}")
+
+
 def _pad_or_truncate(ids: List[int], *, length: int, pad_id: int) -> List[int]:
     if len(ids) >= length:
         return ids[:length]
@@ -179,6 +206,7 @@ def _pick_bucket(seq_len: int, buckets: Sequence[int]) -> int:
 def make_batch_iterator(
     *,
     paths: Sequence[str],
+    pretokenized: Optional[Sequence[Dict[str, Any]]] = None,
     tokenizer,
     task: str,
     seq_len: int,
@@ -196,7 +224,7 @@ def make_batch_iterator(
         bos_id = tokenizer.encode(f"{tokenizer.bos_token}assistant", add_special_tokens=False)
         eos_id = tokenizer.encode(f"{tokenizer.eos_token}", add_special_tokens=False)
 
-    stream: Iterable[Dict[str, Any]] = iter_jsonl(paths)
+    stream: Iterable[Dict[str, Any]] = pretokenized if pretokenized is not None else iter_jsonl(paths)
     stream = shuffle_stream(stream, buffer_size=shuffle_buffer, seed=seed)
 
     cur_x: List[List[int]] = []
@@ -204,40 +232,17 @@ def make_batch_iterator(
     cur_m: List[List[int]] = []
 
     for obj in stream:
+        ids = _encode_sample(obj, tokenizer=tokenizer, task=task)
         if task == "pretrain":
-            if "ids" in obj:
-                ids = [int(t) for t in cast(Sequence[Any], obj["ids"])]
-                x, y, m = tokenize_pretrain_from_ids(ids=ids, seq_len=seq_len, pad_id=pad_id)
-            else:
-                if "text" in obj:
-                    text = str(obj["text"])
-                elif "conversations" in obj:
-                    conversations = cast(Sequence[Dict[str, Any]], obj["conversations"])
-                    text = tokenizer.apply_chat_template(conversations, tokenize=False, add_generation_prompt=False)
-                else:
-                    text = json.dumps(obj, ensure_ascii=False)
-                x, y, m = tokenize_pretrain_sample(tokenizer=tokenizer, text=text, seq_len=seq_len, pad_id=pad_id)
+            x, y, m = tokenize_pretrain_from_ids(ids=ids, seq_len=seq_len, pad_id=pad_id)
         elif task == "sft":
-            if "ids" in obj:
-                ids = [int(t) for t in cast(Sequence[Any], obj["ids"])]
-                x, y, m = tokenize_sft_from_ids(
-                    ids=ids,
-                    seq_len=seq_len,
-                    pad_id=pad_id,
-                    bos_id=bos_id or [],
-                    eos_id=eos_id or [],
-                )
-            else:
-                if "conversations" not in obj:
-                    raise ValueError("SFT task expects JSONL lines with a `conversations` field.")
-                x, y, m = tokenize_sft_sample(
-                    tokenizer=tokenizer,
-                    conversations=cast(Sequence[Dict[str, Any]], obj["conversations"]),
-                    seq_len=seq_len,
-                    pad_id=pad_id,
-                    bos_id=bos_id or [],
-                    eos_id=eos_id or [],
-                )
+            x, y, m = tokenize_sft_from_ids(
+                ids=ids,
+                seq_len=seq_len,
+                pad_id=pad_id,
+                bos_id=bos_id or [],
+                eos_id=eos_id or [],
+            )
         else:
             raise ValueError(f"Unknown task: {task}")
 
@@ -263,6 +268,7 @@ def make_microbatch_iterator(
     bucket_sizes: Optional[Sequence[int]] = None,
     return_label_positions: bool = False,
     label_bucket_sizes: Optional[Sequence[int]] = None,
+    pretokenized: Optional[Sequence[Dict[str, Any]]] = None,
 ) -> Iterator[MicroBatchGroup]:
     """
     Yield groups of `accum_steps` micro-batches with the same padded `seq_len`.
@@ -324,7 +330,7 @@ def make_microbatch_iterator(
         bos_id = tokenizer.encode(f"{tokenizer.bos_token}assistant", add_special_tokens=False)
         eos_id = tokenizer.encode(f"{tokenizer.eos_token}", add_special_tokens=False)
 
-    stream: Iterable[Dict[str, Any]] = iter_jsonl(paths)
+    stream: Iterable[Dict[str, Any]] = pretokenized if pretokenized is not None else iter_jsonl(paths)
     stream = shuffle_stream(stream, buffer_size=shuffle_buffer, seed=seed)
 
     buffers: Dict[int, List[Tuple[List[int], List[int], List[int]]]] = {b: [] for b in buckets}
@@ -378,36 +384,13 @@ def make_microbatch_iterator(
         )
 
     for obj in stream:
+        ids = _encode_sample(obj, tokenizer=tokenizer, task=task)
+        ids = ids[: max_seq_len + 1]
+        b = _pick_bucket(max(1, len(ids) - 1), buckets)
+
         if task == "pretrain":
-            if "ids" in obj:
-                ids = [int(t) for t in cast(Sequence[Any], obj["ids"])]
-            else:
-                if "text" in obj:
-                    text = str(obj["text"])
-                elif "conversations" in obj:
-                    conversations = cast(Sequence[Dict[str, Any]], obj["conversations"])
-                    text = tokenizer.apply_chat_template(conversations, tokenize=False, add_generation_prompt=False)
-                else:
-                    text = json.dumps(obj, ensure_ascii=False)
-                ids = tokenizer.encode(text, add_special_tokens=False)
-            # Clip to max length upfront to avoid pathological long samples.
-            ids = ids[: max_seq_len + 1]
-            b = _pick_bucket(max(1, len(ids) - 1), buckets)
             x, y, m = tokenize_pretrain_from_ids(ids=ids, seq_len=int(b), pad_id=pad_id)
         elif task == "sft":
-            if "ids" in obj:
-                ids = [int(t) for t in cast(Sequence[Any], obj["ids"])]
-            else:
-                if "conversations" not in obj:
-                    raise ValueError("SFT task expects JSONL lines with a `conversations` field.")
-                prompt = tokenizer.apply_chat_template(
-                    cast(Sequence[Dict[str, Any]], obj["conversations"]),
-                    tokenize=False,
-                    add_generation_prompt=False,
-                )
-                ids = tokenizer.encode(prompt, add_special_tokens=False)
-            ids = ids[: max_seq_len + 1]
-            b = _pick_bucket(max(1, len(ids) - 1), buckets)
             x, y, m = tokenize_sft_from_ids(
                 ids=ids,
                 seq_len=int(b),
@@ -486,3 +469,21 @@ def make_microbatch_iterator(
                 ys.append([t[1] for t in chunk])
                 ms.append([t[2] for t in chunk])
             yield MicroBatchGroup(seq_len=int(b), micro_batches=int(micro_batches), x=xs, y=ys, loss_mask=ms)
+
+
+def pretokenize_jsonl(
+    *,
+    paths: Sequence[str],
+    tokenizer,
+    task: str,
+) -> List[Dict[str, Any]]:
+    """
+    Pre-tokenize a JSONL dataset once to avoid repeated text->ids work across epochs.
+
+    Returns a list of {"ids": [...]} items compatible with `make_microbatch_iterator`.
+    """
+    cache: List[Dict[str, Any]] = []
+    for obj in iter_jsonl(paths):
+        ids = _encode_sample(obj, tokenizer=tokenizer, task=task)
+        cache.append({"ids": ids})
+    return cache

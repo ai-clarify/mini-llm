@@ -15,7 +15,7 @@ import mlx.optimizers as optim
 import mlx.utils as mlx_utils
 
 from ..config import MiniLLMConfig, minillm_200mb
-from ..data import make_microbatch_iterator, resolve_jsonl_paths
+from ..data import make_microbatch_iterator, pretokenize_jsonl, resolve_jsonl_paths
 from ..download import resolve_data_path_spec
 from ..models import MiniLLMForCausalLM, count_parameters, parameters_bytes
 from ..optim import make_optimizer
@@ -454,6 +454,12 @@ def main() -> None:
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--shuffle_buffer", type=int, default=2048)
     parser.add_argument(
+        "--cache_tokenized",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pre-tokenize the dataset once and reuse token IDs across epochs (trades RAM for speed).",
+    )
+    parser.add_argument(
         "--keep_last_checkpoints",
         type=int,
         default=3,
@@ -612,6 +618,10 @@ def main() -> None:
         max_download_mb=args.max_download_mb,
     )
     paths = resolve_jsonl_paths(data_spec)
+    cached_dataset = None
+    if args.cache_tokenized:
+        cached_dataset = pretokenize_jsonl(paths=paths, tokenizer=tokenizer, task=args.task)
+        print(f"[data] cached {len(cached_dataset)} tokenized samples for reuse")
 
     cfg = (
         load_config_from_checkpoint(args.resume)
@@ -873,6 +883,7 @@ def main() -> None:
                     bucket_sizes=bucket_sizes,
                     return_label_positions=bool(use_sparse_loss),
                     label_bucket_sizes=label_bucket_sizes,
+                    pretokenized=cached_dataset,
                 )
             )
 
