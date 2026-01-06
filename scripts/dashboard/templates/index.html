@@ -89,8 +89,24 @@
                 <h2>训练运行</h2>
                 <p class="meta">覆盖 PyTorch 与 MLX 任务</p>
               </div>
+              <div class="panel-actions">
+                <button id="refresh-runs" class="ghost">刷新</button>
+              </div>
             </div>
+            <div class="subpanel">
+              <div class="subpanel-head">
+                <h3>训练任务</h3>
+                <div class="meta">从“配置模板”启动后会出现在这里</div>
+              </div>
+              <div id="jobs-list" class="artifact-list compact"></div>
+            </div>
+            <div class="subpanel">
+              <div class="subpanel-head">
+                <h3>运行记录</h3>
+                <div class="meta">读取 out/ 与 TensorBoard 事件</div>
+              </div>
             <div id="runs-list" class="artifact-list"></div>
+            </div>
           </div>
           <div class="panel run-detail">
             <div class="panel-head">
@@ -104,6 +120,16 @@
             <div class="chart-block">
               <canvas id="run-chart" height="200"></canvas>
               <div id="chart-status" class="meta muted"></div>
+            </div>
+            <div class="subpanel">
+              <div class="subpanel-head">
+                <h3>训练状态</h3>
+                <div class="panel-actions">
+                  <button id="stop-job" class="danger ghost" disabled>停止</button>
+                </div>
+              </div>
+              <div id="job-meta" class="meta muted">未选择任务</div>
+              <pre id="job-log" class="log-tail"></pre>
             </div>
           </div>
         </div>

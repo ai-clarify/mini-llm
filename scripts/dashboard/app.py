@@ -2,7 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import signal
+import subprocess
+import sys
+import threading
+import time
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,10 +25,22 @@ DATA_ROOT = REPO_ROOT / "data"
 DATASET_ROOT = REPO_ROOT / "dataset"
 OUT_ROOT = REPO_ROOT / "out"
 CONFIG_ROOT = REPO_ROOT / "configs" / "dashboard"
+JOBS_ROOT = OUT_ROOT / "dashboard_jobs"
 
 
 DATA_EXTS = {".jsonl", ".json", ".csv", ".txt"}
 METRIC_TAGS = ("train/loss", "train/lr", "eval/loss", "train/accuracy", "eval/accuracy")
+
+TRAINING_SCRIPTS = {
+    "pretrain": "trainer/train_pretrain.py",
+    "sft": "trainer/train_full_sft.py",
+    "dpo": "trainer/train_dpo.py",
+}
+
+
+_JOBS_LOCK = threading.Lock()
+_JOBS: dict[str, "TrainingJob"] = {}
+_JOB_PROCS: dict[str, subprocess.Popen] = {}
 
 
 @dataclass
@@ -361,6 +380,295 @@ def _read_json(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+def _ensure_jobs_root() -> None:
+    JOBS_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def _tail_text(path: Path, *, max_bytes: int = 96_000) -> str:
+    if not path.exists():
+        return ""
+    max_bytes = max(1024, int(max_bytes))
+    with path.open("rb") as handle:
+        try:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_bytes), os.SEEK_SET)
+        except OSError:
+            handle.seek(0, os.SEEK_SET)
+        data = handle.read()
+    text = data.decode("utf-8", errors="replace")
+    return text[-200_000:]
+
+
+def _resolve_repo_path(raw: str) -> Path:
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = (REPO_ROOT / candidate).resolve()
+    if REPO_ROOT not in candidate.parents and candidate != REPO_ROOT:
+        raise ValueError(f"Path outside repository: {raw}")
+    return candidate
+
+
+def _choose_device(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value != "auto":
+        return value
+    try:
+        import torch  # type: ignore
+
+        if torch.cuda.is_available():
+            return "cuda:0"
+        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _build_cli_args(args: dict) -> list[str]:
+    argv: list[str] = []
+    for key, value in (args or {}).items():
+        if value is None:
+            continue
+        flag = f"--{key}"
+
+        if key == "device":
+            resolved = _choose_device(str(value))
+            if resolved:
+                argv.extend([flag, resolved])
+            continue
+
+        if isinstance(value, bool):
+            if value:
+                argv.append(flag)
+            continue
+
+        if key == "use_moe":
+            if bool(value):
+                argv.extend([flag, "True"])
+            continue
+
+        argv.extend([flag, str(value)])
+    return argv
+
+
+def _job_state(job_id: str) -> str:
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        proc = _JOB_PROCS.get(job_id)
+    if not job:
+        return "missing"
+    if job.state not in {"queued", "running"}:
+        return job.state
+    if proc is None:
+        if job.pid and _pid_alive(job.pid):
+            return "running"
+        return job.state
+    if proc.poll() is None:
+        return "running"
+    return job.state
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _watch_process(job_id: str, proc: subprocess.Popen) -> None:
+    code = proc.wait()
+    with _JOBS_LOCK:
+        job = _JOBS.get(job_id)
+        _JOB_PROCS.pop(job_id, None)
+        if not job:
+            return
+        job.return_code = int(code) if code is not None else None
+        job.finished_at = _now()
+        if job.stop_requested:
+            job.state = "canceled"
+        else:
+            job.state = "succeeded" if code == 0 else "failed"
+
+
+def _start_subprocess(job: "TrainingJob", cmd: list[str], env: dict[str, str]) -> None:
+    _ensure_jobs_root()
+    log_path = _resolve_repo_path(job.log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = log_path.open("a", encoding="utf-8")
+
+    def preexec() -> None:
+        os.setsid()
+
+    try:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(REPO_ROOT),
+                env=env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                preexec_fn=preexec if os.name != "nt" else None,
+            )
+        except Exception:
+            with _JOBS_LOCK:
+                _JOBS.pop(job.job_id, None)
+            raise
+    finally:
+        log_handle.close()
+    with _JOBS_LOCK:
+        _JOB_PROCS[job.job_id] = proc
+        job.pid = proc.pid
+        job.started_at = _now()
+        job.state = "running"
+    threading.Thread(target=_watch_process, args=(job.job_id, proc), daemon=True).start()
+
+
+@dataclass
+class TrainingJob:
+    job_id: str
+    config_path: str
+    stage: str
+    kind: str
+    command: list[str]
+    run_id: str | None
+    log_path: str
+    created_at: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    pid: int | None = None
+    return_code: int | None = None
+    state: str = "queued"
+    stop_requested: bool = False
+
+    def to_payload(self) -> dict:
+        log_file = _resolve_repo_path(self.log_path)
+        log_updated_at = None
+        try:
+            if log_file.exists():
+                log_updated_at = datetime.fromtimestamp(log_file.stat().st_mtime).isoformat()
+        except Exception:
+            log_updated_at = None
+
+        return {
+            "id": self.job_id,
+            "config_path": self.config_path,
+            "stage": self.stage,
+            "kind": self.kind,
+            "command": self.command,
+            "run_id": self.run_id,
+            "log_path": self.log_path,
+            "log_updated_at": log_updated_at,
+            "created_at": self.created_at,
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "pid": self.pid,
+            "return_code": self.return_code,
+            "state": _job_state(self.job_id),
+            "stop_requested": self.stop_requested,
+        }
+
+
+def _start_training_from_config(config_path: str) -> TrainingJob:
+    path = _resolve_repo_path(config_path)
+    if CONFIG_ROOT not in path.parents:
+        raise ValueError("Config not under configs/dashboard")
+    cfg = _read_json(path)
+    if not cfg:
+        raise ValueError("Invalid config JSON")
+    meta = cfg.get("meta", {}) if isinstance(cfg, dict) else {}
+    stage = meta.get("stage") or "unknown"
+    job_id = uuid.uuid4().hex[:12]
+    created_at = _now()
+    log_path = str((JOBS_ROOT / f"{job_id}.log").relative_to(REPO_ROOT))
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONPATH"] = f"{REPO_ROOT}{os.pathsep}{env.get('PYTHONPATH','')}".rstrip(os.pathsep)
+
+    if stage in TRAINING_SCRIPTS:
+        args = cfg.get("args", {}) if isinstance(cfg.get("args", {}), dict) else {}
+        script = TRAINING_SCRIPTS[stage]
+        cmd = [sys.executable, script] + _build_cli_args(args)
+        run_id = str(Path(str(args.get("out_dir", "out"))))
+        job = TrainingJob(
+            job_id=job_id,
+            config_path=str(path.relative_to(REPO_ROOT)),
+            stage=stage,
+            kind="python",
+            command=cmd,
+            run_id=run_id,
+            log_path=log_path,
+            created_at=created_at,
+        )
+        with _JOBS_LOCK:
+            _JOBS[job.job_id] = job
+        _start_subprocess(job, cmd, env)
+        return job
+
+    if stage == "pipeline":
+        paths = cfg.get("paths", {}) if isinstance(cfg.get("paths", {}), dict) else {}
+        stages = cfg.get("stages", {}) if isinstance(cfg.get("stages", {}), dict) else {}
+        env["PRETRAIN_JSON"] = str(Path(str(paths.get("pretrain_data", "dataset/identity_cn_sample.jsonl"))))
+        env["SFT_JSON"] = str(Path(str(paths.get("sft_data", "data/chinese/identity_conversations.jsonl"))))
+        env["DPO_JSON"] = str(Path(str(paths.get("dpo_data", "dataset/preference_cn_sample.jsonl"))))
+        env["TF_DIR"] = str(Path(str(paths.get("tensorboard_root", "out/logs/dashboard"))))
+        env["OUT_DIR"] = str(Path(str(paths.get("out_dir", "out/pipeline_dashboard"))))
+
+        pretrain = stages.get("pretrain", {}) if isinstance(stages.get("pretrain", {}), dict) else {}
+        env["MODEL_HIDDEN_SIZE"] = str(pretrain.get("hidden_size", 512))
+        env["MODEL_NUM_LAYERS"] = str(pretrain.get("num_hidden_layers", 8))
+
+        def extra_args(block: dict) -> str:
+            extras: list[str] = []
+            for k, v in block.items():
+                if k == "script":
+                    continue
+                if v is None:
+                    continue
+                if k == "use_moe":
+                    if bool(v):
+                        extras.extend([f"--{k}", "True"])
+                    continue
+                if isinstance(v, bool):
+                    if v:
+                        extras.append(f"--{k}")
+                    continue
+                if k == "device":
+                    resolved = _choose_device(str(v))
+                    if resolved:
+                        extras.extend([f"--{k}", resolved])
+                    continue
+                extras.extend([f"--{k}", str(v)])
+            return " ".join(extras)
+
+        env["PRETRAIN_ARGS"] = extra_args(stages.get("pretrain", {}) if isinstance(stages.get("pretrain", {}), dict) else {})
+        env["SFT_ARGS"] = extra_args(stages.get("sft", {}) if isinstance(stages.get("sft", {}), dict) else {})
+        env["DPO_ARGS"] = extra_args(stages.get("dpo", {}) if isinstance(stages.get("dpo", {}), dict) else {})
+
+        cmd = ["bash", "scripts/run.sh"]
+        job = TrainingJob(
+            job_id=job_id,
+            config_path=str(path.relative_to(REPO_ROOT)),
+            stage=stage,
+            kind="bash",
+            command=cmd,
+            run_id=env["OUT_DIR"],
+            log_path=log_path,
+            created_at=created_at,
+        )
+        with _JOBS_LOCK:
+            _JOBS[job.job_id] = job
+        _start_subprocess(job, cmd, env)
+        return job
+
+    raise ValueError(f"Unsupported stage: {stage}")
+
+
 def create_app() -> Flask:
     app = Flask(
         __name__,
@@ -436,6 +744,58 @@ def create_app() -> Flask:
         if not event_file:
             return jsonify({"scalars": {}})
         return jsonify({"scalars": _load_scalars(event_file)})
+
+    @app.route("/api/jobs")
+    def jobs():
+        with _JOBS_LOCK:
+            job_list = [job.to_payload() for job in _JOBS.values()]
+        job_list.sort(key=lambda j: j.get("created_at") or "", reverse=True)
+        return jsonify(job_list)
+
+    @app.route("/api/jobs", methods=["POST"])
+    def jobs_create():
+        payload = request.get_json(force=True) or {}
+        config_path = payload.get("config_path")
+        if not config_path or not isinstance(config_path, str):
+            return jsonify({"error": "Missing config_path"}), 400
+        try:
+            job = _start_training_from_config(config_path)
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 400
+        return jsonify(job.to_payload())
+
+    @app.route("/api/jobs/<job_id>")
+    def jobs_detail(job_id: str):
+        with _JOBS_LOCK:
+            job = _JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        max_bytes = request.args.get("max_bytes", default="96000")
+        try:
+            max_bytes_i = int(max_bytes)
+        except ValueError:
+            max_bytes_i = 96_000
+        tail = _tail_text(_resolve_repo_path(job.log_path), max_bytes=max_bytes_i)
+        return jsonify({"job": job.to_payload(), "log_tail": tail})
+
+    @app.route("/api/jobs/<job_id>/stop", methods=["POST"])
+    def jobs_stop(job_id: str):
+        with _JOBS_LOCK:
+            job = _JOBS.get(job_id)
+            proc = _JOB_PROCS.get(job_id)
+            if job:
+                job.stop_requested = True
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if proc and proc.poll() is None:
+            try:
+                if os.name != "nt":
+                    os.killpg(proc.pid, signal.SIGTERM)
+                else:
+                    proc.terminate()
+            except Exception:
+                pass
+        return jsonify(job.to_payload())
 
     return app
 

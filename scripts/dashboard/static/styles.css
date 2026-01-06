@@ -605,6 +605,10 @@ main {
   gap: 10px;
 }
 
+.artifact-list.compact {
+  gap: 8px;
+}
+
 .artifact-card {
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -629,6 +633,26 @@ main {
   justify-content: space-between;
   align-items: flex-start;
   gap: 16px;
+  margin-bottom: 10px;
+}
+
+.panel-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.subpanel {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--border);
+}
+
+.subpanel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 10px;
   margin-bottom: 10px;
 }
 
@@ -697,6 +721,37 @@ button.primary {
   background: var(--accent);
   color: #fff;
   border-color: var(--accent);
+}
+
+button.ghost {
+  background: transparent;
+}
+
+button.ghost:hover {
+  background: var(--panel-4);
+}
+
+button.danger {
+  border-color: rgba(239, 68, 68, 0.55);
+  color: rgba(239, 68, 68, 0.95);
+}
+
+button.danger:hover {
+  background: rgba(239, 68, 68, 0.12);
+}
+
+.log-tail {
+  margin: 10px 0 0;
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  padding: 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  white-space: pre-wrap;
 }
 
 button.token-btn {
@@ -1258,6 +1313,12 @@ th {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.config-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .config-name {
