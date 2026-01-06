@@ -1,0 +1,22 @@
+{
+  "meta": {
+    "name": "MLX 一键脚本（完整流水线）",
+    "version": "v1",
+    "stage": "mlx_pipeline",
+    "description": "等价于 `bash scripts/run_mlx.sh`：下载数据 -> 预训练 -> SFT -> 推理。"
+  },
+  "script": "scripts/run_mlx.sh",
+  "script_args": [],
+  "train_args": [],
+  "env": {
+    "OUT_DIR": "out/mlx_dashboard",
+    "VENV_DIR": ".venv_mlx",
+    "DATA_DIR": "dataset/minimind",
+    "PRESET": "200mb",
+    "DTYPE": "bfloat16",
+    "KEEP_LAST_CHECKPOINTS": 3,
+    "MAX_DOWNLOAD_MB": 2048,
+    "DOWNLOAD_DPO": 0,
+    "CLEANUP_SMOKE": 0
+  }
+}

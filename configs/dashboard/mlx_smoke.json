@@ -1,0 +1,23 @@
+{
+  "meta": {
+    "name": "MLX 一键脚本（Smoke 跑通）",
+    "version": "v1",
+    "stage": "mlx_pipeline",
+    "description": "等价于 `bash scripts/run_mlx.sh --smoke-test`：极小数据 + 少量步数 + 推理。默认保留输出，便于在仪表盘查看。"
+  },
+  "script": "scripts/run_mlx.sh",
+  "script_args": [
+    "--smoke-test"
+  ],
+  "train_args": [],
+  "env": {
+    "OUT_DIR": "out/mlx_smoke_dashboard",
+    "VENV_DIR": ".venv_mlx",
+    "DATA_DIR": "dataset/minimind",
+    "PRESET": "tiny",
+    "DTYPE": "float32",
+    "KEEP_LAST_CHECKPOINTS": 3,
+    "MAX_DOWNLOAD_MB": 2048,
+    "CLEANUP_SMOKE": 0
+  }
+}

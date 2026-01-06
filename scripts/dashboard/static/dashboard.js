@@ -127,7 +127,8 @@ function renderConfigs(configs) {
     card.className = 'config-card';
     const meta = cfg.content.meta || {};
     const stage = meta.stage || 'pipeline';
-    const runnable = ['pretrain', 'sft', 'dpo', 'pipeline'].includes(stage);
+    const runnable = ['pretrain', 'sft', 'dpo', 'pipeline', 'mlx_pipeline'].includes(stage);
+    const stageLabel = stage === 'mlx_pipeline' ? 'mlx' : stage;
     card.innerHTML = `
       <div class="config-head">
         <div>
@@ -136,7 +137,7 @@ function renderConfigs(configs) {
         </div>
         <div class="config-actions">
           ${runnable ? `<button class="primary start-train" data-config-path="${cfg.path}">开始训练</button>` : ''}
-          <span class="tag">${stage}</span>
+          <span class="tag">${stageLabel}</span>
         </div>
       </div>
       <div class="meta">版本：${meta.version || '未标注'}</div>

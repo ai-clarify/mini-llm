@@ -453,6 +453,37 @@ def _build_cli_args(args: dict) -> list[str]:
     return argv
 
 
+def _build_env_overrides(env_payload: dict | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    if not env_payload:
+        return overrides
+    for key, value in env_payload.items():
+        if not key or not isinstance(key, str):
+            continue
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            overrides[key] = "1" if value else "0"
+        else:
+            overrides[key] = str(value)
+    return overrides
+
+
+def _string_list(value) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("Expected list of strings")
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError("Expected list of strings")
+        if item.strip() == "":
+            continue
+        out.append(item)
+    return out
+
+
 def _job_state(job_id: str) -> str:
     with _JOBS_LOCK:
         job = _JOBS.get(job_id)
@@ -602,6 +633,40 @@ def _start_training_from_config(config_path: str) -> TrainingJob:
             kind="python",
             command=cmd,
             run_id=run_id,
+            log_path=log_path,
+            created_at=created_at,
+        )
+        with _JOBS_LOCK:
+            _JOBS[job.job_id] = job
+        _start_subprocess(job, cmd, env)
+        return job
+
+    if stage == "mlx_pipeline":
+        script = str(cfg.get("script") or "scripts/run_mlx.sh")
+        script_path = _resolve_repo_path(script)
+        if script_path != (REPO_ROOT / "scripts" / "run_mlx.sh"):
+            raise ValueError("Only scripts/run_mlx.sh is supported for mlx_pipeline")
+
+        script_args = _string_list(cfg.get("script_args"))
+        train_args = _string_list(cfg.get("train_args"))
+        env_overrides = cfg.get("env", {}) if isinstance(cfg.get("env", {}), dict) else {}
+        env.update(_build_env_overrides(env_overrides))
+
+        cmd = ["bash", "scripts/run_mlx.sh", *script_args]
+        if train_args:
+            cmd.extend(["--", *train_args])
+
+        out_dir = env.get("OUT_DIR")
+        if not out_dir:
+            out_dir = "out/mlx_smoke" if "--smoke-test" in script_args else "out/mlx"
+
+        job = TrainingJob(
+            job_id=job_id,
+            config_path=str(path.relative_to(REPO_ROOT)),
+            stage=stage,
+            kind="bash",
+            command=cmd,
+            run_id=out_dir,
             log_path=log_path,
             created_at=created_at,
         )
