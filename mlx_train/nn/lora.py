@@ -169,7 +169,7 @@ def apply_lora(
     if cfg.r <= 0:
         return 0
 
-    targets: Set[str] = set(cfg.target_modules)
+    targets: Set[str] = {t.split(".")[-1] for t in cfg.target_modules if t}
     to_replace: List[Tuple[str, nn.Linear]] = []
     for name, mod in model.named_modules():
         if not isinstance(mod, nn.Linear):
@@ -186,6 +186,12 @@ def apply_lora(
 
     if verbose and to_replace:
         uniq = sorted({n.split(".")[-1] for n, _ in to_replace})
-        print(f"[lora] enabled r={cfg.r} alpha={cfg.alpha} dropout={cfg.dropout} targets={','.join(uniq)}")
+        lora_params = sum(
+            int(mod.lora_A.weight.size + mod.lora_B.weight.size) for mod in iter_lora_linear_modules(model)
+        )
+        print(
+            f"[lora] enabled r={cfg.r} alpha={cfg.alpha} dropout={cfg.dropout} targets={','.join(uniq)} "
+            f"| trainable_params={lora_params / 1e6:.3f}M"
+        )
 
     return len(to_replace)
