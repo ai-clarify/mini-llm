@@ -2,9 +2,7 @@ const sections = document.querySelectorAll('.page-section');
 const navButtons = document.querySelectorAll('.nav-btn');
 const state = {
   runs: [],
-  jobs: [],
   selectedRun: null,
-  selectedJob: null,
 };
 let runChart = null;
 let autoRefreshTimer = null;
@@ -127,7 +125,6 @@ function renderConfigs(configs) {
     card.className = 'config-card';
     const meta = cfg.content.meta || {};
     const stage = meta.stage || 'pipeline';
-    const runnable = ['pretrain', 'sft', 'dpo', 'pipeline', 'mlx_pipeline'].includes(stage);
     const stageLabel = stage === 'mlx_pipeline' ? 'mlx' : stage;
     card.innerHTML = `
       <div class="config-head">
@@ -136,7 +133,6 @@ function renderConfigs(configs) {
           <div class="meta">${cfg.description || '可直接用于训练脚本或 run.sh/MLX 管线'}</div>
         </div>
         <div class="config-actions">
-          ${runnable ? `<button class="primary start-train" data-config-path="${cfg.path}">开始训练</button>` : ''}
           <span class="tag">${stageLabel}</span>
         </div>
       </div>
@@ -146,14 +142,6 @@ function renderConfigs(configs) {
         <pre>${JSON.stringify(cfg.content, null, 2)}</pre>
       </details>
     `;
-    const startBtn = card.querySelector('.start-train');
-    if (startBtn) {
-      startBtn.addEventListener('click', async (ev) => {
-        ev.preventDefault();
-        ev.stopPropagation();
-        await startTraining(cfg.path, startBtn);
-      });
-    }
     grid.appendChild(card);
   });
 }
@@ -162,6 +150,7 @@ function runBadge(run) {
   const parts = [];
   if (run.stage && run.stage !== 'unknown') parts.push(run.stage);
   parts.push(run.kind === 'mlx' ? 'MLX' : 'Torch');
+  if (run.is_active) parts.push('active');
   return parts.join(' · ');
 }
 
@@ -190,7 +179,6 @@ function renderRuns(runs) {
     div.addEventListener('click', () => {
       document.querySelectorAll('#runs-list .list-item').forEach((el) => el.classList.remove('active'));
       div.classList.add('active');
-      state.selectedJob = null;
       state.selectedRun = run.id;
       showRunDetail(run.id);
     });
@@ -200,72 +188,25 @@ function renderRuns(runs) {
     list.appendChild(div);
   });
   const first = list.querySelector('.list-item');
-  if (first && !state.selectedJob && !document.querySelector('#runs-list .list-item.active')) {
+  if (first && !document.querySelector('#runs-list .list-item.active')) {
     first.classList.add('active');
     state.selectedRun = state.runs[0].id;
     showRunDetail(state.runs[0].id);
   }
 }
 
-function jobBadge(job) {
-  const parts = [];
-  if (job.stage) parts.push(job.stage);
-  if (job.kind) parts.push(job.kind);
-  return parts.join(' · ');
-}
-
-function renderJobs(jobs) {
-  state.jobs = jobs || [];
-  const list = document.getElementById('jobs-list');
-  list.innerHTML = '';
-  if (!state.jobs.length) {
-    list.innerHTML = '<div class="meta">暂无任务</div>';
-    return;
-  }
-  state.jobs.forEach((job) => {
-    const div = document.createElement('div');
-    div.className = 'list-item';
-    const stateLabel = job.state || 'unknown';
-    const started = job.started_at ? new Date(job.started_at).toLocaleString() : '未开始';
-    div.innerHTML = `
-      <div class="item-head">
-        <div>
-          <div class="item-title">${job.config_path.split('/').slice(-1)[0]} <span class="pill">${stateLabel}</span></div>
-          <div class="meta">${jobBadge(job)} · ${started}</div>
-        </div>
-        <span class="tag">${job.pid ? `PID ${job.pid}` : ''}</span>
-      </div>
-      <div class="meta">${job.run_id ? `Run: <code>${job.run_id}</code>` : ''}</div>
-    `;
-
-    div.addEventListener('click', () => {
-      document.querySelectorAll('#jobs-list .list-item').forEach((el) => el.classList.remove('active'));
-      div.classList.add('active');
-      state.selectedJob = job.id;
-      state.selectedRun = null;
-      (async () => {
-        await showJobDetail(job.id);
-        if (state.selectedRun) await showRunDetail(state.selectedRun);
-      })();
-    });
-
-    if (state.selectedJob && job.id === state.selectedJob) {
-      div.classList.add('active');
-    }
-    list.appendChild(div);
-  });
-}
-
 function applyRunSummary(detail) {
   const meta = document.getElementById('run-meta');
   const summary = document.getElementById('run-summary');
   const run = detail.run;
-  meta.textContent = `${run.name} · ${runBadge(run)} · ${new Date(run.modified_at).toLocaleString()}`;
+  const lastUpdate = run.last_update_at ? new Date(run.last_update_at).toLocaleString() : '未知';
+  meta.textContent = `${run.name} · ${runBadge(run)} · 最近更新: ${lastUpdate}`;
   const metrics = run.metrics && Object.keys(run.metrics).length
     ? Object.entries(run.metrics).map(([k, v]) => `<span class="pill">${k}: ${fmtMetric(v)}</span>`).join(' ')
     : '<span class="meta">暂无标量</span>';
   summary.innerHTML = `
     <div class="meta">Checkpoint: ${run.latest_checkpoint || '未找到'}</div>
+    <div class="meta">Activity: ${run.is_active ? 'active' : 'idle'} ${run.activity_source ? `(${run.activity_source})` : ''}</div>
     <div class="metric-row">${metrics}</div>
   `;
 }
@@ -278,6 +219,7 @@ function applyMlxSummary(detail) {
     return;
   }
   const parts = [];
+  if (mlx.status && mlx.status !== 'running_or_resumable') parts.push(`状态: ${mlx.status}`);
   if (mlx.task) parts.push(`任务: ${mlx.task}`);
   if (mlx.step !== undefined) parts.push(`步数: ${fmtNumber(mlx.step)}`);
   if (mlx.seen_tokens !== undefined) parts.push(`Seen tokens: ${fmtNumber(mlx.seen_tokens)}`);
@@ -292,7 +234,7 @@ function applyMlxSummary(detail) {
     <div class="pill">MLX 运行</div>
     <div class="meta">${parts.join(' · ')}</div>
     <div class="meta">模型: ${modelBits.join(' / ') || '未知'}</div>
-    <div class="meta">Checkpoint 目录: ${mlx.checkpoint_dir || '未找到'}</div>
+    <div class="meta">Checkpoint 目录: ${mlx.checkpoint_dir || mlx.checkpoint_root || '未找到'}</div>
   `;
 }
 
@@ -343,86 +285,6 @@ async function showRunDetail(runId) {
   }
 }
 
-async function showJobDetail(jobId) {
-  const stopBtn = document.getElementById('stop-job');
-  const metaEl = document.getElementById('job-meta');
-  const logEl = document.getElementById('job-log');
-  if (!jobId) {
-    if (metaEl) metaEl.textContent = '未选择任务';
-    if (logEl) logEl.textContent = '';
-    if (stopBtn) stopBtn.disabled = true;
-    return;
-  }
-  try {
-    const res = await fetchJSON(`/api/jobs/${encodeURIComponent(jobId)}?max_bytes=96000`);
-    const job = res.job;
-    const derived = res.derived || {};
-    const stateLabel = job.state || 'unknown';
-    const bits = [];
-    bits.push(`任务: ${job.config_path}`);
-    bits.push(`状态: ${stateLabel}`);
-    if (job.pid) bits.push(`PID: ${job.pid}`);
-    if (job.started_at) bits.push(`开始: ${new Date(job.started_at).toLocaleString()}`);
-    if (job.finished_at) bits.push(`结束: ${new Date(job.finished_at).toLocaleString()}`);
-    if (job.run_id) bits.push(`Run: ${job.run_id}`);
-    if (metaEl) metaEl.textContent = bits.join(' · ');
-    if (logEl) logEl.textContent = res.log_tail || '';
-
-    if (derived.primary_run_id) {
-      state.selectedRun = derived.primary_run_id;
-    } else if (!state.selectedRun && job.run_id) {
-      state.selectedRun = job.run_id;
-    }
-
-    if (stopBtn) {
-      stopBtn.disabled = !(stateLabel === 'running' || stateLabel === 'queued');
-      stopBtn.onclick = async () => {
-        stopBtn.disabled = true;
-        try {
-          await fetchJSON(`/api/jobs/${encodeURIComponent(jobId)}/stop`, { method: 'POST' });
-          await refreshRunsAndJobs();
-          await showJobDetail(jobId);
-        } catch (err) {
-          alert(`停止失败：${err.message}`);
-        }
-      };
-    }
-  } catch (err) {
-    if (metaEl) metaEl.textContent = `任务加载失败: ${err.message}`;
-    if (logEl) logEl.textContent = '';
-    if (stopBtn) stopBtn.disabled = true;
-  }
-}
-
-async function startTraining(configPath, btnEl) {
-  if (!configPath) return;
-  const btn = btnEl || null;
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = '启动中...';
-  }
-  try {
-    const job = await fetchJSON('/api/jobs', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ config_path: configPath }),
-    });
-    switchSection('runs');
-    state.selectedJob = job.id;
-    state.selectedRun = null;
-    await refreshRunsAndJobs();
-    await showJobDetail(job.id);
-    if (state.selectedRun) await showRunDetail(state.selectedRun);
-  } catch (err) {
-    alert(`启动失败：${err.message}`);
-  } finally {
-    if (btn) {
-      btn.disabled = false;
-      btn.textContent = '开始训练';
-    }
-  }
-}
-
 async function buildSnapshot() {
   const btn = document.getElementById('build-snapshot');
   const selected = Array.from(document.querySelectorAll('input[type="checkbox"][data-path]:checked')).map((el) => el.dataset.path);
@@ -462,18 +324,9 @@ async function refreshAll() {
   renderRuns(runs);
 }
 
-async function refreshRunsAndJobs() {
-  const [jobsRes, runsRes] = await Promise.allSettled([fetchJSON('/api/jobs'), fetchJSON('/api/runs')]);
-  if (jobsRes.status === 'fulfilled') {
-    renderJobs(jobsRes.value);
-  } else {
-    renderJobs([]);
-  }
-  if (runsRes.status === 'fulfilled') {
-    renderRuns(runsRes.value);
-  } else {
-    renderRuns([]);
-  }
+async function refreshRuns() {
+  const runs = await fetchJSON('/api/runs');
+  renderRuns(runs);
 }
 
 function setupNav() {
@@ -494,8 +347,7 @@ function setupRunsPanel() {
       refreshBtn.disabled = true;
       refreshBtn.textContent = '刷新中...';
       try {
-        await refreshRunsAndJobs();
-        if (state.selectedJob) await showJobDetail(state.selectedJob);
+        await refreshRuns();
         if (state.selectedRun) await showRunDetail(state.selectedRun);
       } finally {
         refreshBtn.disabled = false;
@@ -511,8 +363,7 @@ function startAutoRefresh() {
     const active = document.querySelector('.page-section.active');
     if (!active || active.dataset.section !== 'runs') return;
     try {
-      await refreshRunsAndJobs();
-      if (state.selectedJob) await showJobDetail(state.selectedJob);
+      await refreshRuns();
       if (state.selectedRun) await showRunDetail(state.selectedRun);
     } catch (err) {
       // ignore transient refresh errors
@@ -525,6 +376,5 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupSnapshotBuilder();
   setupRunsPanel();
   await refreshAll();
-  refreshRunsAndJobs().catch(() => {});
   startAutoRefresh();
 });

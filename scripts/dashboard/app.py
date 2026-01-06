@@ -31,6 +31,7 @@ JOBS_DB_PATH = JOBS_ROOT / "jobs.json"
 
 DATA_EXTS = {".jsonl", ".json", ".csv", ".txt"}
 METRIC_TAGS = ("train/loss", "train/lr", "eval/loss", "train/accuracy", "eval/accuracy")
+ACTIVE_WINDOW_SECONDS = 30
 
 TRAINING_SCRIPTS = {
     "pretrain": "trainer/train_pretrain.py",
@@ -72,6 +73,9 @@ class RunSummary:
     kind: str
     latest_checkpoint: str | None
     modified_at: datetime
+    last_update_at: datetime
+    is_active: bool
+    activity_source: str | None
     metrics: dict[str, float]
     tensorboard_root: str | None
     event_file: Path | None = None
@@ -84,6 +88,9 @@ class RunSummary:
             "kind": self.kind,
             "latest_checkpoint": self.latest_checkpoint,
             "modified_at": self.modified_at.isoformat(),
+            "last_update_at": self.last_update_at.isoformat(),
+            "is_active": self.is_active,
+            "activity_source": self.activity_source,
             "metrics": self.metrics,
             "tensorboard_root": self.tensorboard_root,
         }
@@ -274,16 +281,24 @@ def _latest_mlx_checkpoint_dir(root: Path) -> Path | None:
 
 
 def _load_mlx_metadata(root: Path) -> dict | None:
+    ckpt_root = root / "checkpoints"
+    if not ckpt_root.exists():
+        return None
     latest_dir = _latest_mlx_checkpoint_dir(root)
     if latest_dir is None:
-        return None
+        return {
+            "status": "waiting_for_first_checkpoint",
+            "checkpoint_root": str(ckpt_root.relative_to(REPO_ROOT)),
+        }
     state = _read_json(latest_dir / "state.json") or {}
     config = _read_json(latest_dir / "config.json") or {}
     args = state.get("args", {}) if isinstance(state, dict) else {}
     model = config if isinstance(config, dict) else {}
     return {
+        "status": "running_or_resumable",
         "step": state.get("step"),
         "seen_tokens": state.get("seen_tokens"),
+        "checkpoint_root": str(ckpt_root.relative_to(REPO_ROOT)),
         "checkpoint_dir": str(latest_dir.relative_to(REPO_ROOT)),
         "task": args.get("task"),
         "preset": args.get("preset"),
@@ -304,13 +319,33 @@ def _load_mlx_metadata(root: Path) -> dict | None:
     }
 
 
+def _activity_from_paths(paths: dict[str, Path | None]) -> tuple[datetime, str | None]:
+    best_ts = None
+    best_source = None
+    for source, path in paths.items():
+        if not path:
+            continue
+        try:
+            ts = path.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if best_ts is None or ts > best_ts:
+            best_ts = ts
+            best_source = source
+    if best_ts is None:
+        return datetime.utcnow(), None
+    return datetime.fromtimestamp(best_ts), best_source
+
+
 def _build_run_summary(root: Path) -> RunSummary | None:
     if not root.exists():
         return None
     latest = _latest_checkpoint(root)
     event_file = _find_event_file(root)
     mlx = _load_mlx_metadata(root)
-    if not latest and not event_file and not mlx:
+    mlx_ckpt_root = root / "checkpoints"
+    is_mlx = mlx is not None or mlx_ckpt_root.exists()
+    if not latest and not event_file and not is_mlx:
         return None
     metrics: dict[str, float] = {}
     if event_file:
@@ -328,13 +363,27 @@ def _build_run_summary(root: Path) -> RunSummary | None:
     except FileNotFoundError:
         return None
     stage = mlx.get("task") if mlx and mlx.get("task") else _infer_stage(root)
+
+    last_update_at, source = _activity_from_paths(
+        {
+            "tensorboard": event_file,
+            "checkpoint": latest,
+            "mlx_checkpoint": _latest_mlx_checkpoint_dir(root),
+            "mlx_checkpoint_root": mlx_ckpt_root if mlx_ckpt_root.exists() else None,
+            "dir": root,
+        }
+    )
+    is_active = (time.time() - last_update_at.timestamp()) < ACTIVE_WINDOW_SECONDS
     return RunSummary(
         run_id=str(root.relative_to(REPO_ROOT)),
         name=root.name,
         stage=stage,
-        kind="mlx" if mlx else "torch",
+        kind="mlx" if is_mlx else "torch",
         latest_checkpoint=str(latest.relative_to(REPO_ROOT)) if latest else None,
         modified_at=modified,
+        last_update_at=last_update_at,
+        is_active=is_active,
+        activity_source=source,
         metrics=metrics,
         tensorboard_root=str(event_file.parent.relative_to(REPO_ROOT)) if event_file else None,
         event_file=event_file,
