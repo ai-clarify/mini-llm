@@ -509,6 +509,27 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _infer_mlx_pipeline_stage(log_tail: str) -> str | None:
+    if not log_tail:
+        return None
+    markers = [
+        ("[stage] pretrain", "pretrain"),
+        ("[stage] sft", "sft"),
+        ("[stage] infer", "infer"),
+        ("[done] MLX pipeline finished.", "done"),
+        ("[abort] Interrupted", "aborted"),
+    ]
+    last_pos = -1
+    last_stage: str | None = None
+    lower = log_tail.lower()
+    for needle, stage in markers:
+        pos = lower.rfind(needle.lower())
+        if pos > last_pos:
+            last_pos = pos
+            last_stage = stage
+    return last_stage
+
+
 def _watch_process(job_id: str, proc: subprocess.Popen) -> None:
     code = proc.wait()
     with _JOBS_LOCK:
@@ -612,7 +633,7 @@ def _start_training_from_config(config_path: str) -> TrainingJob:
     if not cfg:
         raise ValueError("Invalid config JSON")
     meta = cfg.get("meta", {}) if isinstance(cfg, dict) else {}
-    stage = meta.get("stage") or "unknown"
+    stage = str(meta.get("stage") or "unknown").strip().lower()
     job_id = uuid.uuid4().hex[:12]
     created_at = _now()
     log_path = str((JOBS_ROOT / f"{job_id}.log").relative_to(REPO_ROOT))
@@ -841,7 +862,22 @@ def create_app() -> Flask:
         except ValueError:
             max_bytes_i = 96_000
         tail = _tail_text(_resolve_repo_path(job.log_path), max_bytes=max_bytes_i)
-        return jsonify({"job": job.to_payload(), "log_tail": tail})
+        derived: dict[str, object] = {}
+        if job.stage == "mlx_pipeline" and job.run_id:
+            out_dir = job.run_id
+            associated_runs = [out_dir, f"{out_dir}/pretrain", f"{out_dir}/sft"]
+            current = _infer_mlx_pipeline_stage(tail)
+            primary_run = out_dir
+            if current in {"pretrain", "sft"}:
+                primary_run = f"{out_dir}/{current}"
+            elif current in {"infer", "done"}:
+                primary_run = f"{out_dir}/sft"
+            derived = {
+                "current_stage": current,
+                "associated_runs": associated_runs,
+                "primary_run_id": primary_run,
+            }
+        return jsonify({"job": job.to_payload(), "log_tail": tail, "derived": derived})
 
     @app.route("/api/jobs/<job_id>/stop", methods=["POST"])
     def jobs_stop(job_id: str):

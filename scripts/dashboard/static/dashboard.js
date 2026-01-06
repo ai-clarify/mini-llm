@@ -242,9 +242,11 @@ function renderJobs(jobs) {
       document.querySelectorAll('#jobs-list .list-item').forEach((el) => el.classList.remove('active'));
       div.classList.add('active');
       state.selectedJob = job.id;
-      state.selectedRun = job.run_id || null;
-      showJobDetail(job.id);
-      if (job.run_id) showRunDetail(job.run_id);
+      state.selectedRun = null;
+      (async () => {
+        await showJobDetail(job.id);
+        if (state.selectedRun) await showRunDetail(state.selectedRun);
+      })();
     });
 
     if (state.selectedJob && job.id === state.selectedJob) {
@@ -354,6 +356,7 @@ async function showJobDetail(jobId) {
   try {
     const res = await fetchJSON(`/api/jobs/${encodeURIComponent(jobId)}?max_bytes=96000`);
     const job = res.job;
+    const derived = res.derived || {};
     const stateLabel = job.state || 'unknown';
     const bits = [];
     bits.push(`任务: ${job.config_path}`);
@@ -364,6 +367,12 @@ async function showJobDetail(jobId) {
     if (job.run_id) bits.push(`Run: ${job.run_id}`);
     if (metaEl) metaEl.textContent = bits.join(' · ');
     if (logEl) logEl.textContent = res.log_tail || '';
+
+    if (derived.primary_run_id) {
+      state.selectedRun = derived.primary_run_id;
+    } else if (!state.selectedRun && job.run_id) {
+      state.selectedRun = job.run_id;
+    }
 
     if (stopBtn) {
       stopBtn.disabled = !(stateLabel === 'running' || stateLabel === 'queued');
@@ -400,10 +409,10 @@ async function startTraining(configPath, btnEl) {
     });
     switchSection('runs');
     state.selectedJob = job.id;
-    state.selectedRun = job.run_id || null;
+    state.selectedRun = null;
     await refreshRunsAndJobs();
     await showJobDetail(job.id);
-    if (job.run_id) await showRunDetail(job.run_id);
+    if (state.selectedRun) await showRunDetail(state.selectedRun);
   } catch (err) {
     alert(`启动失败：${err.message}`);
   } finally {
