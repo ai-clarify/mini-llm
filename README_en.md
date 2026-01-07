@@ -81,6 +81,31 @@ MLX checkpoints are stored under `out/mlx`, and the WebUI auto-resolves the late
 
 ---
 
+## 🧪 Distillation (Optional)
+
+### One-click MLX distillation (Ollama teacher)
+
+```bash
+# Start ollama serve and pull a teacher model first (e.g. qwen3:0.6b)
+bash scripts/run_mlx_distill_ollama.sh
+```
+
+Override with environment variables:
+
+```bash
+OLLAMA_MODEL=qwen3:0.6b DATA_JSONL=out/distill_ollama_qwen3_0.6b/synth.jsonl OUT_DIR=out/mlx_distill/qwen3_0.6b_sft \
+  bash scripts/run_mlx_distill_ollama.sh
+```
+
+### PyTorch distillation training
+
+```bash
+# Expects out/full_sft_512.pth (student) and out/full_sft_768.pth (teacher) by default
+python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir out
+```
+
+---
+
 ## 🧪 Inference & Serving
 
 - **OpenAI-compatible API**: `python scripts/serve_openai_api.py` (default port 8998)

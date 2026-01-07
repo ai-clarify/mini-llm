@@ -81,6 +81,31 @@ MLX 产物默认写入 `out/mlx`，WebUI 会自动解析最新 `step_` checkpoin
 
 ---
 
+## 🧪 蒸馏（可选）
+
+### MLX 一键蒸馏（Ollama 教师模型）
+
+```bash
+# 需要先启动 ollama serve，并拉取教师模型（如 qwen3:0.6b）
+bash scripts/run_mlx_distill_ollama.sh
+```
+
+可通过环境变量调整：
+
+```bash
+OLLAMA_MODEL=qwen3:0.6b DATA_JSONL=out/distill_ollama_qwen3_0.6b/synth.jsonl OUT_DIR=out/mlx_distill/qwen3_0.6b_sft \
+  bash scripts/run_mlx_distill_ollama.sh
+```
+
+### PyTorch 蒸馏训练
+
+```bash
+# 默认读取 out/ 中的 full_sft_512.pth（学生）与 full_sft_768.pth（教师）
+python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir out
+```
+
+---
+
 ## 🧪 推理与部署
 
 - **OpenAI 兼容 API**：`python scripts/serve_openai_api.py`（默认端口 8998）
