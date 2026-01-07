@@ -136,8 +136,8 @@ python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir
 - [docs/README.md](./docs/README.md) - Documentation index
 - [docs/booklet_cn.md](./docs/booklet_cn.md) - Full pipeline booklet (CN)
 - [docs/changelog/CHANGELOG.md](./docs/changelog/CHANGELOG.md) - Changelog
-- [ModelScope: MiniLLM-Reasoning](https://www.modelscope.cn/models/gongjy/MiniLLM-Reasoning)
-- [ModelScope: MiniLLM](https://www.modelscope.cn/models/gongjy/MiniLLM)
+- [ModelScope: MiniMind-Reasoning](https://www.modelscope.cn/studios/gongjy/minimind-reasoning)
+- [ModelScope: MiniMind](https://www.modelscope.cn/studios/gongjy/minimind)
 - [Bilibili overview](https://www.bilibili.com/video/BV12dHPeqE72)
 
 ---
