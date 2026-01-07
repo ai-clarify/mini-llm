@@ -37,7 +37,8 @@ Environment overrides (common):
   MLX_SMALL_DATA     Use smaller datasets for reproduction (default: 1)
   PRETRAIN_DATA_SPEC Dataset spec for pretrain (default: minimind:sft_mini_512.jsonl)
   SFT_DATA_SPEC      Dataset spec for SFT (default: minimind:sft_mini_512.jsonl)
-  R1_DATA_SPEC       Dataset spec for R1 stage (default: minimind:r1_mix_1024.jsonl)
+  R1_DATA_SPEC       Dataset spec for R1 stage (default: minimind:r1_mix_1024.jsonl; small mode uses sft_mini_512.jsonl)
+  AUTO_DOWNLOAD      Auto-download datasets when needed (default: 1; auto-disabled when --skip-pretrain is set)
   HF_ENDPOINT        Optional HuggingFace mirror endpoint (e.g. https://hf-mirror.com)
   MAX_DOWNLOAD_MB    Per-file download guard in MB (default: 2048; set 0 to disable).
                     When MLX_SMALL_DATA=0 and MAX_DOWNLOAD_MB is not set, defaults to 0.
@@ -134,6 +135,11 @@ export TRANSFORMERS_VERBOSITY=${TRANSFORMERS_VERBOSITY:-error}
 VENV_DIR=${VENV_DIR:-.venv_mlx}
 DATA_DIR=${DATA_DIR:-dataset/minimind}
 MLX_SMALL_DATA=${MLX_SMALL_DATA:-1}
+AUTO_DOWNLOAD_SET=0
+if [ -n "${AUTO_DOWNLOAD+x}" ]; then
+  AUTO_DOWNLOAD_SET=1
+fi
+AUTO_DOWNLOAD=${AUTO_DOWNLOAD:-1}
 MAX_DOWNLOAD_MB_SET=0
 if [ -n "${MAX_DOWNLOAD_MB+x}" ]; then
   MAX_DOWNLOAD_MB_SET=1
@@ -158,6 +164,12 @@ else
   fi
   DTYPE=${DTYPE:-bfloat16}
   CLEANUP_SMOKE=${CLEANUP_SMOKE:-0}
+fi
+
+if [ "$DOWNLOAD_ONLY" -eq 1 ]; then
+  AUTO_DOWNLOAD=1
+elif [ "$AUTO_DOWNLOAD_SET" -eq 0 ] && [ "$SKIP_PRETRAIN" -eq 1 ] && [ "$INFER_ONLY" -eq 0 ]; then
+  AUTO_DOWNLOAD=0
 fi
 
 PYTHON_CMD=${PYTHON_CMD:-python3}
@@ -263,15 +275,18 @@ else
   if [ "$MLX_SMALL_DATA" = "1" ]; then
     PRETRAIN_DATA_SPEC=${PRETRAIN_DATA_SPEC:-minimind:sft_mini_512.jsonl}
     SFT_DATA_SPEC=${SFT_DATA_SPEC:-minimind:sft_mini_512.jsonl}
+    R1_DATA_SPEC=${R1_DATA_SPEC:-minimind:sft_mini_512.jsonl}
   else
     PRETRAIN_DATA_SPEC=${PRETRAIN_DATA_SPEC:-minimind:pretrain_hq.jsonl}
     SFT_DATA_SPEC=${SFT_DATA_SPEC:-minimind:sft_512.jsonl}
+    R1_DATA_SPEC=${R1_DATA_SPEC:-minimind:r1_mix_1024.jsonl}
   fi
-  R1_DATA_SPEC=${R1_DATA_SPEC:-minimind:r1_mix_1024.jsonl}
 fi
 
 if [ "$INFER_ONLY" -eq 1 ]; then
   echo "[data] Skipping dataset download (--infer-only)"
+elif [ "$AUTO_DOWNLOAD" -eq 0 ]; then
+  echo "[data] Auto download disabled (AUTO_DOWNLOAD=0). Ensure datasets already exist."
 else
   export DATA_DIR MAX_DOWNLOAD_MB HF_ENDPOINT
   echo "[data] Download required datasets"
