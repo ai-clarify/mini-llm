@@ -1,10 +1,15 @@
+import os
 import random
 import re
+import sys
+from pathlib import Path
 from threading import Thread
 
 import torch
 import numpy as np
 import streamlit as st
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 st.set_page_config(page_title="MiniLLM", initial_sidebar_state="collapsed")
 
@@ -69,9 +74,13 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def process_assistant_content(content):
-    if model_source == "API" and 'R1' not in api_model_name:
-        return content
-    if model_source != "API" and 'R1' not in MODEL_PATHS[selected_model][1]:
+    if model_source == "API":
+        if 'R1' not in api_model_name:
+            return content
+    elif model_source == "本地模型":
+        if 'R1' not in MODEL_PATHS[selected_model][1]:
+            return content
+    else:
         return content
 
     if '<think>' in content and '</think>' in content:
@@ -95,18 +104,84 @@ def process_assistant_content(content):
     return content
 
 
+import numpy as np
+
+
 @st.cache_resource
 def load_model_tokenizer(model_path):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    if not os.path.isdir(model_path):
+        raise FileNotFoundError(f"Local model path not found: {model_path}")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        trust_remote_code=True
+        trust_remote_code=True,
+        local_files_only=True,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
-        trust_remote_code=True
+        trust_remote_code=True,
+        local_files_only=True,
     )
     model = model.eval().to(device)
     return model, tokenizer
+
+
+def _resolve_mlx_checkpoint(path: str) -> Path:
+    candidate = Path(path)
+    if candidate.is_file() and candidate.name.endswith(".safetensors"):
+        candidate = candidate.parent
+    if candidate.is_dir() and (candidate / "model.safetensors").is_file():
+        return candidate
+
+    # Try to resolve from an output root (out/mlx style).
+    def _iter_step_dirs(base: Path) -> list[tuple[int, Path]]:
+        if not base.exists() or not base.is_dir():
+            return []
+        out: list[tuple[int, Path]] = []
+        for child in base.iterdir():
+            if not child.is_dir() or not child.name.startswith("step_"):
+                continue
+            try:
+                step = int(child.name.split("_", 1)[1])
+            except ValueError:
+                continue
+            if (child / "model.safetensors").is_file() and (child / "config.json").is_file():
+                out.append((step, child))
+        out.sort(key=lambda x: x[0])
+        return out
+
+    roots = [
+        candidate / "sft" / "checkpoints",
+        candidate / "pretrain" / "checkpoints",
+        candidate / "checkpoints",
+    ]
+    for root in roots:
+        steps = _iter_step_dirs(root)
+        if steps:
+            return steps[-1][1]
+
+    raise FileNotFoundError(f"MLX checkpoint not found under: {path}")
+
+
+@st.cache_resource
+def load_mlx_model_tokenizer(checkpoint_dir: str, tokenizer_path: str):
+    from transformers import AutoTokenizer
+
+    from mlx_train.cli.infer import load_config
+    from mlx_train.models import MiniLLMForCausalLM
+
+    ckpt = _resolve_mlx_checkpoint(checkpoint_dir)
+    cfg = load_config(ckpt)
+    model = MiniLLMForCausalLM(cfg)
+    model.load_weights(os.fspath(ckpt / "model.safetensors"))
+    model.eval()
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_path,
+        local_files_only=os.path.isdir(tokenizer_path),
+    )
+    return model, tokenizer, cfg
 
 
 def clear_chat_messages():
@@ -159,7 +234,7 @@ st.session_state.history_chat_num = st.sidebar.slider("Number of Historical Dial
 st.session_state.max_new_tokens = st.sidebar.slider("Max Sequence Length", 256, 8192, 8192, step=1)
 st.session_state.temperature = st.sidebar.slider("Temperature", 0.6, 1.2, 0.85, step=0.01)
 
-model_source = st.sidebar.radio("选择模型来源", ["本地模型", "API"], index=0)
+model_source = st.sidebar.radio("选择模型来源", ["本地模型", "MLX", "API"], index=1)
 
 if model_source == "API":
     api_url = st.sidebar.text_input("API URL", value="http://127.0.0.1:8000/v1")
@@ -167,6 +242,10 @@ if model_source == "API":
     api_model_name = st.sidebar.text_input("Model Name", value="MiniLLM2")
     api_key = st.sidebar.text_input("API Key", value="none", type="password")
     slogan = f"Hi, I'm {api_model_name}"
+elif model_source == "MLX":
+    mlx_checkpoint = st.sidebar.text_input("MLX Checkpoint/Out Dir", value="out/mlx")
+    mlx_tokenizer_path = st.sidebar.text_input("Tokenizer Path", value="./model")
+    slogan = "Hi, I'm MLX"
 else:
     MODEL_PATHS = {
         "MiniLLM2-R1 (0.1B)": ["../MiniLLM2-R1", "MiniLLM2-R1"],
@@ -206,7 +285,17 @@ def setup_seed(seed):
 
 def main():
     if model_source == "本地模型":
-        model, tokenizer = load_model_tokenizer(model_path)
+        try:
+            model, tokenizer = load_model_tokenizer(model_path)
+        except Exception as e:
+            st.error(f"本地模型加载失败: {e}")
+            model, tokenizer = None, None
+    elif model_source == "MLX":
+        try:
+            model, tokenizer, _ = load_mlx_model_tokenizer(mlx_checkpoint, mlx_tokenizer_path)
+        except Exception as e:
+            st.error(f"MLX 模型加载失败: {e}")
+            model, tokenizer = None, None
     else:
         model, tokenizer = None, None
 
@@ -274,6 +363,39 @@ def main():
                 except Exception as e:
                     answer = f"API调用出错: {str(e)}"
                     placeholder.markdown(answer, unsafe_allow_html=True)
+            elif model_source == "MLX":
+                if model is None or tokenizer is None:
+                    raise RuntimeError("MLX model/tokenizer is not loaded")
+
+                import mlx.core as mx
+
+                from mlx_train.cli.infer import generate as mlx_generate
+
+                random_seed = random.randint(0, 2 ** 32 - 1)
+                mx.random.seed(random_seed)
+
+                st.session_state.chat_messages = system_prompt + st.session_state.chat_messages[
+                    -(st.session_state.history_chat_num + 1):]
+                new_prompt = tokenizer.apply_chat_template(
+                    st.session_state.chat_messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
+                prompt_ids = tokenizer.encode(new_prompt, add_special_tokens=False)
+                out_ids = mlx_generate(
+                    model,
+                    input_ids=prompt_ids,
+                    eos_token_id=tokenizer.eos_token_id,
+                    max_new_tokens=st.session_state.max_new_tokens,
+                    min_new_tokens=0,
+                    banned_token_ids=list(tokenizer.all_special_ids),
+                    temperature=st.session_state.temperature,
+                    top_p=0.85,
+                    max_seq_len=None,
+                )
+                answer = tokenizer.decode(out_ids[len(prompt_ids):], skip_special_tokens=True)
+                placeholder.markdown(process_assistant_content(answer), unsafe_allow_html=True)
+
             else:
                 if model is None or tokenizer is None:
                     raise RuntimeError("Local model/tokenizer is not loaded")
@@ -294,6 +416,8 @@ def main():
                     return_tensors="pt",
                     truncation=True
                 ).to(device)
+
+                from transformers import TextIteratorStreamer
 
                 streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
                 generation_kwargs = {
@@ -326,6 +450,4 @@ def main():
 
 
 if __name__ == "__main__":
-    from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
-
     main()

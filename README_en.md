@@ -224,9 +224,9 @@ python eval_model.py --load 1 --model_mode 2
 
 ```bash
 # May require `python>=3.10`, install with `pip install streamlit`
-# cd scripts
-streamlit run web_demo.py
+streamlit run scripts/web_demo.py
 ```
+
 
 ### (Optional) Third-party Inference Frameworks
 

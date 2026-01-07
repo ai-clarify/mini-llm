@@ -12,4 +12,3 @@ from .models.minillm import (  # noqa: F401
     count_parameters,
     parameters_bytes,
 )
-

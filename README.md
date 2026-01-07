@@ -103,6 +103,12 @@ bash scripts/run_mlx.sh --smoke-test
   - 勾选数据文件并合并成 `out/datasets/<name>/combined.jsonl` 快照，自动写入 manifest；
   - 聚合 `out/` 目录下的 checkpoint、TensorBoard 标量并绘制曲线，便于快速比对训练状态。
 
+### 5. (可选) 启动 WebUI
+
+```bash
+streamlit run scripts/web_demo.py
+```
+
 ---
 
 ## 🧠 模型与特性
