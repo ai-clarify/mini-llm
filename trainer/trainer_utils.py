@@ -1,4 +1,4 @@
-"""Utility helpers shared by the MiniMind VLM training scripts."""
+"""Utility helpers shared by the MiniLLM VLM training scripts."""
 from __future__ import annotations
 
 import math
@@ -12,7 +12,7 @@ import torch.distributed as dist
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer
 
-from model.model_vlm import MiniMindVLM, VLMConfig
+from model.model_vlm import MiniLLMVLM, VLMConfig
 
 
 def is_main_process() -> bool:
@@ -57,7 +57,7 @@ def init_vlm_model(
     freeze_llm: bool = False,
 ):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = MiniMindVLM(vlm_config, vision_model_path=vision_model_path)
+    model = MiniLLMVLM(vlm_config, vision_model_path=vision_model_path)
 
     if from_weight != "none":
         moe_suffix = "_moe" if vlm_config.use_moe else ""

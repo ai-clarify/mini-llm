@@ -134,9 +134,10 @@ fi
 
 OUT_DIR=${OUT_DIR:-out}
 DATA_DIR=${DATA_DIR:-data/processed}
-R1_DATA_DIR=${R1_DATA_DIR:-dataset/minimind}
+MINIMIND_DATA_DIR=${MINIMIND_DATA_DIR:-dataset/minimind}
 RESULTS_FILE=${RESULTS_FILE:-"$TF_DIR/eval_results.jsonl"}
-MAX_DOWNLOAD_MB=${MAX_DOWNLOAD_MB:-2048}
+MAX_DOWNLOAD_MB=${MAX_DOWNLOAD_MB:-0}
+AUTO_DOWNLOAD=${AUTO_DOWNLOAD:-1}
 
 USE_UV=0
 
@@ -288,7 +289,7 @@ fi
 mkdir -p "$TF_DIR" || { echo "[warn] Could not create $TF_DIR directory"; }
 mkdir -p "$OUT_DIR" || { echo "[error] Could not create $OUT_DIR directory" >&2; exit 1; }
 mkdir -p "$DATA_DIR" || { echo "[error] Could not create $DATA_DIR directory" >&2; exit 1; }
-mkdir -p "$R1_DATA_DIR" || { echo "[error] Could not create $R1_DATA_DIR directory" >&2; exit 1; }
+mkdir -p "$MINIMIND_DATA_DIR" || { echo "[error] Could not create $MINIMIND_DATA_DIR directory" >&2; exit 1; }
 
 # PRETRAIN_DEFAULT_ROOT was already set in cloud environment detection above
 if [ -z "${PRETRAIN_DEFAULT_ROOT:-}" ]; then
@@ -346,8 +347,8 @@ if [ ! -s "$R1_JSON" ]; then
     R1_JSON="$PRETRAIN_DEFAULT_ROOT/r1_mix_1024.jsonl"
   elif [ -s "$DATA_DIR/r1_mix_1024.jsonl" ]; then
     R1_JSON="$DATA_DIR/r1_mix_1024.jsonl"
-  elif [ -s "$R1_DATA_DIR/r1_mix_1024.jsonl" ]; then
-    R1_JSON="$R1_DATA_DIR/r1_mix_1024.jsonl"
+  elif [ -s "$MINIMIND_DATA_DIR/r1_mix_1024.jsonl" ]; then
+    R1_JSON="$MINIMIND_DATA_DIR/r1_mix_1024.jsonl"
   fi
 fi
 
@@ -466,12 +467,53 @@ print(f'[cloud] Processing complete: kept {kept_count:,}, removed {removed_count
   fi
 fi
 
-IDENTITY_DATA="data/chinese/identity_conversations.jsonl"
-if [ -f "$IDENTITY_DATA" ]; then
-  echo "[data] Using identity data at $IDENTITY_DATA"
-else
-  echo "[data] Identity data missing at $IDENTITY_DATA" >&2
-  exit 1
+download_minimind_file() {
+  local filename=$1
+  python - <<PY
+import os
+from mlx_train.download import ensure_hf_dataset_file
+
+path = ensure_hf_dataset_file(
+    repo_id=os.environ.get("MINIMIND_DATA_REPO", "jingyaogong/minimind_dataset"),
+    filename="${filename}",
+    data_dir=os.environ.get("MINIMIND_DATA_DIR", "dataset/minimind"),
+    endpoint=os.environ.get("HF_ENDPOINT"),
+    force=False,
+    max_download_mb=int(os.environ.get("MAX_DOWNLOAD_MB", "0")),
+)
+print(path)
+PY
+}
+
+if [ "$AUTO_DOWNLOAD" -eq 1 ]; then
+  if [ ! -s "$PRETRAIN_JSON" ]; then
+    echo "[data] Downloading pretrain_hq.jsonl..."
+    PRETRAIN_JSON=$(download_minimind_file "pretrain_hq.jsonl") || {
+      echo "[error] Failed to download pretrain_hq.jsonl" >&2
+      exit 1
+    }
+  fi
+  if [ ! -s "$SFT_JSON" ]; then
+    echo "[data] Downloading sft_512.jsonl..."
+    SFT_JSON=$(download_minimind_file "sft_512.jsonl") || {
+      echo "[error] Failed to download sft_512.jsonl" >&2
+      exit 1
+    }
+  fi
+  if [ ! -s "$DPO_JSON" ]; then
+    echo "[data] Downloading dpo.jsonl..."
+    DPO_JSON=$(download_minimind_file "dpo.jsonl") || {
+      echo "[error] Failed to download dpo.jsonl" >&2
+      exit 1
+    }
+  fi
+  if [ "$RUN_R1" -eq 1 ] && [ ! -s "$R1_JSON" ]; then
+    echo "[data] Downloading r1_mix_1024.jsonl..."
+    R1_JSON=$(download_minimind_file "r1_mix_1024.jsonl") || {
+      echo "[error] Failed to download r1_mix_1024.jsonl" >&2
+      exit 1
+    }
+  fi
 fi
 
 NEED_LOCAL_DATA=0
@@ -495,32 +537,15 @@ if [ ! -s "$DPO_JSON" ]; then
 fi
 
 if [ "$NEED_LOCAL_DATA" -eq 1 ]; then
-  echo "[data] Building Chinese data mixtures"
-  python scripts/build_chinese_mix.py --output-dir "$DATA_DIR"
-fi
-
-if [ "$RUN_R1" -eq 1 ] && [ ! -s "$R1_JSON" ]; then
-  echo "[data] R1 dataset missing, downloading from minimind_dataset..."
-  if ! R1_JSON=$(python - <<'PY'
-import os
-from mlx_train.download import ensure_hf_dataset_file
-
-data_dir = os.environ.get("R1_DATA_DIR", "dataset/minimind")
-path = ensure_hf_dataset_file(
-    repo_id="jingyaogong/minimind_dataset",
-    filename="r1_mix_1024.jsonl",
-    data_dir=data_dir,
-    endpoint=os.environ.get("HF_ENDPOINT"),
-    force=False,
-    max_download_mb=int(os.environ.get("MAX_DOWNLOAD_MB", "2048")),
-)
-print(path)
-PY
-  ); then
-    echo "[error] Failed to download r1_mix_1024.jsonl" >&2
+  IDENTITY_DATA="data/chinese/identity_conversations.jsonl"
+  if [ -f "$IDENTITY_DATA" ]; then
+    echo "[data] Using identity data at $IDENTITY_DATA"
+  else
+    echo "[data] Identity data missing at $IDENTITY_DATA" >&2
     exit 1
   fi
-  echo "[data] R1 dataset ready: $R1_JSON"
+  echo "[data] Building Chinese data mixtures"
+  python scripts/build_chinese_mix.py --output-dir "$DATA_DIR"
 fi
 
 for path in "$PRETRAIN_JSON" "$SFT_JSON" "$DPO_JSON"; do
@@ -573,7 +598,7 @@ if [ -n "${R1_ARGS:-}" ]; then
   read -r -a EXTRA_R1_ARGS <<<"${R1_ARGS}"
 fi
 
-MODEL_HIDDEN_SIZE=${MODEL_HIDDEN_SIZE:-512}
+MODEL_HIDDEN_SIZE=${MODEL_HIDDEN_SIZE:-512}   # MiniLLM2-Small (~26M params)
 MODEL_NUM_LAYERS=${MODEL_NUM_LAYERS:-8}
 USE_MOE=${USE_MOE:-false}
 

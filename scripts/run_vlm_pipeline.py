@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One-click pipeline for MiniMind VLM training and evaluation.
+"""One-click pipeline for MiniLLM VLM training and evaluation.
 
 The script automates three stages:
 
@@ -208,7 +208,7 @@ def run_evaluation(args, vision_dir: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='MiniMind VLM automation pipeline')
+    parser = argparse.ArgumentParser(description='MiniLLM VLM automation pipeline')
     parser.add_argument('--dataset-repo', default='gongjy/minimind-v_dataset', help='ModelScope dataset repo id')
     parser.add_argument('--model-repo', default='gongjy/MiniMind2-V-PyTorch', help='ModelScope base LLM repo id')
     parser.add_argument('--vision-repo', default='openai-mirror/clip-vit-base-patch16', help='ModelScope vision encoder repo id')

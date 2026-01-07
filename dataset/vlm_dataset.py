@@ -1,4 +1,4 @@
-"""Dataset helpers for MiniMind vision-language fine-tuning."""
+"""Dataset helpers for MiniLLM vision-language fine-tuning."""
 from __future__ import annotations
 
 import json
@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 from torch.utils.data import Dataset
 
-from model.model_vlm import MiniMindVLM
+from model.model_vlm import MiniLLMVLM
 
 
 class VLMDataset(Dataset):
@@ -93,7 +93,7 @@ class VLMDataset(Dataset):
                     raise FileNotFoundError(f"Image {image_name} not found under {self.images_path}")
                 image_path = candidates[0]
             image = Image.open(image_path)
-            image_tensor = MiniMindVLM.image2tensor(image, self.preprocess)
+            image_tensor = MiniLLMVLM.image2tensor(image, self.preprocess)
             image_tensors.append(image_tensor)
         pixel_values = torch.stack(image_tensors, dim=0)
 

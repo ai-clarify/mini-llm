@@ -34,13 +34,16 @@ Environment overrides (common):
   USE_UV             Use uv to create/install venv (default: auto)
   OUT_DIR            Output root (default: out/mlx; smoke-test: out/mlx_smoke)
   DATA_DIR           Dataset cache dir (default: dataset/minimind)
+  MLX_SMALL_DATA     Use smaller datasets for reproduction (default: 1)
+  PRETRAIN_DATA_SPEC Dataset spec for pretrain (default: minimind:sft_mini_512.jsonl)
+  SFT_DATA_SPEC      Dataset spec for SFT (default: minimind:sft_mini_512.jsonl)
+  R1_DATA_SPEC       Dataset spec for R1 stage (default: minimind:r1_mix_1024.jsonl)
   HF_ENDPOINT        Optional HuggingFace mirror endpoint (e.g. https://hf-mirror.com)
   MAX_DOWNLOAD_MB    Per-file download guard in MB (default: 2048; set 0 to disable)
   DOWNLOAD_DPO       Download DPO dataset too (default: 0; MLX DPO training not implemented)
   KEEP_LAST_CHECKPOINTS  Keep last N checkpoints per stage (default: 3)
   CLEANUP_SMOKE      Auto-delete smoke-test outputs (default: 1)
   RUN_R1             Enable R1 reasoning stage (default: 0)
-  R1_DATA_SPEC       Dataset spec (default: minimind:r1_mix_1024.jsonl; smoke: minimind:smoke)
   R1_OUT_DIR         Output dir for R1 stage (default: OUT_DIR/r1)
   R1_INIT_FROM       Checkpoint to init R1 stage (default: latest SFT checkpoint)
   R1_SEQ_LEN         Sequence length for R1 stage (default: 1024; smoke: 256)
@@ -50,7 +53,7 @@ Environment overrides (common):
   R1_MAX_STEPS       Optional max steps for R1 stage
 
 Model/training overrides:
-  PRESET             Model preset: 200mb|tiny|custom (default: 200mb)
+  PRESET             Model preset: 200mb|tiny|custom (default: custom when MLX_SMALL_DATA=1)
   DTYPE              float16|bfloat16|float32 (default: bfloat16)
 
   PRETRAIN_SEQ_LEN, PRETRAIN_BATCH_SIZE, PRETRAIN_ACCUM_STEPS, PRETRAIN_EPOCHS, PRETRAIN_MAX_STEPS
@@ -129,6 +132,7 @@ export TRANSFORMERS_VERBOSITY=${TRANSFORMERS_VERBOSITY:-error}
 
 VENV_DIR=${VENV_DIR:-.venv_mlx}
 DATA_DIR=${DATA_DIR:-dataset/minimind}
+MLX_SMALL_DATA=${MLX_SMALL_DATA:-1}
 MAX_DOWNLOAD_MB=${MAX_DOWNLOAD_MB:-2048}
 DOWNLOAD_DPO=${DOWNLOAD_DPO:-0}
 KEEP_LAST_CHECKPOINTS=${KEEP_LAST_CHECKPOINTS:-3}
@@ -139,7 +143,11 @@ if [ "$SMOKE_TEST" -eq 1 ]; then
   CLEANUP_SMOKE=${CLEANUP_SMOKE:-1}
 else
   OUT_DIR=${OUT_DIR:-out/mlx}
-  PRESET=${PRESET:-200mb}
+  if [ "$MLX_SMALL_DATA" = "1" ]; then
+    PRESET=${PRESET:-custom}
+  else
+    PRESET=${PRESET:-200mb}
+  fi
   DTYPE=${DTYPE:-bfloat16}
   CLEANUP_SMOKE=${CLEANUP_SMOKE:-0}
 fi
@@ -239,30 +247,36 @@ fi
 
 mkdir -p "$DATA_DIR"
 
+if [ "$SMOKE_TEST" -eq 1 ]; then
+  PRETRAIN_DATA_SPEC=${PRETRAIN_DATA_SPEC:-minimind:smoke}
+  SFT_DATA_SPEC=${SFT_DATA_SPEC:-minimind:smoke}
+  R1_DATA_SPEC=${R1_DATA_SPEC:-minimind:smoke}
+else
+  if [ "$MLX_SMALL_DATA" = "1" ]; then
+    PRETRAIN_DATA_SPEC=${PRETRAIN_DATA_SPEC:-minimind:sft_mini_512.jsonl}
+    SFT_DATA_SPEC=${SFT_DATA_SPEC:-minimind:sft_mini_512.jsonl}
+  else
+    PRETRAIN_DATA_SPEC=${PRETRAIN_DATA_SPEC:-minimind:pretrain_hq.jsonl}
+    SFT_DATA_SPEC=${SFT_DATA_SPEC:-minimind:sft_512.jsonl}
+  fi
+  R1_DATA_SPEC=${R1_DATA_SPEC:-minimind:r1_mix_1024.jsonl}
+fi
+
 if [ "$INFER_ONLY" -eq 1 ]; then
   echo "[data] Skipping dataset download (--infer-only)"
-elif [ "$SMOKE_TEST" -eq 1 ]; then
-  export DATA_DIR MAX_DOWNLOAD_MB HF_ENDPOINT
-  echo "[data] Download smoke dataset"
-  download_minimind "minimind:smoke" "sft"
 else
   export DATA_DIR MAX_DOWNLOAD_MB HF_ENDPOINT
   echo "[data] Download required datasets"
   if [ "$SKIP_PRETRAIN" -eq 0 ]; then
-    download_minimind "minimind:pretrain_hq.jsonl" "pretrain"
+    download_minimind "$PRETRAIN_DATA_SPEC" "pretrain"
   fi
   if [ "$SKIP_SFT" -eq 0 ]; then
-    download_minimind "minimind:sft_mini_512.jsonl" "sft"
+    download_minimind "$SFT_DATA_SPEC" "sft"
   fi
   if [ "$DOWNLOAD_DPO" = "1" ]; then
     download_minimind "minimind:dpo.jsonl" "sft"
   fi
   if [ "$RUN_R1" -eq 1 ]; then
-    if [ "$SMOKE_TEST" -eq 1 ]; then
-      R1_DATA_SPEC=${R1_DATA_SPEC:-minimind:smoke}
-    else
-      R1_DATA_SPEC=${R1_DATA_SPEC:-minimind:r1_mix_1024.jsonl}
-    fi
     download_minimind "$R1_DATA_SPEC" "sft"
   fi
 fi
@@ -392,7 +406,7 @@ if [ "$SKIP_PRETRAIN" -eq 0 ]; then
     --task pretrain
     --preset "$PRESET"
     --dtype "$DTYPE"
-    --data_path "$( [ "$SMOKE_TEST" -eq 1 ] && echo minimind:smoke || echo minimind:pretrain_hq.jsonl )"
+    --data_path "$PRETRAIN_DATA_SPEC"
     --data_dir "$DATA_DIR"
     --max_download_mb "$MAX_DOWNLOAD_MB"
     --out_dir "$PRETRAIN_OUT"
@@ -445,7 +459,7 @@ if [ "$SKIP_SFT" -eq 0 ]; then
     --task sft
     --preset "$PRESET"
     --dtype "$DTYPE"
-    --data_path "$( [ "$SMOKE_TEST" -eq 1 ] && echo minimind:smoke || echo minimind:sft_mini_512.jsonl )"
+    --data_path "$SFT_DATA_SPEC"
     --data_dir "$DATA_DIR"
     --max_download_mb "$MAX_DOWNLOAD_MB"
     --out_dir "$SFT_OUT"

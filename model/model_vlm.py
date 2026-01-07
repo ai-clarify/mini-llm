@@ -1,10 +1,8 @@
-"""MiniMind vision-language model integration.
+"""MiniLLM vision-language model integration.
 
-This module adapts the MiniMind-V implementation from the upstream
-``jingyaogong/minimind-v`` project so that it can be used inside the
-Mini-LLM codebase.  Only lightweight dependencies are required and the
-vision encoder is kept frozen by default which keeps the overall
-implementation compact.
+This module adapts the upstream vision-language implementation to fit the
+MiniLLM codebase. The CLIP encoder is kept frozen by default to keep the
+dependency surface and training costs low.
 """
 from __future__ import annotations
 
@@ -21,9 +19,9 @@ from .model_minillm import MiniLLMConfig, MiniLLMForCausalLM, MOEFeedForward
 
 
 class VLMConfig(MiniLLMConfig):
-    """Configuration for the MiniMind vision-language model."""
+    """Configuration for the MiniLLM vision-language model."""
 
-    model_type = "minimind-v"
+    model_type = "minillm-v"
 
     def __init__(
         self,
@@ -102,8 +100,8 @@ class VisionProj(nn.Module):
         return self.vision_proj(image_encoders)
 
 
-class MiniMindVLM(MiniLLMForCausalLM):
-    """MiniMind Vision-Language model with a frozen CLIP encoder."""
+class MiniLLMVLM(MiniLLMForCausalLM):
+    """MiniLLM vision-language model with a frozen CLIP encoder."""
 
     config_class = VLMConfig
 
@@ -163,6 +161,7 @@ class MiniMindVLM(MiniLLMForCausalLM):
         seqlen: int = 512,
     ) -> torch.Tensor:
         def find_indices(tok: torch.Tensor, image_ids: List[int]):
+            # Look for contiguous runs of placeholder image token ids.
             image_ids_tensor = torch.tensor(image_ids, device=tok.device)
             token_windows = tok.unfold(1, len(image_ids), 1)
             matches = (token_windows == image_ids_tensor).all(dim=2)

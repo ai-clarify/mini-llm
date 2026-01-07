@@ -97,7 +97,7 @@ def train_epoch(args, vlm_config, model, optimizer, scaler, autocast_ctx, loader
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MiniMind-V SFT")
+    parser = argparse.ArgumentParser(description="MiniLLM-V SFT")
     parser.add_argument('--save_dir', type=str, default='../out', help='模型保存目录')
     parser.add_argument('--save_weight', type=str, default='sft_vlm', help='保存权重前缀')
     parser.add_argument('--epochs', type=int, default=2, help='训练轮数')
@@ -121,7 +121,7 @@ def main():
     parser.add_argument('--from_weight', type=str, default='pretrain_vlm', help='继承的基础权重名称，为none表示不继承')
     parser.add_argument('--from_resume', type=int, default=0, choices=[0, 1], help='是否自动检测续训')
     parser.add_argument('--use_wandb', action='store_true', help='是否启用SwanLab/W&B日志')
-    parser.add_argument('--wandb_project', type=str, default='MiniMind-V-SFT', help='SwanLab项目名')
+    parser.add_argument('--wandb_project', type=str, default='MiniLLM-V-SFT', help='SwanLab项目名')
     args = parser.parse_args()
 
     local_rank = init_distributed_mode()
@@ -147,7 +147,7 @@ def main():
         import swanlab as wandb
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
-        wandb_run_name = f"MiniMind-V-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
+        wandb_run_name = f"MiniLLM-V-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
 
     model, tokenizer, preprocess = init_vlm_model(

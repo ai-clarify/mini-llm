@@ -1,4 +1,4 @@
-"""Smoke tests ensuring the MiniMind VLM training & inference loops run locally."""
+"""Smoke tests ensuring the MiniLLM VLM training & inference loops run locally."""
 from __future__ import annotations
 
 import json
@@ -49,7 +49,7 @@ def _create_dummy_dataset(root: Path) -> tuple[Path, Path]:
 
 
 def _init_tiny_model(tmp_path: Path):
-    """Initialise a CPU-only MiniMindVLM with extremely small settings."""
+    """Initialise a CPU-only MiniLLM VLM with extremely small settings."""
 
     vlm_config = VLMConfig(
         hidden_size=64,

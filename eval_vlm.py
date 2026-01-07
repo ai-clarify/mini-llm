@@ -1,4 +1,4 @@
-"""Evaluate a trained MiniMind VLM checkpoint."""
+"""Evaluate a trained MiniLLM VLM checkpoint."""
 from __future__ import annotations
 
 import argparse
@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
 
-from model.model_vlm import MiniMindVLM, VLMConfig
+from model.model_vlm import MiniLLMVLM, VLMConfig
 from trainer.trainer_utils import setup_seed
 
 warnings.filterwarnings('ignore')
@@ -20,7 +20,7 @@ def init_model(args):
     if 'model' in args.load_from:
         moe_suffix = '_moe' if args.use_moe else ''
         ckp = f'./{args.save_dir}/{args.weight}_{args.hidden_size}{moe_suffix}.pth'
-        model = MiniMindVLM(
+        model = MiniLLMVLM(
             VLMConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe)),
             vision_model_path=args.vision_model_path,
         )
@@ -28,7 +28,7 @@ def init_model(args):
         model.load_state_dict({k: v for k, v in state_dict.items() if 'mask' not in k}, strict=False)
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
-        model.vision_encoder, model.processor = MiniMindVLM.get_vision_model(args.vision_model_path)
+        model.vision_encoder, model.processor = MiniLLMVLM.get_vision_model(args.vision_model_path)
 
     print(f'VLM模型参数: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f} M(illion)')
     preprocess = model.processor
@@ -36,7 +36,7 @@ def init_model(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='MiniMind-V Chat')
+    parser = argparse.ArgumentParser(description='MiniLLM-V Chat')
     parser.add_argument('--load_from', default='model', type=str, help='模型加载路径（model=原生权重，其他路径=transformers格式）')
     parser.add_argument('--save_dir', default='out', type=str, help='模型权重目录')
     parser.add_argument('--weight', default='sft_vlm', type=str, help='权重名称前缀（pretrain_vlm, sft_vlm）')
@@ -60,7 +60,7 @@ def main():
             setup_seed(2026)
             image_path = os.path.join(args.image_dir, image_file)
             image = Image.open(image_path).convert('RGB')
-            pixel_values = MiniMindVLM.image2tensor(image, preprocess).to(args.device).unsqueeze(0)
+            pixel_values = MiniLLMVLM.image2tensor(image, preprocess).to(args.device).unsqueeze(0)
 
             messages = [{"role": "user", "content": prompt.replace('<image>', model.params.image_special_token)}]
             inputs_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
