@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="MiniLLM logo">
+  <rect width="256" height="256" rx="28" fill="#0C1116"/>
+  <rect x="40" y="52" width="176" height="28" rx="14" fill="#F6D365"/>
+  <rect x="40" y="94" width="176" height="28" rx="14" fill="#6CC3B2"/>
+  <rect x="40" y="136" width="176" height="28" rx="14" fill="#4E6E91"/>
+  <rect x="40" y="178" width="124" height="28" rx="14" fill="#FFFFFF" opacity="0.9"/>
+  <circle cx="196" cy="192" r="14" fill="#F27F5C"/>
+</svg>
