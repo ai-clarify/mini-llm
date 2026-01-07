@@ -15,6 +15,9 @@ Options:
                      will automatically check if a pretrain checkpoint exists and
                      has acceptable quality, then skip to SFT training.
 
+  --run-r1          After DPO, train a reasoning (R1) model via distillation and
+                    run a lightweight demo generation.
+
   --force-pretrain   Force pretrain stage even if a checkpoint exists (overrides
                      --skip-pretrain).
 
@@ -25,6 +28,7 @@ USAGE
 SMOKE_TEST=0
 SKIP_PRETRAIN=0
 FORCE_PRETRAIN=0
+RUN_R1=0
 
 while (($#)); do
   case "$1" in
@@ -34,6 +38,10 @@ while (($#)); do
       ;;
     --skip-pretrain)
       SKIP_PRETRAIN=1
+      shift
+      ;;
+    --run-r1)
+      RUN_R1=1
       shift
       ;;
     --force-pretrain)
@@ -126,7 +134,9 @@ fi
 
 OUT_DIR=${OUT_DIR:-out}
 DATA_DIR=${DATA_DIR:-data/processed}
+R1_DATA_DIR=${R1_DATA_DIR:-dataset/minimind}
 RESULTS_FILE=${RESULTS_FILE:-"$TF_DIR/eval_results.jsonl"}
+MAX_DOWNLOAD_MB=${MAX_DOWNLOAD_MB:-2048}
 
 USE_UV=0
 
@@ -278,6 +288,7 @@ fi
 mkdir -p "$TF_DIR" || { echo "[warn] Could not create $TF_DIR directory"; }
 mkdir -p "$OUT_DIR" || { echo "[error] Could not create $OUT_DIR directory" >&2; exit 1; }
 mkdir -p "$DATA_DIR" || { echo "[error] Could not create $DATA_DIR directory" >&2; exit 1; }
+mkdir -p "$R1_DATA_DIR" || { echo "[error] Could not create $R1_DATA_DIR directory" >&2; exit 1; }
 
 # PRETRAIN_DEFAULT_ROOT was already set in cloud environment detection above
 if [ -z "${PRETRAIN_DEFAULT_ROOT:-}" ]; then
@@ -321,11 +332,22 @@ PRETRAIN_JSON=${PRETRAIN_JSON:-"$PRETRAIN_DEFAULT_ROOT/pretrain_hq.jsonl"}
 # Use high-quality SFT dataset (cleaned, deduplicated, filtered)
 SFT_JSON=${SFT_JSON:-"data/final/sft_high_quality.jsonl"}
 DPO_JSON=${DPO_JSON:-"$PRETRAIN_DEFAULT_ROOT/dpo_pairs.jsonl"}
+R1_JSON=${R1_JSON:-"dataset/r1_mix_1024.jsonl"}
 
 if [ ! -s "$DPO_JSON" ]; then
   ALT_DPO="$PRETRAIN_DEFAULT_ROOT/dpo.jsonl"
   if [ -s "$ALT_DPO" ]; then
     DPO_JSON="$ALT_DPO"
+  fi
+fi
+
+if [ ! -s "$R1_JSON" ]; then
+  if [ -s "$PRETRAIN_DEFAULT_ROOT/r1_mix_1024.jsonl" ]; then
+    R1_JSON="$PRETRAIN_DEFAULT_ROOT/r1_mix_1024.jsonl"
+  elif [ -s "$DATA_DIR/r1_mix_1024.jsonl" ]; then
+    R1_JSON="$DATA_DIR/r1_mix_1024.jsonl"
+  elif [ -s "$R1_DATA_DIR/r1_mix_1024.jsonl" ]; then
+    R1_JSON="$R1_DATA_DIR/r1_mix_1024.jsonl"
   fi
 fi
 
@@ -477,6 +499,30 @@ if [ "$NEED_LOCAL_DATA" -eq 1 ]; then
   python scripts/build_chinese_mix.py --output-dir "$DATA_DIR"
 fi
 
+if [ "$RUN_R1" -eq 1 ] && [ ! -s "$R1_JSON" ]; then
+  echo "[data] R1 dataset missing, downloading from minimind_dataset..."
+  if ! R1_JSON=$(python - <<'PY'
+import os
+from mlx_train.download import ensure_hf_dataset_file
+
+data_dir = os.environ.get("R1_DATA_DIR", "dataset/minimind")
+path = ensure_hf_dataset_file(
+    repo_id="jingyaogong/minimind_dataset",
+    filename="r1_mix_1024.jsonl",
+    data_dir=data_dir,
+    endpoint=os.environ.get("HF_ENDPOINT"),
+    force=False,
+    max_download_mb=int(os.environ.get("MAX_DOWNLOAD_MB", "2048")),
+)
+print(path)
+PY
+  ); then
+    echo "[error] Failed to download r1_mix_1024.jsonl" >&2
+    exit 1
+  fi
+  echo "[data] R1 dataset ready: $R1_JSON"
+fi
+
 for path in "$PRETRAIN_JSON" "$SFT_JSON" "$DPO_JSON"; do
   if [ ! -s "$path" ]; then
     echo "[data] Required dataset not found: $path" >&2
@@ -501,11 +547,18 @@ if [ "$SMOKE_TEST" -eq 1 ]; then
 
   python scripts/create_smoke_subset.py --input "$DPO_JSON" --output "$SMOKE_DIR/dpo.jsonl" --limit "$SMOKE_DPO_LIMIT"
   DPO_JSON="$SMOKE_DIR/dpo.jsonl"
+
+  if [ "$RUN_R1" -eq 1 ] && [ -s "$R1_JSON" ]; then
+    SMOKE_R1_LIMIT=${SMOKE_R1_LIMIT:-8}
+    python scripts/create_smoke_subset.py --input "$R1_JSON" --output "$SMOKE_DIR/r1.jsonl" --limit "$SMOKE_R1_LIMIT"
+    R1_JSON="$SMOKE_DIR/r1.jsonl"
+  fi
 fi
 
 EXTRA_PRETRAIN_ARGS=()
 EXTRA_SFT_ARGS=()
 EXTRA_DPO_ARGS=()
+EXTRA_R1_ARGS=()
 
 if [ -n "${PRETRAIN_ARGS:-}" ]; then
   read -r -a EXTRA_PRETRAIN_ARGS <<<"${PRETRAIN_ARGS}"
@@ -515,6 +568,9 @@ if [ -n "${SFT_ARGS:-}" ]; then
 fi
 if [ -n "${DPO_ARGS:-}" ]; then
   read -r -a EXTRA_DPO_ARGS <<<"${DPO_ARGS}"
+fi
+if [ -n "${R1_ARGS:-}" ]; then
+  read -r -a EXTRA_R1_ARGS <<<"${R1_ARGS}"
 fi
 
 MODEL_HIDDEN_SIZE=${MODEL_HIDDEN_SIZE:-512}
@@ -550,6 +606,7 @@ fi
 CHECKPOINT_PRETRAIN="$OUT_DIR/pretrain_${MODEL_HIDDEN_SIZE}.pth"
 CHECKPOINT_SFT="$OUT_DIR/full_sft_${MODEL_HIDDEN_SIZE}.pth"
 CHECKPOINT_DPO="$OUT_DIR/rlhf_${MODEL_HIDDEN_SIZE}.pth"
+CHECKPOINT_R1="$OUT_DIR/reason_${MODEL_HIDDEN_SIZE}.pth"
 
 # Auto-load pretrained checkpoints from /openbayes/home/out or environment
 PRETRAINED_PATH=""
@@ -612,6 +669,7 @@ if [ "$SMOKE_TEST" -eq 1 ]; then
   EXTRA_PRETRAIN_ARGS+=(--device cpu --dtype float32 --batch_size "${SMOKE_PRETRAIN_BATCH:-2}" --max_steps "${SMOKE_PRETRAIN_STEPS:-4}" --num_workers 0 --log_interval 1 --save_interval "${SMOKE_PRETRAIN_STEPS:-4}")
   EXTRA_SFT_ARGS+=(--device cpu --dtype float32 --batch_size "${SMOKE_SFT_BATCH:-2}" --max_steps "${SMOKE_SFT_STEPS:-4}" --num_workers 0 --log_interval 1 --save_interval "${SMOKE_SFT_STEPS:-4}")
   EXTRA_DPO_ARGS+=(--device cpu --dtype float32 --batch_size "${SMOKE_DPO_BATCH:-2}" --max_steps "${SMOKE_DPO_STEPS:-4}" --num_workers 0 --log_interval 1 --save_interval "${SMOKE_DPO_STEPS:-4}")
+  EXTRA_R1_ARGS+=(--device cpu --dtype float32 --batch_size "${SMOKE_R1_BATCH:-2}" --epochs "${SMOKE_R1_EPOCHS:-1}" --num_workers 0 --log_interval 1 --save_interval "${SMOKE_R1_SAVE_INTERVAL:-2}" --max_seq_len "${SMOKE_R1_SEQ_LEN:-256}")
 
   PRETRAIN_EVAL_MAX_SAMPLES=${SMOKE_PRETRAIN_EVAL_SAMPLES:-8}
   PRETRAIN_EVAL_BATCH=${SMOKE_PRETRAIN_EVAL_BATCH:-2}
@@ -723,6 +781,104 @@ if [ -f "$CHECKPOINT_DPO" ]; then
   "${EVAL_CMD_BASE[@]}" --stage dpo --checkpoint "$CHECKPOINT_DPO" --data-path "$DPO_JSON" --max-seq-len 1024 --max-samples "$DPO_EVAL_MAX_SAMPLES" --batch-size "$DPO_EVAL_BATCH" --tensorboard-dir "$TB_EVAL_DIR/dpo"
 else
   echo "[warn] DPO checkpoint not found at $CHECKPOINT_DPO" >&2
+fi
+
+if [ "$RUN_R1" -eq 1 ]; then
+  if [ ! -s "$R1_JSON" ]; then
+    echo "[error] R1 dataset not found at $R1_JSON" >&2
+    exit 1
+  fi
+  if [ ! -f "$CHECKPOINT_DPO" ]; then
+    echo "[error] R1 requires DPO checkpoint at $CHECKPOINT_DPO" >&2
+    exit 1
+  fi
+  echo "[stage] Starting R1 distillation (reasoning)"
+  R1_ARGS_WITH_PRETRAIN=("${EXTRA_R1_ARGS[@]}")
+  $TRAIN_CMD_PREFIX trainer/train_distill_reason.py --data_path "$R1_JSON" --hidden_size "$MODEL_HIDDEN_SIZE" --num_hidden_layers "$MODEL_NUM_LAYERS" --out_dir "$OUT_DIR" ${R1_ARGS_WITH_PRETRAIN[@]+"${R1_ARGS_WITH_PRETRAIN[@]}"}
+
+  if [ -f "$CHECKPOINT_R1" ]; then
+    R1_DEMO=${R1_DEMO:-1}
+    if [ "$R1_DEMO" -ne 0 ]; then
+      R1_DEMO_PROMPT=${R1_DEMO_PROMPT:-"Compute 23 * 17. Show reasoning and give the final answer."}
+      R1_DEMO_MAX_NEW_TOKENS=${R1_DEMO_MAX_NEW_TOKENS:-256}
+      R1_DEMO_TEMPERATURE=${R1_DEMO_TEMPERATURE:-0.7}
+      R1_DEMO_TOP_P=${R1_DEMO_TOP_P:-0.9}
+      R1_DEMO_SEED=${R1_DEMO_SEED:-1337}
+      if ! R1_DEMO_CHECKPOINT="$CHECKPOINT_R1" \
+        R1_DEMO_PROMPT="$R1_DEMO_PROMPT" \
+        R1_DEMO_MAX_NEW_TOKENS="$R1_DEMO_MAX_NEW_TOKENS" \
+        R1_DEMO_TEMPERATURE="$R1_DEMO_TEMPERATURE" \
+        R1_DEMO_TOP_P="$R1_DEMO_TOP_P" \
+        R1_DEMO_SEED="$R1_DEMO_SEED" \
+        R1_DEMO_HIDDEN_SIZE="$MODEL_HIDDEN_SIZE" \
+        R1_DEMO_NUM_LAYERS="$MODEL_NUM_LAYERS" \
+        R1_DEMO_USE_MOE="$USE_MOE" \
+        python - <<'PY'
+import os
+import torch
+from transformers import AutoTokenizer
+from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
+
+ckpt = os.environ["R1_DEMO_CHECKPOINT"]
+prompt = os.environ["R1_DEMO_PROMPT"]
+max_new_tokens = int(os.environ.get("R1_DEMO_MAX_NEW_TOKENS", "256"))
+temperature = float(os.environ.get("R1_DEMO_TEMPERATURE", "0.7"))
+top_p = float(os.environ.get("R1_DEMO_TOP_P", "0.9"))
+seed = int(os.environ.get("R1_DEMO_SEED", "1337"))
+hidden_size = int(os.environ["R1_DEMO_HIDDEN_SIZE"])
+num_layers = int(os.environ["R1_DEMO_NUM_LAYERS"])
+use_moe = os.environ.get("R1_DEMO_USE_MOE", "false").lower() == "true"
+
+device = os.environ.get("R1_DEMO_DEVICE")
+if not device:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(seed)
+
+tokenizer = AutoTokenizer.from_pretrained("./model")
+cfg = MiniLLMConfig(hidden_size=hidden_size, num_hidden_layers=num_layers, use_moe=use_moe)
+model = MiniLLMForCausalLM(cfg)
+state = torch.load(ckpt, map_location=device)
+model.load_state_dict(state, strict=False)
+model.eval().to(device)
+
+messages = [{"role": "user", "content": prompt}]
+try:
+    prompt_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, enable_thinking=True
+    )
+except TypeError:
+    prompt_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+inputs = tokenizer(prompt_text, return_tensors="pt", truncation=True).to(device)
+do_sample = temperature > 0
+with torch.no_grad():
+    output_ids = model.generate(
+        inputs["input_ids"],
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+        attention_mask=inputs["attention_mask"],
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+    )
+
+response = tokenizer.decode(output_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True).strip()
+print("[r1-demo] prompt:", prompt)
+print("[r1-demo] response:", response or "<empty>")
+PY
+      then
+        echo "[warn] R1 demo failed, but training completed" >&2
+      fi
+    fi
+  else
+    echo "[warn] R1 checkpoint not found at $CHECKPOINT_R1" >&2
+  fi
 fi
 
 echo "[done] Training pipeline completed. Check $OUT_DIR for checkpoints and $RESULTS_FILE for evaluation logs."

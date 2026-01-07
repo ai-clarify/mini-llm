@@ -25,6 +25,7 @@ Options:
   --skip-pretrain    Skip pretrain stage (requires existing checkpoint or MLX_INIT_FROM).
   --skip-sft         Skip SFT stage.
   --skip-infer       Skip final inference.
+  --run-r1           Run R1 reasoning SFT after SFT using r1_mix_1024.jsonl.
   --                Forward remaining args to mlx_train.train (pretrain & sft).
   -h, --help         Show this help message and exit.
 
@@ -38,6 +39,15 @@ Environment overrides (common):
   DOWNLOAD_DPO       Download DPO dataset too (default: 0; MLX DPO training not implemented)
   KEEP_LAST_CHECKPOINTS  Keep last N checkpoints per stage (default: 3)
   CLEANUP_SMOKE      Auto-delete smoke-test outputs (default: 1)
+  RUN_R1             Enable R1 reasoning stage (default: 0)
+  R1_DATA_SPEC       Dataset spec (default: minimind:r1_mix_1024.jsonl; smoke: minimind:smoke)
+  R1_OUT_DIR         Output dir for R1 stage (default: OUT_DIR/r1)
+  R1_INIT_FROM       Checkpoint to init R1 stage (default: latest SFT checkpoint)
+  R1_SEQ_LEN         Sequence length for R1 stage (default: 1024; smoke: 256)
+  R1_BATCH_SIZE      Batch size for R1 stage (default: 1; smoke: 2)
+  R1_ACCUM_STEPS     Grad accumulation steps for R1 stage (default: 8; smoke: 1)
+  R1_EPOCHS          Epochs for R1 stage (default: 1)
+  R1_MAX_STEPS       Optional max steps for R1 stage
 
 Model/training overrides:
   PRESET             Model preset: 200mb|tiny|custom (default: 200mb)
@@ -70,6 +80,7 @@ INFER_CHECKPOINT=""
 SKIP_PRETRAIN=0
 SKIP_SFT=0
 SKIP_INFER=0
+RUN_R1=0
 OUT_DIR_WAS_SET=0
 if [ -n "${OUT_DIR+x}" ]; then
   OUT_DIR_WAS_SET=1
@@ -96,6 +107,7 @@ while (($#)); do
     --skip-pretrain) SKIP_PRETRAIN=1; shift ;;
     --skip-sft) SKIP_SFT=1; shift ;;
     --skip-infer) SKIP_INFER=1; shift ;;
+    --run-r1) RUN_R1=1; shift ;;
     --) shift; TRAIN_EXTRA_ARGS+=("$@"); break ;;
     -h|--help) usage; exit 0 ;;
     *) TRAIN_EXTRA_ARGS+=("$1"); shift ;;
@@ -245,6 +257,14 @@ else
   if [ "$DOWNLOAD_DPO" = "1" ]; then
     download_minimind "minimind:dpo.jsonl" "sft"
   fi
+  if [ "$RUN_R1" -eq 1 ]; then
+    if [ "$SMOKE_TEST" -eq 1 ]; then
+      R1_DATA_SPEC=${R1_DATA_SPEC:-minimind:smoke}
+    else
+      R1_DATA_SPEC=${R1_DATA_SPEC:-minimind:r1_mix_1024.jsonl}
+    fi
+    download_minimind "$R1_DATA_SPEC" "sft"
+  fi
 fi
 
 if [ "$DOWNLOAD_ONLY" -eq 1 ]; then
@@ -329,6 +349,7 @@ run_stage() {
 
 PRETRAIN_OUT="$OUT_DIR/pretrain"
 SFT_OUT="$OUT_DIR/sft"
+R1_OUT=${R1_OUT_DIR:-"$OUT_DIR/r1"}
 
 if [ "$SMOKE_TEST" -eq 1 ]; then
   PRETRAIN_SEQ_LEN=${PRETRAIN_SEQ_LEN:-256}
@@ -471,6 +492,74 @@ if [ "$SKIP_SFT" -eq 0 ]; then
   run_stage "sft" "${SFT_ARGS[@]}"
 fi
 
+if [ "$RUN_R1" -eq 1 ]; then
+  if [ "$SMOKE_TEST" -eq 1 ]; then
+    R1_SEQ_LEN=${R1_SEQ_LEN:-256}
+    R1_BATCH_SIZE=${R1_BATCH_SIZE:-2}
+    R1_ACCUM_STEPS=${R1_ACCUM_STEPS:-1}
+    R1_EPOCHS=${R1_EPOCHS:-1}
+    R1_MAX_STEPS=${R1_MAX_STEPS:-5}
+  else
+    R1_SEQ_LEN=${R1_SEQ_LEN:-1024}
+    R1_BATCH_SIZE=${R1_BATCH_SIZE:-1}
+    R1_ACCUM_STEPS=${R1_ACCUM_STEPS:-8}
+    R1_EPOCHS=${R1_EPOCHS:-1}
+    R1_MAX_STEPS=${R1_MAX_STEPS:-}
+  fi
+
+  R1_RESUME=$(latest_ckpt "$R1_OUT")
+  R1_INIT_FROM=${R1_INIT_FROM:-}
+  if [ -z "$R1_INIT_FROM" ]; then
+    R1_INIT_FROM=$(latest_ckpt "$SFT_OUT")
+  fi
+  if [ -z "$R1_RESUME" ] && [ -z "$R1_INIT_FROM" ]; then
+    echo "[error] R1 requires a SFT checkpoint (set R1_INIT_FROM or run SFT first)" >&2
+    exit 1
+  fi
+
+  if [ -z "${R1_DATA_SPEC:-}" ]; then
+    if [ "$SMOKE_TEST" -eq 1 ]; then
+      R1_DATA_SPEC=minimind:smoke
+    else
+      R1_DATA_SPEC=minimind:r1_mix_1024.jsonl
+    fi
+  fi
+
+  R1_ARGS=(
+    --task sft
+    --preset "$PRESET"
+    --dtype "$DTYPE"
+    --data_path "$R1_DATA_SPEC"
+    --data_dir "$DATA_DIR"
+    --max_download_mb "$MAX_DOWNLOAD_MB"
+    --out_dir "$R1_OUT"
+    --keep_last_checkpoints "$KEEP_LAST_CHECKPOINTS"
+    --seq_len "$R1_SEQ_LEN"
+    --batch_size "$R1_BATCH_SIZE"
+    --accum_steps "$R1_ACCUM_STEPS"
+    --epochs "$R1_EPOCHS"
+    --log_interval "$LOG_INTERVAL"
+    --save_interval "$SAVE_INTERVAL"
+  )
+  if [ -n "${HF_ENDPOINT:-}" ]; then
+    R1_ARGS+=(--hf_endpoint "$HF_ENDPOINT")
+  fi
+  if [ -n "$R1_MAX_STEPS" ]; then
+    R1_ARGS+=(--max_steps "$R1_MAX_STEPS")
+  fi
+
+  if [ -n "$R1_RESUME" ]; then
+    R1_ARGS+=(--resume "$R1_RESUME")
+  else
+    R1_ARGS+=(--init_from "$R1_INIT_FROM")
+  fi
+
+  if [ "${#TRAIN_EXTRA_ARGS[@]}" -gt 0 ]; then
+    R1_ARGS+=("${TRAIN_EXTRA_ARGS[@]}")
+  fi
+  run_stage "r1" "${R1_ARGS[@]}"
+fi
+
 if [ "$SKIP_INFER" -eq 0 ]; then
   if [ -n "$INFER_CHECKPOINT" ]; then
     INFER_CKPT=$INFER_CHECKPOINT
@@ -493,6 +582,9 @@ if [ "$SKIP_INFER" -eq 0 ]; then
       INFER_CKPT=$OUT_DIR
     else
       INFER_CKPT=$(latest_ckpt "$OUT_DIR")
+      if [ -z "$INFER_CKPT" ] && [ -d "$R1_OUT" ]; then
+        INFER_CKPT=$(latest_ckpt "$R1_OUT")
+      fi
       if [ -z "$INFER_CKPT" ]; then
         INFER_CKPT=$(latest_ckpt "$SFT_OUT")
       fi
