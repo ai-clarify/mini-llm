@@ -136,8 +136,8 @@ python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir
 - [docs/README.md](./docs/README.md)：文档入口与导航
 - [docs/booklet_cn.md](./docs/booklet_cn.md)：完整中文小册子
 - [docs/changelog/CHANGELOG.md](./docs/changelog/CHANGELOG.md)：版本记录
-- [ModelScope: MiniLLM-Reasoning](https://www.modelscope.cn/studios/gongjy/MiniLLM-Reasoning)
-- [ModelScope: MiniLLM](https://www.modelscope.cn/studios/gongjy/MiniLLM)
+- [ModelScope: MiniLLM-Reasoning](https://www.modelscope.cn/models/gongjy/MiniLLM-Reasoning)
+- [ModelScope: MiniLLM](https://www.modelscope.cn/models/gongjy/MiniLLM)
 - [Bilibili 视频介绍](https://www.bilibili.com/video/BV12dHPeqE72)
 
 ---
