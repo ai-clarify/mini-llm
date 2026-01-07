@@ -39,7 +39,8 @@ Environment overrides (common):
   SFT_DATA_SPEC      Dataset spec for SFT (default: minimind:sft_mini_512.jsonl)
   R1_DATA_SPEC       Dataset spec for R1 stage (default: minimind:r1_mix_1024.jsonl)
   HF_ENDPOINT        Optional HuggingFace mirror endpoint (e.g. https://hf-mirror.com)
-  MAX_DOWNLOAD_MB    Per-file download guard in MB (default: 2048; set 0 to disable)
+  MAX_DOWNLOAD_MB    Per-file download guard in MB (default: 2048; set 0 to disable).
+                    When MLX_SMALL_DATA=0 and MAX_DOWNLOAD_MB is not set, defaults to 0.
   DOWNLOAD_DPO       Download DPO dataset too (default: 0; MLX DPO training not implemented)
   KEEP_LAST_CHECKPOINTS  Keep last N checkpoints per stage (default: 3)
   CLEANUP_SMOKE      Auto-delete smoke-test outputs (default: 1)
@@ -133,6 +134,10 @@ export TRANSFORMERS_VERBOSITY=${TRANSFORMERS_VERBOSITY:-error}
 VENV_DIR=${VENV_DIR:-.venv_mlx}
 DATA_DIR=${DATA_DIR:-dataset/minimind}
 MLX_SMALL_DATA=${MLX_SMALL_DATA:-1}
+MAX_DOWNLOAD_MB_SET=0
+if [ -n "${MAX_DOWNLOAD_MB+x}" ]; then
+  MAX_DOWNLOAD_MB_SET=1
+fi
 MAX_DOWNLOAD_MB=${MAX_DOWNLOAD_MB:-2048}
 DOWNLOAD_DPO=${DOWNLOAD_DPO:-0}
 KEEP_LAST_CHECKPOINTS=${KEEP_LAST_CHECKPOINTS:-3}
@@ -147,6 +152,9 @@ else
     PRESET=${PRESET:-custom}
   else
     PRESET=${PRESET:-200mb}
+    if [ "$MAX_DOWNLOAD_MB_SET" -eq 0 ]; then
+      MAX_DOWNLOAD_MB=0
+    fi
   fi
   DTYPE=${DTYPE:-bfloat16}
   CLEANUP_SMOKE=${CLEANUP_SMOKE:-0}
