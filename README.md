@@ -109,6 +109,11 @@ python scripts/train_eagle3_speculator.py
 python scripts/infer_eagle3_speculator.py --prompt "Hi"
 ```
 
+```bash
+# 基准对比（baseline vs speculator）
+python scripts/bench_eagle3_speculator.py --max_samples 16
+```
+
 ### PyTorch 蒸馏训练
 
 ```bash
