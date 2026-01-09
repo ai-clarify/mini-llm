@@ -9,6 +9,7 @@ This folder contains the canonical docs, guides, and community references for Mi
 - **[Changelog](./changelog/CHANGELOG.md)** - Version history
 - **[Booklet (CN)](./booklet_cn.md)** - Full technical walkthrough in Chinese
 - **[Code of Conduct](./CODE_OF_CONDUCT.md)** - Community guidelines
+- **[Agent Guide](../AGENTS.md)** - Automation and contributor guide
 
 ## Quick Navigation
 
@@ -20,6 +21,7 @@ This folder contains the canonical docs, guides, and community references for Mi
 | Checkpoint Management | [Checkpoint Loading Guide](./guides/CHECKPOINT_LOADING.md) |
 | Version History | [Changelog](./changelog/CHANGELOG.md) |
 | Community Standards | [Code of Conduct](./CODE_OF_CONDUCT.md) |
+| Agent Guide | [AGENTS.md](../AGENTS.md) |
 
 ## Getting Help
 

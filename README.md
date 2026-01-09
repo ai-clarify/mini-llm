@@ -144,7 +144,7 @@ python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir
 
 ## 🤝 贡献指南
 
-欢迎通过 Issue 或 Pull Request 反馈问题和改进建议。请先阅读 [docs/CODE_OF_CONDUCT.md](./docs/CODE_OF_CONDUCT.md)。
+欢迎通过 Issue 或 Pull Request 反馈问题和改进建议。请先阅读 [docs/CODE_OF_CONDUCT.md](./docs/CODE_OF_CONDUCT.md)，并参考 [AGENTS.md](./AGENTS.md) 了解项目约定。
 
 ---
 

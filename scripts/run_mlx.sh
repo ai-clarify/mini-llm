@@ -18,64 +18,63 @@ Runs a one-click MLX pipeline (pretrain -> SFT -> infer) aligned with MiniMind d
 Options:
   --smoke-test       Tiny fast run (downloads minimind:smoke, runs infer).
   --download-only    Only download datasets, then exit.
-  --infer-only       Skip training; run inference using the latest checkpoint (OUT_DIR/, or OUT_DIR/{sft,pretrain}/).
+  --infer-only       Skip training; run inference using the latest checkpoint (OUT/, or OUT/{sft,pretrain}/).
   --infer-demo       Alias of `--infer-only` (kept for backward compatibility).
   --infer-checkpoint PATH
                     Skip training; run inference using the specified checkpoint dir (or model.safetensors file).
-  --skip-pretrain    Skip pretrain stage (requires existing checkpoint or MLX_INIT_FROM).
+  --skip-pretrain    Skip pretrain stage (requires existing checkpoint or SFT_FROM).
   --skip-sft         Skip SFT stage.
   --skip-infer       Skip final inference.
   --run-r1           Run R1 reasoning SFT after SFT using r1_mix_1024.jsonl.
   --                Forward remaining args to mlx_train.train (pretrain & sft).
   -h, --help         Show this help message and exit.
 
-Environment overrides (common):
-  PYTHON_CMD        Python interpreter to use (default: auto-detect 3.10-3.12)
-  PYTHON            Alias for PYTHON_CMD
-  VENV_DIR           Virtualenv directory (default: .venv_mlx)
-  USE_UV             Use uv to create/install venv (default: auto)
-  OUT_DIR            Output root (default: out/mlx; smoke-test: out/mlx_smoke)
-  DATA_DIR           Dataset cache dir (default: dataset/minimind)
-  MLX_SMALL_DATA     Use smaller datasets for reproduction (default: 1)
-  PRETRAIN_DATA_SPEC Dataset spec for pretrain (default: minimind:sft_mini_512.jsonl)
-  SFT_DATA_SPEC      Dataset spec for SFT (default: minimind:sft_mini_512.jsonl)
-  R1_DATA_SPEC       Dataset spec for R1 stage (default: minimind:r1_mix_1024.jsonl; small mode uses sft_mini_512.jsonl)
-  AUTO_DOWNLOAD      Auto-download datasets when needed (default: 1; auto-disabled when --skip-pretrain is set)
-  HF_ENDPOINT        Optional HuggingFace mirror endpoint (e.g. https://hf-mirror.com)
-  MAX_DOWNLOAD_MB    Per-file download guard in MB (default: 2048; set 0 to disable).
-                    When MLX_SMALL_DATA=0 and MAX_DOWNLOAD_MB is not set, defaults to 0.
-  DOWNLOAD_DPO       Download DPO dataset too (default: 0; MLX DPO training not implemented)
-  KEEP_LAST_CHECKPOINTS  Keep last N checkpoints per stage (default: 3)
-  CLEANUP_SMOKE      Auto-delete smoke-test outputs (default: 1)
-  RUN_R1             Enable R1 reasoning stage (default: 0)
-  R1_OUT_DIR         Output dir for R1 stage (default: OUT_DIR/r1)
-  R1_INIT_FROM       Checkpoint to init R1 stage (default: latest SFT checkpoint)
-  R1_SEQ_LEN         Sequence length for R1 stage (default: 1024; smoke: 256)
-  R1_BATCH_SIZE      Batch size for R1 stage (default: 1; smoke: 2)
-  R1_ACCUM_STEPS     Grad accumulation steps for R1 stage (default: 8; smoke: 1)
-  R1_EPOCHS          Epochs for R1 stage (default: 1)
-  R1_MAX_STEPS       Optional max steps for R1 stage
+Environment overrides:
+  PY                Python interpreter to use (default: auto-detect 3.10-3.12)
+  VENV              Virtualenv directory (default: .venv_mlx)
+  UV                Use uv to create/install venv (default: auto)
+  OUT               Output root (default: out/mlx; smoke-test: out/mlx_smoke)
+  DATA              Dataset cache dir (default: dataset/minimind)
+  SMALL             Use smaller SFT dataset; pretrain stays full (default: 1)
+  PRE_DATA          Dataset spec for pretrain (default: minimind:auto)
+  SFT_DATA          Dataset spec for SFT (default: minimind:sft_mini_512.jsonl)
+  R1_DATA           Dataset spec for R1 stage (default: minimind:r1_mix_1024.jsonl)
+  AUTO_DL           Auto-download datasets when needed (default: 1; auto-disabled when --skip-pretrain is set)
+  HF_EP             Optional HuggingFace mirror endpoint (e.g. https://hf-mirror.com)
+  DL_MAX            Per-file download guard in MB (default: 2048; set 0 to disable).
+                    When PRE_DATA is large and DL_MAX is not set, defaults to 0.
+  DPO_DL            Download DPO dataset too (default: 0; MLX DPO training not implemented)
+  KEEP_LAST         Keep last N checkpoints per stage (default: 3)
+  SMOKE_CLEAN       Auto-delete smoke-test outputs (default: 1)
+  R1                Enable R1 reasoning stage (default: 0)
+  R1_OUT            Output dir for R1 stage (default: OUT/r1)
+  R1_FROM           Checkpoint to init R1 stage (default: latest SFT checkpoint)
+  R1_LEN            Sequence length for R1 stage (default: 1024; smoke: 256)
+  R1_BS             Batch size for R1 stage (default: 1; smoke: 2)
+  R1_ACCUM          Grad accumulation steps for R1 stage (default: 8; smoke: 1)
+  R1_EPOCH          Epochs for R1 stage (default: 1)
+  R1_MAX            Optional max steps for R1 stage
 
 Model/training overrides:
-  PRESET             Model preset: 200mb|tiny|custom (default: custom when MLX_SMALL_DATA=1)
+  PRESET             Model preset: 200mb|tiny|custom (default: custom)
   DTYPE              float16|bfloat16|float32 (default: bfloat16)
 
-  PRETRAIN_SEQ_LEN, PRETRAIN_BATCH_SIZE, PRETRAIN_ACCUM_STEPS, PRETRAIN_EPOCHS, PRETRAIN_MAX_STEPS
-  SFT_SEQ_LEN, SFT_BATCH_SIZE, SFT_ACCUM_STEPS, SFT_EPOCHS, SFT_MAX_STEPS
+  PRE_LEN, PRE_BS, PRE_ACCUM, PRE_EPOCH, PRE_MAX
+  SFT_LEN, SFT_BS, SFT_ACCUM, SFT_EPOCH, SFT_MAX
 
 Advanced:
-  MLX_INIT_FROM      Checkpoint dir or model.safetensors to init SFT from (overrides auto-detect).
-  INFER_PROMPT       Prompt used by non-demo inference (default: hi)
-  INFER_MAX_NEW_TOKENS  Max new tokens for smoke-test inference (default: 64)
-  INFER_MIN_NEW_TOKENS  Force at least N new tokens (default: 1)
-  INFER_TEMPERATURE  0 for greedy; >0 for sampling (default: 0)
-  INFER_TOP_P        Nucleus sampling threshold (default: 1.0)
-  INFER_DEMO_MODE     Demo mode for --infer-only (default: knowledge; other: bench)
-  INFER_DEMO_SUITES   [bench mode] Suites (default: copy,json,sort,math_mcq,logic,qa,knowledge)
-  INFER_DEMO_N        [bench mode] Examples per suite (default: 2)
-  INFER_DEMO_NO_CHAT  [bench mode] Set to 1 to skip the open-ended chat prompt (default: 0)
-  ATTN_GATE          Enable gated attention in training (1=on,0=off; default: unset/preset).
-  ATTN_GATE_INIT     Gate init logit for training (default: 4.0; sigmoid(init) is multiplier).
+  SFT_FROM           Checkpoint dir or model.safetensors to init SFT from (overrides auto-detect).
+  INF_PROMPT         Prompt used by non-demo inference (default: hi)
+  INF_MAX_NEW        Max new tokens for smoke-test inference (default: 64)
+  INF_MIN_NEW        Force at least N new tokens (default: 1)
+  INF_TEMP           0 for greedy; >0 for sampling (default: 0)
+  INF_TOP_P          Nucleus sampling threshold (default: 1.0)
+  INF_MODE           Demo mode for --infer-only (default: knowledge; other: bench)
+  INF_SUITES         [bench mode] Suites (default: copy,json,sort,math_mcq,logic,qa,knowledge)
+  INF_N              [bench mode] Examples per suite (default: 2)
+  INF_NO_CHAT        [bench mode] Set to 1 to skip the open-ended chat prompt (default: 0)
+  GATE               Enable gated attention in training (1=on,0=off; default: unset/preset).
+  GATE_INIT          Gate init logit for training (default: 4.0; sigmoid(init) is multiplier).
 USAGE
 }
 
@@ -87,9 +86,9 @@ INFER_CHECKPOINT=""
 SKIP_PRETRAIN=0
 SKIP_SFT=0
 SKIP_INFER=0
-RUN_R1=0
+RUN_R1=${R1:-0}
 OUT_DIR_WAS_SET=0
-if [ -n "${OUT_DIR+x}" ]; then
+if [ -n "${OUT+x}" ]; then
   OUT_DIR_WAS_SET=1
 fi
 
@@ -134,38 +133,42 @@ export UV_INDEX_URL=${UV_INDEX_URL:-$PIP_INDEX_URL}
 # Silence transformers advisory warning in MLX-only envs (no torch/tf/flax).
 export TRANSFORMERS_VERBOSITY=${TRANSFORMERS_VERBOSITY:-error}
 
-VENV_DIR=${VENV_DIR:-.venv_mlx}
-DATA_DIR=${DATA_DIR:-dataset/minimind}
-MLX_SMALL_DATA=${MLX_SMALL_DATA:-1}
+VENV_DIR=${VENV:-.venv_mlx}
+DATA_DIR=${DATA:-dataset/minimind}
+MLX_SMALL_DATA=${SMALL:-1}
 AUTO_DOWNLOAD_SET=0
-if [ -n "${AUTO_DOWNLOAD+x}" ]; then
+if [ -n "${AUTO_DL+x}" ]; then
   AUTO_DOWNLOAD_SET=1
 fi
-AUTO_DOWNLOAD=${AUTO_DOWNLOAD:-1}
+AUTO_DOWNLOAD=${AUTO_DL:-1}
 MAX_DOWNLOAD_MB_SET=0
-if [ -n "${MAX_DOWNLOAD_MB+x}" ]; then
+if [ -n "${DL_MAX+x}" ]; then
   MAX_DOWNLOAD_MB_SET=1
 fi
-MAX_DOWNLOAD_MB=${MAX_DOWNLOAD_MB:-2048}
-DOWNLOAD_DPO=${DOWNLOAD_DPO:-0}
-KEEP_LAST_CHECKPOINTS=${KEEP_LAST_CHECKPOINTS:-3}
+MAX_DOWNLOAD_MB=${DL_MAX:-2048}
+DOWNLOAD_DPO=${DPO_DL:-0}
+KEEP_LAST_CHECKPOINTS=${KEEP_LAST:-3}
+HF_ENDPOINT=${HF_EP:-}
+if [ -n "$HF_ENDPOINT" ]; then
+  HF_ENDPOINT=${HF_ENDPOINT%/}
+  if [[ "$HF_ENDPOINT" != http://* && "$HF_ENDPOINT" != https://* ]]; then
+    HF_ENDPOINT="https://$HF_ENDPOINT"
+  fi
+else
+  unset HF_ENDPOINT
+fi
+R1_OUT_DIR=${R1_OUT:-}
+R1_INIT_FROM=${R1_FROM:-}
 if [ "$SMOKE_TEST" -eq 1 ]; then
-  OUT_DIR=${OUT_DIR:-out/mlx_smoke}
+  OUT_DIR=${OUT:-out/mlx_smoke}
   PRESET=${PRESET:-tiny}
   DTYPE=${DTYPE:-float32}
-  CLEANUP_SMOKE=${CLEANUP_SMOKE:-1}
+  CLEANUP_SMOKE=${SMOKE_CLEAN:-1}
 else
-  OUT_DIR=${OUT_DIR:-out/mlx}
-  if [ "$MLX_SMALL_DATA" = "1" ]; then
-    PRESET=${PRESET:-custom}
-  else
-    PRESET=${PRESET:-200mb}
-    if [ "$MAX_DOWNLOAD_MB_SET" -eq 0 ]; then
-      MAX_DOWNLOAD_MB=0
-    fi
-  fi
+  OUT_DIR=${OUT:-out/mlx}
+  PRESET=${PRESET:-custom}
   DTYPE=${DTYPE:-bfloat16}
-  CLEANUP_SMOKE=${CLEANUP_SMOKE:-0}
+  CLEANUP_SMOKE=${SMOKE_CLEAN:-0}
 fi
 
 if [ "$DOWNLOAD_ONLY" -eq 1 ]; then
@@ -174,7 +177,21 @@ elif [ "$AUTO_DOWNLOAD_SET" -eq 0 ] && [ "$SKIP_PRETRAIN" -eq 1 ] && [ "$INFER_O
   AUTO_DOWNLOAD=0
 fi
 
-PYTHON_CMD=${PYTHON_CMD:-${PYTHON:-}}
+PYTHON_CMD=${PY:-}
+DEFAULT_PYTHON_VERSION=3.11
+
+USE_UV=${UV:-auto}
+if [ "$USE_UV" = "auto" ]; then
+  if command -v uv >/dev/null 2>&1; then
+    USE_UV=1
+  else
+    USE_UV=0
+  fi
+fi
+if [ "$USE_UV" = "1" ] && ! command -v uv >/dev/null 2>&1; then
+  echo "[env] UV=1 but uv not found; falling back to venv" >&2
+  USE_UV=0
+fi
 
 check_python_version() {
   local python_cmd=$1
@@ -199,44 +216,74 @@ check_python_version() {
   return 1
 }
 
+ensure_uv() {
+  if command -v uv >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local bootstrap_py=""
+  for py_candidate in python3 python; do
+    if command -v "$py_candidate" >/dev/null 2>&1; then
+      bootstrap_py=$py_candidate
+      break
+    fi
+  done
+  if [ -z "$bootstrap_py" ]; then
+    return 1
+  fi
+
+  echo "[env] uv not found; bootstrapping via $bootstrap_py"
+  "$bootstrap_py" -m ensurepip --upgrade >/dev/null 2>&1 || true
+  if ! "$bootstrap_py" -m pip install --user -U uv; then
+    return 1
+  fi
+  local user_base
+  user_base=$("$bootstrap_py" -c 'import site; print(site.getuserbase())')
+  export PATH="$user_base/bin:$PATH"
+  command -v uv >/dev/null 2>&1
+}
+
 PY_VERSION=""
+PYTHON_CMD_IS_VERSION=0
 if [ -n "$PYTHON_CMD" ]; then
-  if ! PY_VERSION=$(check_python_version "$PYTHON_CMD"); then
-    echo "[error] PYTHON_CMD must be Python 3.10-3.12 (got: $PYTHON_CMD)" >&2
+  if PY_VERSION=$(check_python_version "$PYTHON_CMD"); then
+    :
+  else
+    echo "[error] PY must be Python 3.10-3.12 (got: $PYTHON_CMD)" >&2
     exit 1
   fi
 else
-  for py_candidate in python3.12 python3.11 python3.10 python3; do
+  for py_candidate in python3.11 python3.12 python3.10 python3; do
     if PY_VERSION=$(check_python_version "$py_candidate"); then
       PYTHON_CMD=$py_candidate
       break
     fi
   done
   if [ -z "$PYTHON_CMD" ]; then
-    echo "[error] No compatible Python version found (requires 3.10-3.12)" >&2
-    echo "[error] Detected Python versions:" >&2
-    for py_test in python3.12 python3.11 python3.10 python3 python; do
-      if command -v "$py_test" >/dev/null 2>&1; then
-        "$py_test" --version >&2 || true
-      fi
-    done
-    exit 1
+    if ensure_uv; then
+      USE_UV=1
+      PYTHON_CMD=$DEFAULT_PYTHON_VERSION
+      PY_VERSION=$DEFAULT_PYTHON_VERSION
+      PYTHON_CMD_IS_VERSION=1
+      echo "[env] No compatible Python found; uv will download Python $DEFAULT_PYTHON_VERSION"
+    else
+      echo "[error] No compatible Python version found (requires 3.10-3.12)" >&2
+      echo "[error] Detected Python versions:" >&2
+      for py_test in python3.12 python3.11 python3.10 python3 python; do
+        if command -v "$py_test" >/dev/null 2>&1; then
+          "$py_test" --version >&2 || true
+        fi
+      done
+      echo "[error] Install Python 3.11+ or install uv to auto-download a compatible Python." >&2
+      exit 1
+    fi
   fi
 fi
 
-echo "[env] Using Python $PY_VERSION at $PYTHON_CMD"
-
-USE_UV=${USE_UV:-auto}
-if [ "$USE_UV" = "auto" ]; then
-  if command -v uv >/dev/null 2>&1; then
-    USE_UV=1
-  else
-    USE_UV=0
-  fi
-fi
-if [ "$USE_UV" = "1" ] && ! command -v uv >/dev/null 2>&1; then
-  echo "[env] USE_UV=1 but uv not found; falling back to venv" >&2
-  USE_UV=0
+if [ "$PYTHON_CMD_IS_VERSION" -eq 1 ]; then
+  echo "[env] Using Python $PY_VERSION via uv"
+else
+  echo "[env] Using Python $PY_VERSION at $PYTHON_CMD"
 fi
 
 validate_venv() {
@@ -273,6 +320,10 @@ else
   if [ "$USE_UV" = "1" ]; then
     echo "[env] Creating venv with uv at $VENV_DIR"
     if ! uv venv "$VENV_DIR" --python "$PYTHON_CMD" --seed; then
+      if [ "$PYTHON_CMD_IS_VERSION" -eq 1 ]; then
+        echo "[error] uv venv failed while downloading Python $PYTHON_CMD" >&2
+        exit 1
+      fi
       echo "[env] uv venv failed, falling back to venv" >&2
       rm -rf "$VENV_DIR"
       "$PYTHON_CMD" -m venv "$VENV_DIR"
@@ -307,7 +358,8 @@ if ! "$PY" -c "import mlx, transformers, huggingface_hub, requests, jinja2" >/de
 fi
 
 abs_path() {
-  "$PYTHON_CMD" -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"
+  local py_bin=${PY:-$PYTHON_CMD}
+  "$py_bin" -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"
 }
 
 safe_rm_rf() {
@@ -363,27 +415,38 @@ fi
 mkdir -p "$DATA_DIR"
 
 if [ "$SMOKE_TEST" -eq 1 ]; then
-  PRETRAIN_DATA_SPEC=${PRETRAIN_DATA_SPEC:-minimind:smoke}
-  SFT_DATA_SPEC=${SFT_DATA_SPEC:-minimind:smoke}
-  R1_DATA_SPEC=${R1_DATA_SPEC:-minimind:smoke}
+  PRETRAIN_DATA_SPEC=${PRE_DATA:-minimind:smoke}
+  SFT_DATA_SPEC=${SFT_DATA:-minimind:smoke}
+  R1_DATA_SPEC=${R1_DATA:-minimind:smoke}
 else
+  PRETRAIN_DATA_SPEC=${PRE_DATA:-minimind:auto}
   if [ "$MLX_SMALL_DATA" = "1" ]; then
-    PRETRAIN_DATA_SPEC=${PRETRAIN_DATA_SPEC:-minimind:sft_mini_512.jsonl}
-    SFT_DATA_SPEC=${SFT_DATA_SPEC:-minimind:sft_mini_512.jsonl}
-    R1_DATA_SPEC=${R1_DATA_SPEC:-minimind:sft_mini_512.jsonl}
+    SFT_DATA_SPEC=${SFT_DATA:-minimind:sft_mini_512.jsonl}
   else
-    PRETRAIN_DATA_SPEC=${PRETRAIN_DATA_SPEC:-minimind:pretrain_hq.jsonl}
-    SFT_DATA_SPEC=${SFT_DATA_SPEC:-minimind:sft_512.jsonl}
-    R1_DATA_SPEC=${R1_DATA_SPEC:-minimind:r1_mix_1024.jsonl}
+    SFT_DATA_SPEC=${SFT_DATA:-minimind:sft_512.jsonl}
   fi
+  R1_DATA_SPEC=${R1_DATA:-minimind:r1_mix_1024.jsonl}
+fi
+
+if [ "$MAX_DOWNLOAD_MB_SET" -eq 0 ]; then
+  case "$PRETRAIN_DATA_SPEC" in
+    *minimind:auto*|*minimind:pretrain_hq*|*minimind:pretrain*)
+      MAX_DOWNLOAD_MB=0
+      ;;
+  esac
 fi
 
 if [ "$INFER_ONLY" -eq 1 ]; then
   echo "[data] Skipping dataset download (--infer-only)"
 elif [ "$AUTO_DOWNLOAD" -eq 0 ]; then
-  echo "[data] Auto download disabled (AUTO_DOWNLOAD=0). Ensure datasets already exist."
+  echo "[data] Auto download disabled (AUTO_DL=0). Ensure datasets already exist."
 else
-  export DATA_DIR MAX_DOWNLOAD_MB HF_ENDPOINT
+  export DATA_DIR MAX_DOWNLOAD_MB
+  if [ -n "${HF_ENDPOINT:-}" ]; then
+    export HF_ENDPOINT
+  else
+    unset HF_ENDPOINT
+  fi
   echo "[data] Download required datasets"
   if [ "$SKIP_PRETRAIN" -eq 0 ]; then
     download_minimind "$PRETRAIN_DATA_SPEC" "pretrain"
@@ -484,36 +547,39 @@ SFT_OUT="$OUT_DIR/sft"
 R1_OUT=${R1_OUT_DIR:-"$OUT_DIR/r1"}
 
 if [ "$SMOKE_TEST" -eq 1 ]; then
-  PRETRAIN_SEQ_LEN=${PRETRAIN_SEQ_LEN:-256}
-  PRETRAIN_BATCH_SIZE=${PRETRAIN_BATCH_SIZE:-2}
-  PRETRAIN_ACCUM_STEPS=${PRETRAIN_ACCUM_STEPS:-1}
-  PRETRAIN_EPOCHS=${PRETRAIN_EPOCHS:-1}
-  PRETRAIN_MAX_STEPS=${PRETRAIN_MAX_STEPS:-5}
+  PRETRAIN_SEQ_LEN=${PRE_LEN:-256}
+  PRETRAIN_BATCH_SIZE=${PRE_BS:-2}
+  PRETRAIN_ACCUM_STEPS=${PRE_ACCUM:-1}
+  PRETRAIN_EPOCHS=${PRE_EPOCH:-1}
+  PRETRAIN_MAX_STEPS=${PRE_MAX:-5}
 
-  SFT_SEQ_LEN=${SFT_SEQ_LEN:-256}
-  SFT_BATCH_SIZE=${SFT_BATCH_SIZE:-2}
-  SFT_ACCUM_STEPS=${SFT_ACCUM_STEPS:-1}
-  SFT_EPOCHS=${SFT_EPOCHS:-1}
-  SFT_MAX_STEPS=${SFT_MAX_STEPS:-5}
+  SFT_SEQ_LEN=${SFT_LEN:-256}
+  SFT_BATCH_SIZE=${SFT_BS:-2}
+  SFT_ACCUM_STEPS=${SFT_ACCUM:-1}
+  SFT_EPOCHS=${SFT_EPOCH:-1}
+  SFT_MAX_STEPS=${SFT_MAX:-5}
 
   LOG_INTERVAL=${LOG_INTERVAL:-1}
   SAVE_INTERVAL=${SAVE_INTERVAL:-2}
 else
-  PRETRAIN_SEQ_LEN=${PRETRAIN_SEQ_LEN:-1024}
-  PRETRAIN_BATCH_SIZE=${PRETRAIN_BATCH_SIZE:-1}
-  PRETRAIN_ACCUM_STEPS=${PRETRAIN_ACCUM_STEPS:-8}
-  PRETRAIN_EPOCHS=${PRETRAIN_EPOCHS:-1}
-  PRETRAIN_MAX_STEPS=${PRETRAIN_MAX_STEPS:-}
+  PRETRAIN_SEQ_LEN=${PRE_LEN:-1024}
+  PRETRAIN_BATCH_SIZE=${PRE_BS:-1}
+  PRETRAIN_ACCUM_STEPS=${PRE_ACCUM:-8}
+  PRETRAIN_EPOCHS=${PRE_EPOCH:-1}
+  PRETRAIN_MAX_STEPS=${PRE_MAX:-}
 
-  SFT_SEQ_LEN=${SFT_SEQ_LEN:-512}
-  SFT_BATCH_SIZE=${SFT_BATCH_SIZE:-1}
-  SFT_ACCUM_STEPS=${SFT_ACCUM_STEPS:-8}
-  SFT_EPOCHS=${SFT_EPOCHS:-1}
-  SFT_MAX_STEPS=${SFT_MAX_STEPS:-}
+  SFT_SEQ_LEN=${SFT_LEN:-512}
+  SFT_BATCH_SIZE=${SFT_BS:-1}
+  SFT_ACCUM_STEPS=${SFT_ACCUM:-8}
+  SFT_EPOCHS=${SFT_EPOCH:-1}
+  SFT_MAX_STEPS=${SFT_MAX:-}
 
   LOG_INTERVAL=${LOG_INTERVAL:-10}
   SAVE_INTERVAL=${SAVE_INTERVAL:-200}
 fi
+
+ATTN_GATE=${GATE:-}
+ATTN_GATE_INIT=${GATE_INIT:-}
 
 if [ "$SKIP_PRETRAIN" -eq 0 ]; then
   PRETRAIN_RESUME=$(latest_ckpt "$PRETRAIN_OUT")
@@ -568,7 +634,7 @@ if [ "$SKIP_SFT" -eq 0 ]; then
   if [ "$SMOKE_TEST" -eq 1 ] && [ -n "$SFT_MAX_STEPS" ]; then
     SFT_MAX_STEPS=$(smoke_bump_max_steps "$SFT_RESUME" "$SFT_MAX_STEPS" "${SMOKE_EXTRA_STEPS:-5}")
   fi
-  INIT_FROM=${MLX_INIT_FROM:-}
+  INIT_FROM=${SFT_FROM:-}
   if [ -z "$INIT_FROM" ]; then
     INIT_FROM=$(latest_ckpt "$PRETRAIN_OUT")
   fi
@@ -612,7 +678,7 @@ if [ "$SKIP_SFT" -eq 0 ]; then
     SFT_ARGS+=(--resume "$SFT_RESUME")
   else
     if [ -z "$INIT_FROM" ]; then
-      echo "[error] No pretrain checkpoint found for SFT init; run without --skip-pretrain or set MLX_INIT_FROM" >&2
+      echo "[error] No pretrain checkpoint found for SFT init; run without --skip-pretrain or set SFT_FROM" >&2
       exit 1
     fi
     SFT_ARGS+=(--init_from "$INIT_FROM")
@@ -626,17 +692,17 @@ fi
 
 if [ "$RUN_R1" -eq 1 ]; then
   if [ "$SMOKE_TEST" -eq 1 ]; then
-    R1_SEQ_LEN=${R1_SEQ_LEN:-256}
-    R1_BATCH_SIZE=${R1_BATCH_SIZE:-2}
-    R1_ACCUM_STEPS=${R1_ACCUM_STEPS:-1}
-    R1_EPOCHS=${R1_EPOCHS:-1}
-    R1_MAX_STEPS=${R1_MAX_STEPS:-5}
+    R1_SEQ_LEN=${R1_LEN:-256}
+    R1_BATCH_SIZE=${R1_BS:-2}
+    R1_ACCUM_STEPS=${R1_ACCUM:-1}
+    R1_EPOCHS=${R1_EPOCH:-1}
+    R1_MAX_STEPS=${R1_MAX:-5}
   else
-    R1_SEQ_LEN=${R1_SEQ_LEN:-1024}
-    R1_BATCH_SIZE=${R1_BATCH_SIZE:-1}
-    R1_ACCUM_STEPS=${R1_ACCUM_STEPS:-8}
-    R1_EPOCHS=${R1_EPOCHS:-1}
-    R1_MAX_STEPS=${R1_MAX_STEPS:-}
+    R1_SEQ_LEN=${R1_LEN:-1024}
+    R1_BATCH_SIZE=${R1_BS:-1}
+    R1_ACCUM_STEPS=${R1_ACCUM:-8}
+    R1_EPOCHS=${R1_EPOCH:-1}
+    R1_MAX_STEPS=${R1_MAX:-}
   fi
 
   R1_RESUME=$(latest_ckpt "$R1_OUT")
@@ -727,18 +793,18 @@ if [ "$SKIP_INFER" -eq 0 ]; then
   fi
 
   if [ -n "$INFER_CKPT" ]; then
-    INFER_PROMPT=${INFER_PROMPT:-hi}
-    INFER_MAX_NEW_TOKENS=${INFER_MAX_NEW_TOKENS:-64}
-    INFER_MIN_NEW_TOKENS=${INFER_MIN_NEW_TOKENS:-1}
-    INFER_TEMPERATURE=${INFER_TEMPERATURE:-0}
-    INFER_TOP_P=${INFER_TOP_P:-1.0}
+    INFER_PROMPT=${INF_PROMPT:-hi}
+    INFER_MAX_NEW_TOKENS=${INF_MAX_NEW:-64}
+    INFER_MIN_NEW_TOKENS=${INF_MIN_NEW:-1}
+    INFER_TEMPERATURE=${INF_TEMP:-0}
+    INFER_TOP_P=${INF_TOP_P:-1.0}
     echo
     echo "[stage] infer"
     if [ "$INFER_DEMO" -eq 1 ]; then
-      INFER_DEMO_MODE=${INFER_DEMO_MODE:-knowledge}
-      INFER_DEMO_SUITES=${INFER_DEMO_SUITES:-copy,json,sort,math_mcq,logic,qa,knowledge}
-      INFER_DEMO_N=${INFER_DEMO_N:-2}
-      INFER_DEMO_NO_CHAT=${INFER_DEMO_NO_CHAT:-0}
+      INFER_DEMO_MODE=${INF_MODE:-knowledge}
+      INFER_DEMO_SUITES=${INF_SUITES:-copy,json,sort,math_mcq,logic,qa,knowledge}
+      INFER_DEMO_N=${INF_N:-2}
+      INFER_DEMO_NO_CHAT=${INF_NO_CHAT:-0}
       DEMO_ARGS=(--checkpoint "$INFER_CKPT" --mode "$INFER_DEMO_MODE" --max_new_tokens "$INFER_MAX_NEW_TOKENS")
       if [ "$INFER_DEMO_MODE" = "bench" ]; then
         DEMO_ARGS+=(--suite "$INFER_DEMO_SUITES" --n "$INFER_DEMO_N")
@@ -772,4 +838,4 @@ fi
 
 echo
 echo "[done] MLX pipeline finished."
-echo "[note] DPO training is not implemented in mlx_train yet; set DOWNLOAD_DPO=1 if you still want to download dpo.jsonl."
+echo "[note] DPO training is not implemented in mlx_train yet; set DPO_DL=1 if you still want to download dpo.jsonl."

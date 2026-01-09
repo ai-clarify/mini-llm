@@ -11,13 +11,13 @@
   ],
   "train_args": [],
   "env": {
-    "OUT_DIR": "out/mlx_smoke_dashboard",
-    "VENV_DIR": ".venv_mlx",
-    "DATA_DIR": "dataset/minimind",
+    "OUT": "out/mlx_smoke_dashboard",
+    "VENV": ".venv_mlx",
+    "DATA": "dataset/minimind",
     "PRESET": "tiny",
     "DTYPE": "float32",
-    "KEEP_LAST_CHECKPOINTS": 3,
-    "MAX_DOWNLOAD_MB": 2048,
-    "CLEANUP_SMOKE": 0
+    "KEEP_LAST": 3,
+    "DL_MAX": 2048,
+    "SMOKE_CLEAN": 0
   }
 }

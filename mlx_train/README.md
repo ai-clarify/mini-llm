@@ -25,7 +25,7 @@ bash scripts/run_mlx.sh
 bash scripts/run_mlx.sh --smoke-test
 ```
 
-> `--smoke-test` 默认会自动删除输出目录（`out/mlx_smoke`），如需保留可设置 `CLEANUP_SMOKE=0`。
+> `--smoke-test` 默认会自动删除输出目录（`out/mlx_smoke`），如需保留可设置 `SMOKE_CLEAN=0`。
 
 ## 快速 Smoke（推荐先跑通）
 
@@ -105,12 +105,12 @@ python3 -m mlx_train.train \
 - `minimind:smoke`：极小数据（`lora_identity.jsonl`，约 23KB）
 - DPO 数据：`minimind:dpo.jsonl`；兼容别名 `minimind:dpo_pairs.jsonl`（会在本地生成同名文件）
 - 默认下载保护：`--max_download_mb=2048`（超过会报错，需显式放开）
-- `scripts/run_mlx.sh` 默认不会下载 DPO（MLX 还未实现 DPO 训练），如需预先下载可设置 `DOWNLOAD_DPO=1`。
+- `scripts/run_mlx.sh` 默认不会下载 DPO（MLX 还未实现 DPO 训练），如需预先下载可设置 `DPO_DL=1`。
 
 如果本地访问 HuggingFace 较慢/不可用，可设置镜像端点：
 
 ```bash
-export HF_ENDPOINT=https://hf-mirror.com
+export HF_EP=https://hf-mirror.com
 ```
 
 ## 训练 200MB（≈200M params）预设
@@ -132,7 +132,7 @@ python3 -m mlx_train.train \
 训练时可以开启 attention 残差分支的标量 gate（`x <- x + sigmoid(gate)*attn_out`），用于做结构对比实验：
 
 ```bash
-ATTN_GATE=1 bash scripts/run_mlx.sh
+GATE=1 bash scripts/run_mlx.sh
 ```
 
 完成预训练后，可用 `--init_from` 将权重带入 SFT：
@@ -182,7 +182,7 @@ bash scripts/run_mlx.sh --infer-only
 如需切换回合成做题/打分风格（bench 模式）：
 
 ```bash
-INFER_DEMO_MODE=bench bash scripts/run_mlx.sh --infer-only
+INF_MODE=bench bash scripts/run_mlx.sh --infer-only
 ```
 
 ### 推理激活追踪（逐 token 可视化）

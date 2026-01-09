@@ -787,7 +787,7 @@ def _start_training_from_config(config_path: str) -> TrainingJob:
         if train_args:
             cmd.extend(["--", *train_args])
 
-        out_dir = env.get("OUT_DIR")
+        out_dir = env.get("OUT")
         if not out_dir:
             out_dir = "out/mlx_smoke" if "--smoke-test" in script_args else "out/mlx"
 
