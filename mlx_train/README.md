@@ -251,6 +251,33 @@ bash scripts/bench_mlx.sh --suite math_mcq --checkpoint out/mlx/sft/checkpoints/
 bash scripts/bench_mlx.sh --ollama_model qwen3:8b
 ```
 
+## MLX 运行 Qwen3-0.6B（HF 权重）
+
+基于 `mlx-lm` 转换 HF 权重为 MLX 格式，并在本机运行。
+
+```bash
+# 安装 mlx-lm
+python3 -m pip install mlx-lm
+
+# 一键转换 + 推理（默认 Qwen/Qwen3-0.6B）
+bash scripts/run_mlx_hf_qwen3.sh
+```
+
+常用环境变量：
+
+- `HF_REPO`（默认 `Qwen/Qwen3-0.6B`）
+- `OUT_DIR`（默认 `out/mlx_hf/qwen_qwen3_0_6b`）
+- `PROMPT` / `SYSTEM` / `MAX_TOKENS` / `TEMPERATURE` / `TOP_P`
+- `QUANTIZE=1` / `Q_BITS=4` / `Q_GROUP_SIZE=64` / `Q_MODE=affine`（可选量化）
+- `DTYPE=float16|bfloat16|float32`（可选）
+
+也可手动分步执行：
+
+```bash
+python3 -m mlx_train.hf_convert --hf_repo Qwen/Qwen3-0.6B
+python3 -m mlx_train.hf_infer --prompt \"Hello\" --max_tokens 128
+```
+
 ## 蒸馏（Ollama Qwen3:0.6b 合成数据 -> MLX SFT）
 
 目标：用本机 `ollama` 的 `qwen3:0.6b` 生成偏 **知识问答 / 逻辑推理 / 数学计算** 的合成 SFT 数据，并在生成的同时启动 MLX 训练（先冷启动生成一部分数据再开训）。

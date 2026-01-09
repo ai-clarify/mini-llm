@@ -38,6 +38,8 @@ both PyTorch and MLX (Apple Silicon), plus data preparation utilities and eval.
 - Preserve checkpoint layout under `out/mlx/{pretrain,sft,r1}`.
 - Keep large artifacts in `out/` or `dataset/`; do not commit them.
 - Prefer minimal changes with clear docs updates.
+- Deliver professional, well-considered results; ensure changes are coherent, documented, and ready to run.
+- Benchmark outputs should include progress and actionable failure guidance.
 
 ## Validation
 

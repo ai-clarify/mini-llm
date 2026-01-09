@@ -97,6 +97,18 @@ OLLAMA_MODEL=qwen3:0.6b DATA_JSONL=out/distill_ollama_qwen3_0.6b/synth.jsonl OUT
   bash scripts/run_mlx_distill_ollama.sh
 ```
 
+### EAGLE-3 speculator（Qwen3-0.6B，纯合成数据）
+
+```bash
+# 自动生成合成数据 + 训练 EAGLE-3 style speculator
+python scripts/train_eagle3_speculator.py
+```
+
+```bash
+# 推理（speculative decoding）
+python scripts/infer_eagle3_speculator.py --prompt "Hi"
+```
+
 ### PyTorch 蒸馏训练
 
 ```bash
