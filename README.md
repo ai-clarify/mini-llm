@@ -106,19 +106,53 @@ OLLAMA_MODEL=qwen3:0.6b DATA_JSONL=out/distill_ollama_qwen3_0.6b/synth.jsonl OUT
 ### EAGLE-3 speculator（Qwen3-0.6B，纯合成数据）
 
 ```bash
-# 自动生成合成数据 + 训练 EAGLE-3 style speculator
+# Torch：自动生成合成数据 + 训练 EAGLE-3 style speculator
+python train/torch/train_eagle3_speculator.py
+```
+
+```bash
+# Torch：推理（speculative decoding）
+python infer/torch/spec_decode.py --prompt "Hi"
+```
+
+```bash
+# Torch：推理（优化版，连续两次命中失败则切回基线）
+python infer/torch/spec_decode_optimized.py --prompt "Hi"
+```
+
+```bash
+# Torch：基准对比（baseline vs speculator）
+python infer/torch/bench.py --max_samples 16
+```
+
+```bash
+# MLX：先转换 HF 模型（或直接传 --hf_repo 让 mlx-lm 下载）
+python -m mlx_train.hf_convert --hf_repo Qwen/Qwen3-0.6B
+```
+
+```bash
+# MLX：自动生成合成数据 + 训练 speculator
+python train/mlx/train_eagle3_speculator.py --model_dir out/mlx_hf/qwen_qwen3_0_6b
+```
+
+```bash
+# MLX：推理（speculative decoding）
+python infer/mlx/spec_decode.py --model_dir out/mlx_hf/qwen_qwen3_0_6b --prompt "Hi"
+```
+
+```bash
+# MLX：推理（优化版，连续两次命中失败则切回基线）
+python infer/mlx/spec_decode_optimized.py --model_dir out/mlx_hf/qwen_qwen3_0_6b --prompt "Hi"
+```
+
+```bash
+# 兼容旧脚本（仍可用）
 python scripts/train_eagle3_speculator.py
-```
-
-```bash
-# 推理（speculative decoding）
 python scripts/infer_eagle3_speculator.py --prompt "Hi"
-```
-
-```bash
-# 基准对比（baseline vs speculator）
 python scripts/bench_eagle3_speculator.py --max_samples 16
 ```
+
+> MLX 推理/训练依赖 `mlx-lm`（当前与 transformers==5.0.0rc1 绑定），建议使用独立虚拟环境。
 
 ### PyTorch 蒸馏训练
 
