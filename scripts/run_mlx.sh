@@ -30,6 +30,8 @@ Options:
   -h, --help         Show this help message and exit.
 
 Environment overrides (common):
+  PYTHON_CMD        Python interpreter to use (default: auto-detect 3.10-3.12)
+  PYTHON            Alias for PYTHON_CMD
   VENV_DIR           Virtualenv directory (default: .venv_mlx)
   USE_UV             Use uv to create/install venv (default: auto)
   OUT_DIR            Output root (default: out/mlx; smoke-test: out/mlx_smoke)
@@ -172,11 +174,57 @@ elif [ "$AUTO_DOWNLOAD_SET" -eq 0 ] && [ "$SKIP_PRETRAIN" -eq 1 ] && [ "$INFER_O
   AUTO_DOWNLOAD=0
 fi
 
-PYTHON_CMD=${PYTHON_CMD:-python3}
-if ! command -v "$PYTHON_CMD" >/dev/null 2>&1; then
-  echo "[error] python3 not found" >&2
-  exit 1
+PYTHON_CMD=${PYTHON_CMD:-${PYTHON:-}}
+
+check_python_version() {
+  local python_cmd=$1
+  if [ -z "$python_cmd" ]; then
+    return 1
+  fi
+  if [ -x "$python_cmd" ]; then
+    :
+  elif ! command -v "$python_cmd" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local py_version
+  py_version=$("$python_cmd" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null) || return 1
+  local major=${py_version%%.*}
+  local minor=${py_version#*.}
+
+  if [ "$major" -eq 3 ] && [ "$minor" -ge 10 ] && [ "$minor" -le 12 ]; then
+    echo "$py_version"
+    return 0
+  fi
+  return 1
+}
+
+PY_VERSION=""
+if [ -n "$PYTHON_CMD" ]; then
+  if ! PY_VERSION=$(check_python_version "$PYTHON_CMD"); then
+    echo "[error] PYTHON_CMD must be Python 3.10-3.12 (got: $PYTHON_CMD)" >&2
+    exit 1
+  fi
+else
+  for py_candidate in python3.12 python3.11 python3.10 python3; do
+    if PY_VERSION=$(check_python_version "$py_candidate"); then
+      PYTHON_CMD=$py_candidate
+      break
+    fi
+  done
+  if [ -z "$PYTHON_CMD" ]; then
+    echo "[error] No compatible Python version found (requires 3.10-3.12)" >&2
+    echo "[error] Detected Python versions:" >&2
+    for py_test in python3.12 python3.11 python3.10 python3 python; do
+      if command -v "$py_test" >/dev/null 2>&1; then
+        "$py_test" --version >&2 || true
+      fi
+    done
+    exit 1
+  fi
 fi
+
+echo "[env] Using Python $PY_VERSION at $PYTHON_CMD"
 
 USE_UV=${USE_UV:-auto}
 if [ "$USE_UV" = "auto" ]; then
@@ -186,22 +234,69 @@ if [ "$USE_UV" = "auto" ]; then
     USE_UV=0
   fi
 fi
+if [ "$USE_UV" = "1" ] && ! command -v uv >/dev/null 2>&1; then
+  echo "[env] USE_UV=1 but uv not found; falling back to venv" >&2
+  USE_UV=0
+fi
 
-if [ "$USE_UV" = "1" ]; then
-  if [ ! -x "$VENV_DIR/bin/python" ]; then
-    echo "[env] Creating venv with uv at $VENV_DIR"
-    uv venv "$VENV_DIR" --python "$PYTHON_CMD" --seed
+validate_venv() {
+  local venv_path=$1
+  if [ ! -d "$venv_path" ]; then
+    return 1
   fi
-  PY="$VENV_DIR/bin/python"
-  echo "[env] Using $PY"
-  uv pip install -r mlx_train/requirements.txt -p "$PY"
+  if [ ! -x "$venv_path/bin/python" ]; then
+    return 1
+  fi
+  if ! "$venv_path/bin/python" -m pip --version >/dev/null 2>&1; then
+    return 1
+  fi
+
+  local venv_py_version
+  venv_py_version=$("$venv_path/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null) || return 1
+  local major=${venv_py_version%%.*}
+  local minor=${venv_py_version#*.}
+  if [ "$major" -eq 3 ] && [ "$minor" -ge 10 ] && [ "$minor" -le 12 ]; then
+    return 0
+  fi
+  return 1
+}
+
+if validate_venv "$VENV_DIR"; then
+  VENV_PY_VERSION=$("$VENV_DIR/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+  echo "[env] Using existing virtual environment at $VENV_DIR (Python $VENV_PY_VERSION)"
 else
-  if [ ! -x "$VENV_DIR/bin/python" ]; then
+  if [ -d "$VENV_DIR" ]; then
+    echo "[env] Virtual environment at $VENV_DIR is broken or incompatible, removing it"
+    rm -rf "$VENV_DIR"
+  fi
+
+  if [ "$USE_UV" = "1" ]; then
+    echo "[env] Creating venv with uv at $VENV_DIR"
+    if ! uv venv "$VENV_DIR" --python "$PYTHON_CMD" --seed; then
+      echo "[env] uv venv failed, falling back to venv" >&2
+      rm -rf "$VENV_DIR"
+      "$PYTHON_CMD" -m venv "$VENV_DIR"
+    fi
+  else
     echo "[env] Creating venv at $VENV_DIR"
     "$PYTHON_CMD" -m venv "$VENV_DIR"
   fi
-  PY="$VENV_DIR/bin/python"
-  echo "[env] Using $PY"
+fi
+
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+  echo "[error] Python interpreter not found in $VENV_DIR after setup" >&2
+  exit 1
+fi
+
+PY="$VENV_DIR/bin/python"
+echo "[env] Using $PY"
+if [ "$USE_UV" = "1" ]; then
+  if ! uv pip install -r mlx_train/requirements.txt -p "$PY"; then
+    echo "[env] uv pip install failed, falling back to pip" >&2
+    "$PY" -m pip -q install --upgrade pip
+    "$PY" -m pip -q install -r mlx_train/requirements.txt
+  fi
+else
   "$PY" -m pip -q install --upgrade pip
   "$PY" -m pip -q install -r mlx_train/requirements.txt
 fi
