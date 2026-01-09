@@ -22,6 +22,62 @@ from mlx_train.nn.lora import merge_lora
 from dflash_mlx.utils import resolve_dataset
 
 
+def _is_valid_ckpt_dir(path: Path) -> bool:
+    return (path / "model.safetensors").is_file() and (path / "config.json").is_file()
+
+
+def _step_num(path: Path) -> int:
+    name = path.name
+    if name.startswith("step_"):
+        try:
+            return int(name.split("_", 1)[1])
+        except ValueError:
+            return -1
+    return -1
+
+
+def _find_latest_checkpoint(path: Path) -> Optional[Path]:
+    if not path.exists() or not path.is_dir():
+        return None
+    candidates = sorted(
+        [p for p in path.glob("step_*") if p.is_dir()],
+        key=_step_num,
+        reverse=True,
+    )
+    for cand in candidates:
+        if _is_valid_ckpt_dir(cand):
+            return cand
+    return None
+
+
+def resolve_checkpoint_dir(path: Path) -> Path:
+    if path.is_file():
+        if path.name == "model.safetensors":
+            path = path.parent
+        else:
+            raise FileNotFoundError(f"Checkpoint must be a directory: {path}")
+
+    if _is_valid_ckpt_dir(path):
+        return path
+
+    # Try common layouts: stage_dir/checkpoints/step_*
+    ckpt = _find_latest_checkpoint(path / "checkpoints")
+    if ckpt is not None:
+        return ckpt
+
+    # Try stage dirs under a run root.
+    for stage in ("sft", "r1", "pretrain"):
+        ckpt = _find_latest_checkpoint(path / stage / "checkpoints")
+        if ckpt is not None:
+            return ckpt
+
+    raise FileNotFoundError(
+        "No valid checkpoint found. Expect a directory containing "
+        "`model.safetensors` and `config.json`, or a stage dir with "
+        "`checkpoints/step_*`."
+    )
+
+
 def load_config(checkpoint_dir: Path) -> MiniLLMConfig:
     config_path = checkpoint_dir / "config.json"
     if not config_path.exists():
@@ -64,14 +120,17 @@ def load_mlx_model(
     override_layers: Optional[int] = None,
     filter_layers: bool = False,
 ) -> Tuple[MiniLLMForCausalLM, MiniLLMConfig]:
-    cfg = load_config(checkpoint_dir)
+    resolved_dir = resolve_checkpoint_dir(checkpoint_dir)
+    if resolved_dir != checkpoint_dir:
+        print(f"[bench] resolved checkpoint: {resolved_dir}")
+    cfg = load_config(resolved_dir)
     if override_layers is not None:
         cfg.num_hidden_layers = int(override_layers)
     model = MiniLLMForCausalLM(cfg)
 
-    weights_path = checkpoint_dir / "model.safetensors"
+    weights_path = resolved_dir / "model.safetensors"
     if not weights_path.exists():
-        raise FileNotFoundError(f"Missing model.safetensors in {checkpoint_dir}")
+        raise FileNotFoundError(f"Missing model.safetensors in {resolved_dir}")
 
     if filter_layers:
         weights = dict(mx.load(str(weights_path)))

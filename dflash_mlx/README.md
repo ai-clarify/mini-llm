@@ -10,10 +10,11 @@ benchmark with a smaller checkpoint.
 
 ## Quick start
 
-1) Prepare a MLX checkpoint (example: tiny smoke test)
+1) Prepare a MLX checkpoint (example: tiny smoke test). Note that smoke-test
+cleans outputs by default; set `CLEANUP_SMOKE=0` or provide `OUT=...` to keep them.
 
 ```bash
-bash scripts/run_mlx.sh --smoke-test
+CLEANUP_SMOKE=0 bash scripts/run_mlx.sh --smoke-test
 ```
 
 This produces checkpoints under `out/mlx_smoke` (e.g. `out/mlx_smoke/sft/checkpoints/step_XXXXXX`).
