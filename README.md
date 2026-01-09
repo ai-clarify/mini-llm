@@ -175,14 +175,19 @@ python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir
 
 ```text
 .
+├── apps/                # 服务与 UI（OpenAI API / WebUI / Dashboard）
 ├── data/                # 数据缓存目录
 ├── dataset/             # 公开数据集示例与脚本
 ├── docs/                # 文档与指南
+├── infer/               # Speculator 推理入口（torch/mlx）
+├── mlx_train/           # MLX 训练与推理
 ├── model/               # MiniLLM Dense/MoE 实现
+├── pipelines/           # 一键训练/推理流水线脚本（主逻辑）
+├── scripts/             # 兼容入口（薄封装，指向 apps/tools/pipelines）
 ├── tokenizer/           # RustBPE 分词与词表
 ├── trainer/             # 训练/对齐/蒸馏脚本
-├── scripts/             # 一键训练/推理/工具脚本
-├── mlx_train/           # MLX 训练与推理
+├── train/               # Speculator 训练入口（torch/mlx）
+├── tools/               # 数据/评测/转换/分词等工具脚本
 └── utils/               # 公共工具与评估脚本
 ```
 

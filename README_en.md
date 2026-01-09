@@ -175,14 +175,19 @@ python scripts/bench_eagle3_speculator.py --max_samples 16
 
 ```text
 .
+├── apps/                # Services & UI (OpenAI API / WebUI / Dashboard)
 ├── data/                # Data cache
 ├── dataset/             # Public dataset examples
 ├── docs/                # Documentation
+├── infer/               # Speculator inference entrypoints (torch/mlx)
+├── mlx_train/           # MLX training and inference
 ├── model/               # MiniLLM Dense/MoE implementations
+├── pipelines/           # One-click pipeline scripts (main logic)
+├── scripts/             # Legacy entrypoints (thin wrappers to apps/tools/pipelines)
 ├── tokenizer/           # RustBPE tokenizer assets
 ├── trainer/             # Training/alignment/distillation scripts
-├── scripts/             # One-click training/inference/tools
-├── mlx_train/           # MLX training and inference
+├── train/               # Speculator training entrypoints (torch/mlx)
+├── tools/               # Data/eval/convert/tokenizer utilities
 └── utils/               # Shared utilities and evaluation helpers
 ```
 
