@@ -38,6 +38,12 @@ conda activate minillm
 pip install -r requirements.txt
 ```
 
+If downloads are slow, use the Tsinghua PyPI mirror:
+
+```bash
+python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+```
+
 ### 2) Data
 
 - Put raw corpora under `dataset/` or a custom directory

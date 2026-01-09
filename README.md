@@ -38,6 +38,12 @@ conda activate minillm
 pip install -r requirements.txt
 ```
 
+如果下载较慢，可使用清华源：
+
+```bash
+python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r requirements.txt
+```
+
 ### 2) 数据准备
 
 - 将原始语料放在 `dataset/` 或自定义目录
