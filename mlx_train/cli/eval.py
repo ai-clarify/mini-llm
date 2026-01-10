@@ -61,6 +61,25 @@ def main() -> None:
     parser.add_argument("--data_dir", type=str, default="./dataset/minimind")
     parser.add_argument("--hf_repo_id", type=str, default="jingyaogong/minimind_dataset")
     parser.add_argument("--hf_endpoint", type=str, default=None)
+    parser.add_argument(
+        "--data_source",
+        type=str,
+        default=os.environ.get("MINIMIND_DATA_SOURCE", "modelscope"),
+        help="Dataset source for `minimind:*` specs: modelscope|hf (default: MINIMIND_DATA_SOURCE or modelscope).",
+    )
+    parser.add_argument(
+        "--ms_dataset_repo",
+        type=str,
+        default=os.environ.get("MINIMIND_DATA_REPO", "gongjy/minimind_dataset"),
+        help="ModelScope dataset repo used by `minimind:*` specs (default: MINIMIND_DATA_REPO or gongjy/minimind_dataset).",
+    )
+    parser.add_argument(
+        "--ms_cache_dir",
+        type=str,
+        default=os.environ.get("MINIMIND_MS_CACHE"),
+        help="ModelScope cache directory (default: MINIMIND_MS_CACHE).",
+    )
+    parser.add_argument("--ms_revision", type=str, default=None, help="Optional ModelScope revision/tag.")
     parser.add_argument("--force_download", action="store_true")
     parser.add_argument("--max_download_mb", type=int, default=2048)
     parser.add_argument("--seq_len", type=int, default=1024)
@@ -100,6 +119,10 @@ def main() -> None:
         hf_endpoint=args.hf_endpoint,
         force_download=bool(args.force_download),
         max_download_mb=int(args.max_download_mb),
+        data_source=args.data_source,
+        ms_repo_id=args.ms_dataset_repo or args.hf_repo_id,
+        ms_cache_dir=args.ms_cache_dir,
+        ms_revision=args.ms_revision,
     )
     paths = resolve_jsonl_paths(resolved)
 

@@ -40,7 +40,12 @@ Environment overrides:
   SFT_DATA          Dataset spec for SFT (default: minimind:sft_mini_512.jsonl)
   R1_DATA           Dataset spec for R1 stage (default: minimind:r1_mix_1024.jsonl)
   AUTO_DL           Auto-download datasets when needed (default: 1; auto-disabled when --skip-pretrain is set)
-  HF_EP             Optional HuggingFace mirror endpoint (e.g. https://hf-mirror.com)
+  MINIMIND_DATA_SOURCE
+                    Dataset source for minimind:* specs (modelscope|hf; default: modelscope)
+  MINIMIND_DATA_REPO
+                    Dataset repo id for minimind:* specs (default: gongjy/minimind_dataset)
+  MINIMIND_MS_CACHE ModelScope cache dir (default: ~/.cache/modelscope)
+  HF_EP             Optional HuggingFace mirror endpoint (only when MINIMIND_DATA_SOURCE=hf)
   DL_MAX            Per-file download guard in MB (default: 2048; set 0 to disable).
                     When PRE_DATA is large and DL_MAX is not set, defaults to 0.
   DPO_DL            Download DPO dataset too (default: 0; MLX DPO training not implemented)
@@ -135,6 +140,10 @@ export TRANSFORMERS_VERBOSITY=${TRANSFORMERS_VERBOSITY:-error}
 
 VENV_DIR=${VENV:-.venv_mlx}
 DATA_DIR=${DATA:-dataset/minimind}
+MINIMIND_DATA_SOURCE=${MINIMIND_DATA_SOURCE:-modelscope}
+MINIMIND_DATA_REPO=${MINIMIND_DATA_REPO:-gongjy/minimind_dataset}
+MINIMIND_MS_CACHE=${MINIMIND_MS_CACHE:-$HOME/.cache/modelscope}
+export MINIMIND_DATA_SOURCE MINIMIND_DATA_REPO MINIMIND_MS_CACHE
 MLX_SMALL_DATA=${SMALL:-1}
 AUTO_DOWNLOAD_SET=0
 if [ -n "${AUTO_DL+x}" ]; then
@@ -396,10 +405,12 @@ print(
         "${spec}",
         task="${task}",
         data_dir=os.environ.get("DATA_DIR", "dataset/minimind"),
-        hf_repo_id="jingyaogong/minimind_dataset",
+        hf_repo_id=os.environ.get("MINIMIND_DATA_REPO", "gongjy/minimind_dataset"),
         hf_endpoint=os.environ.get("HF_ENDPOINT"),
         force_download=False,
         max_download_mb=int(os.environ.get("MAX_DOWNLOAD_MB", "2048")),
+        data_source=os.environ.get("MINIMIND_DATA_SOURCE", "modelscope"),
+        ms_cache_dir=os.environ.get("MINIMIND_MS_CACHE"),
     )
 )
 PY
@@ -441,7 +452,7 @@ if [ "$INFER_ONLY" -eq 1 ]; then
 elif [ "$AUTO_DOWNLOAD" -eq 0 ]; then
   echo "[data] Auto download disabled (AUTO_DL=0). Ensure datasets already exist."
 else
-  export DATA_DIR MAX_DOWNLOAD_MB
+  export DATA_DIR MAX_DOWNLOAD_MB MINIMIND_DATA_SOURCE MINIMIND_DATA_REPO MINIMIND_MS_CACHE
   if [ -n "${HF_ENDPOINT:-}" ]; then
     export HF_ENDPOINT
   else

@@ -84,7 +84,7 @@ python3 -m mlx_train.train \
 
 ## 自动下载训练数据（MiniMind 数据集）
 
-脚本支持在 `--data_path` 里直接写 `minimind:*`，会自动从 HuggingFace 的 `jingyaogong/minimind_dataset` 下载到 `--data_dir`（默认 `./dataset`）。
+脚本支持在 `--data_path` 里直接写 `minimind:*`，默认从 ModelScope 的数据集仓库下载到 `--data_dir`（默认 `./dataset`）。
 
 ```bash
 # Smoke：下载极小数据并跑通（不会拉取大文件）
@@ -107,7 +107,14 @@ python3 -m mlx_train.train \
 - 默认下载保护：`--max_download_mb=2048`（超过会报错，需显式放开）
 - `scripts/run_mlx.sh` 默认不会下载 DPO（MLX 还未实现 DPO 训练），如需预先下载可设置 `DPO_DL=1`。
 
-如果本地访问 HuggingFace 较慢/不可用，可设置镜像端点：
+切换数据源：
+
+- ModelScope（默认）：`MINIMIND_DATA_SOURCE=modelscope`，仓库由 `MINIMIND_DATA_REPO` 指定（默认 `gongjy/minimind_dataset`）。
+- HuggingFace：`MINIMIND_DATA_SOURCE=hf`，仓库默认 `jingyaogong/minimind_dataset`。
+
+ModelScope 下载依赖 `modelscope`（如未安装请先 `pip install modelscope`）。
+
+如需使用 HuggingFace 镜像，可设置端点：
 
 ```bash
 export HF_EP=https://hf-mirror.com

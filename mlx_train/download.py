@@ -25,6 +25,17 @@ def _is_url(value: str) -> bool:
     return value.startswith("http://") or value.startswith("https://")
 
 
+def _normalize_data_source(source: Optional[str]) -> str:
+    if source is None or not str(source).strip():
+        source = os.environ.get("MINIMIND_DATA_SOURCE") or os.environ.get("DATA_SOURCE") or "modelscope"
+    value = str(source).strip().lower()
+    if value in {"modelscope", "ms", "model-scope"}:
+        return "modelscope"
+    if value in {"hf", "huggingface", "huggingface_hub"}:
+        return "huggingface"
+    raise ValueError(f"Unsupported data source: {source}")
+
+
 def _filename_from_url(url: str) -> str:
     parsed = urlparse(url)
     name = os.path.basename(parsed.path)
@@ -153,6 +164,91 @@ def ensure_hf_dataset_file(
     return os.fspath(path)
 
 
+def ensure_ms_dataset_file(
+    *,
+    repo_id: str,
+    filename: str,
+    data_dir: str,
+    force: bool = False,
+    max_download_mb: int = 0,
+    revision: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+) -> str:
+    try:
+        from modelscope.hub.snapshot_download import snapshot_download
+    except Exception as e:  # pragma: no cover
+        raise DataDownloadError(
+            "Missing `modelscope` for dataset download. Install via `pip install modelscope` "
+            "or set MINIMIND_DATA_SOURCE=hf to use HuggingFace."
+        ) from e
+
+    local_path = Path(data_dir) / filename
+    if local_path.exists() and local_path.stat().st_size > 0 and not force:
+        return os.fspath(local_path)
+
+    Path(data_dir).mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id,
+        repo_type="dataset",
+        local_dir=data_dir,
+        local_dir_use_symlinks=False,
+        allow_patterns=[filename],
+        revision=revision,
+        cache_dir=cache_dir,
+        force_download=force,
+    )
+
+    candidate = local_path
+    if not candidate.exists():
+        matches = list(Path(data_dir).rglob(filename))
+        if matches:
+            candidate = matches[0]
+        else:
+            raise DataDownloadError(f"Downloaded dataset file not found: {filename}")
+
+    max_bytes = _max_bytes(max_download_mb)
+    if max_bytes is not None and candidate.stat().st_size > max_bytes:
+        raise DataDownloadError(
+            f"Refusing to download {repo_id}/{filename} ({candidate.stat().st_size/1024/1024:.1f} MiB) because it exceeds "
+            f"--max_download_mb={max_download_mb}. Increase the limit or set it to 0."
+        )
+
+    return os.fspath(candidate)
+
+
+def ensure_dataset_file(
+    *,
+    data_source: Optional[str],
+    repo_id: str,
+    filename: str,
+    data_dir: str,
+    endpoint: Optional[str],
+    force: bool,
+    max_download_mb: int,
+    ms_revision: Optional[str] = None,
+    ms_cache_dir: Optional[str] = None,
+) -> str:
+    source = _normalize_data_source(data_source)
+    if source == "modelscope":
+        return ensure_ms_dataset_file(
+            repo_id=repo_id,
+            filename=filename,
+            data_dir=data_dir,
+            force=force,
+            max_download_mb=max_download_mb,
+            revision=ms_revision,
+            cache_dir=ms_cache_dir,
+        )
+    return ensure_hf_dataset_file(
+        repo_id=repo_id,
+        filename=filename,
+        data_dir=data_dir,
+        endpoint=endpoint,
+        force=force,
+        max_download_mb=max_download_mb,
+    )
+
+
 def resolve_data_path_spec(
     spec: str,
     *,
@@ -162,6 +258,10 @@ def resolve_data_path_spec(
     hf_endpoint: Optional[str],
     force_download: bool,
     max_download_mb: int,
+    data_source: Optional[str] = None,
+    ms_repo_id: Optional[str] = None,
+    ms_revision: Optional[str] = None,
+    ms_cache_dir: Optional[str] = None,
 ) -> str:
     """
     Expand a comma-separated `--data_path` spec into local paths.
@@ -172,12 +272,15 @@ def resolve_data_path_spec(
     - `minimind:auto` / `minimind`: maps to the recommended dataset for `task`.
     - `minimind:small`: maps to a smaller SFT dataset (good for quick runs).
     - `minimind:smoke`: maps to a tiny SFT dataset (smoke test).
-    - `minimind:<filename>`: downloads from HF dataset repo.
+    - `minimind:<filename>`: downloads from ModelScope or HuggingFace dataset repo (see MINIMIND_DATA_SOURCE).
     """
 
     pieces = _split_csv(spec)
     if not pieces:
         raise ValueError("data_path is empty")
+
+    source = _normalize_data_source(data_source)
+    ms_repo_id = ms_repo_id or hf_repo_id
 
     out: List[str] = []
     for piece in pieces:
@@ -203,13 +306,17 @@ def resolve_data_path_spec(
             remote_filename = filename
             if requested_filename == "dpo_pairs.jsonl":
                 remote_filename = "dpo.jsonl"
-            local_path = ensure_hf_dataset_file(
-                repo_id=hf_repo_id,
+            repo_id = ms_repo_id if source == "modelscope" else hf_repo_id
+            local_path = ensure_dataset_file(
+                data_source=source,
+                repo_id=repo_id,
                 filename=remote_filename,
                 data_dir=data_dir,
                 endpoint=hf_endpoint,
                 force=force_download,
                 max_download_mb=max_download_mb,
+                ms_revision=ms_revision,
+                ms_cache_dir=ms_cache_dir,
             )
             if requested_filename != remote_filename:
                 alias_path = Path(data_dir) / requested_filename

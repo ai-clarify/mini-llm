@@ -78,6 +78,10 @@ unset NO_PROXY
 export PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
 
 VENV_DIR=${VENV_DIR:-.venv}
+MINIMIND_DATA_SOURCE=${MINIMIND_DATA_SOURCE:-modelscope}
+MINIMIND_DATA_REPO=${MINIMIND_DATA_REPO:-gongjy/minimind_dataset}
+MINIMIND_MS_CACHE=${MINIMIND_MS_CACHE:-$HOME/.cache/modelscope}
+export MINIMIND_DATA_SOURCE MINIMIND_DATA_REPO MINIMIND_MS_CACHE
 
 # Check Python version compatibility (requires Python 3.9-3.12)
 check_python_version() {
@@ -471,15 +475,17 @@ download_minimind_file() {
   local filename=$1
   python - <<PY
 import os
-from mlx_train.download import ensure_hf_dataset_file
+from mlx_train.download import ensure_dataset_file
 
-path = ensure_hf_dataset_file(
-    repo_id=os.environ.get("MINIMIND_DATA_REPO", "jingyaogong/minimind_dataset"),
+path = ensure_dataset_file(
+    data_source=os.environ.get("MINIMIND_DATA_SOURCE", "modelscope"),
+    repo_id=os.environ.get("MINIMIND_DATA_REPO", "gongjy/minimind_dataset"),
     filename="${filename}",
     data_dir=os.environ.get("MINIMIND_DATA_DIR", "dataset/minimind"),
     endpoint=os.environ.get("HF_ENDPOINT"),
     force=False,
     max_download_mb=int(os.environ.get("MAX_DOWNLOAD_MB", "0")),
+    ms_cache_dir=os.environ.get("MINIMIND_MS_CACHE"),
 )
 print(path)
 PY
