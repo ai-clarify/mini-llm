@@ -299,6 +299,12 @@ def main() -> None:
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=500)
     parser.add_argument(
+        "--head_rank",
+        type=int,
+        default=None,
+        help="Low-rank speculator head size (reduces params; full head if unset).",
+    )
+    parser.add_argument(
         "--early_stop_loss",
         type=float,
         default=None,
@@ -372,11 +378,13 @@ def main() -> None:
         else:
             print(f"[speculator] auto spec_len={spec_len} spec_layers={spec_layers}")
 
+    head_rank = args.head_rank if args.head_rank is not None and int(args.head_rank) > 0 else None
     speculator = build_speculator(
         target_arch=args.target_arch,
         target=target,
         spec_len=args.spec_len,
         spec_layers=args.spec_layers,
+        head_rank=head_rank,
     )
 
     dtype = _resolve_dtype(args.dtype)
@@ -384,7 +392,11 @@ def main() -> None:
     speculator.train()
 
     trainable = _count_trainable_params(speculator.trainable_parameters())
-    print(f"[speculator] params={trainable / 1e6:.2f}M spec_len={args.spec_len} spec_layers={args.spec_layers}")
+    head_note = f" head_rank={head_rank}" if head_rank else ""
+    print(
+        f"[speculator] params={trainable / 1e6:.2f}M spec_len={args.spec_len} "
+        f"spec_layers={args.spec_layers}{head_note}"
+    )
 
     dataset = SyntheticChatDataset(Path(args.data_path), tokenizer, max_seq_len=args.max_seq_len)
     if len(dataset) == 0:
@@ -416,6 +428,7 @@ def main() -> None:
         "max_seq_len": args.max_seq_len,
         "spec_len": args.spec_len,
         "spec_layers": args.spec_layers,
+        "head_rank": head_rank,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "batch_size": args.batch_size,

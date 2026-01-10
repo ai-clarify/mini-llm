@@ -111,6 +111,16 @@ class SyntheticChatDataset(Dataset):
         )
 
 
+class LowRankHead(nn.Module):
+    def __init__(self, *, hidden_size: int, vocab_size: int, rank: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, int(rank), bias=False)
+        self.out = nn.Linear(int(rank), vocab_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.out(self.proj(x))
+
+
 class Eagle3Speculator(nn.Module):
     def __init__(
         self,
@@ -122,6 +132,7 @@ class Eagle3Speculator(nn.Module):
         spec_heads: int,
         dropout: float,
         init_weight: Optional[torch.Tensor],
+        head_rank: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
@@ -139,10 +150,16 @@ class Eagle3Speculator(nn.Module):
             ]
         )
         self.norm = nn.LayerNorm(hidden_size)
-        self.heads = nn.ModuleList([nn.Linear(hidden_size, vocab_size, bias=False) for _ in range(int(spec_len))])
-        if init_weight is not None:
-            for head in self.heads:
-                head.weight.data.copy_(init_weight)
+        rank = int(head_rank) if head_rank is not None and int(head_rank) > 0 else 0
+        if rank > 0:
+            self.heads = nn.ModuleList(
+                [LowRankHead(hidden_size=hidden_size, vocab_size=vocab_size, rank=rank) for _ in range(int(spec_len))]
+            )
+        else:
+            self.heads = nn.ModuleList([nn.Linear(hidden_size, vocab_size, bias=False) for _ in range(int(spec_len))])
+            if init_weight is not None:
+                for head in self.heads:
+                    head.weight.data.copy_(init_weight)
 
     def forward(self, hidden: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> List[torch.Tensor]:
         x = hidden
@@ -345,6 +362,12 @@ def main() -> None:
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=500)
     parser.add_argument(
+        "--head_rank",
+        type=int,
+        default=None,
+        help="Low-rank speculator head size (reduces params; full head if unset).",
+    )
+    parser.add_argument(
         "--early_stop_loss",
         type=float,
         default=None,
@@ -448,6 +471,7 @@ def main() -> None:
     if hasattr(target, "lm_head") and isinstance(target.lm_head, nn.Linear):
         init_weight = target.lm_head.weight.detach().clone()
 
+    head_rank = args.head_rank if args.head_rank is not None and int(args.head_rank) > 0 else None
     speculator = Eagle3Speculator(
         hidden_size=hidden_size,
         vocab_size=vocab_size,
@@ -456,10 +480,15 @@ def main() -> None:
         spec_heads=spec_heads,
         dropout=args.spec_dropout,
         init_weight=init_weight,
+        head_rank=head_rank,
     ).to(device)
 
     trainable = sum(p.numel() for p in speculator.parameters() if p.requires_grad)
-    print(f"[speculator] params={trainable / 1e6:.2f}M spec_len={args.spec_len} spec_layers={args.spec_layers}")
+    head_note = f" head_rank={head_rank}" if head_rank else ""
+    print(
+        f"[speculator] params={trainable / 1e6:.2f}M spec_len={args.spec_len} "
+        f"spec_layers={args.spec_layers}{head_note}"
+    )
 
     dataset = SyntheticChatDataset(Path(args.data_path), tokenizer, max_seq_len=args.max_seq_len)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
@@ -482,6 +511,7 @@ def main() -> None:
         "spec_len": args.spec_len,
         "spec_layers": args.spec_layers,
         "spec_heads": spec_heads,
+        "head_rank": head_rank,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "batch_size": args.batch_size,

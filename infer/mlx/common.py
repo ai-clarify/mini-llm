@@ -179,6 +179,16 @@ def _get_minillm_deps():
     return _MINILLM_DEPS
 
 
+class LowRankHead(nn.Module):
+    def __init__(self, *, hidden_size: int, vocab_size: int, rank: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, int(rank), bias=False)
+        self.out = nn.Linear(int(rank), vocab_size, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.out(self.proj(x))
+
+
 class Qwen3Speculator(nn.Module):
     def __init__(
         self,
@@ -187,16 +197,21 @@ class Qwen3Speculator(nn.Module):
         spec_len: int,
         spec_layers: int,
         init_weight: Optional[mx.array],
+        head_rank: Optional[int] = None,
     ) -> None:
         super().__init__()
         _, _, qwen3_model, create_attention_mask = _get_qwen3_deps()
         self._create_attention_mask = create_attention_mask
         self.layers = [qwen3_model.TransformerBlock(args=args) for _ in range(int(spec_layers))]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
-        self.heads = [nn.Linear(args.hidden_size, args.vocab_size, bias=False) for _ in range(int(spec_len))]
-        if init_weight is not None:
-            for head in self.heads:
-                head.weight = init_weight
+        rank = int(head_rank) if head_rank is not None and int(head_rank) > 0 else 0
+        if rank > 0:
+            self.heads = [LowRankHead(hidden_size=args.hidden_size, vocab_size=args.vocab_size, rank=rank) for _ in range(int(spec_len))]
+        else:
+            self.heads = [nn.Linear(args.hidden_size, args.vocab_size, bias=False) for _ in range(int(spec_len))]
+            if init_weight is not None:
+                for head in self.heads:
+                    head.weight = init_weight
 
     def __call__(self, hidden: mx.array, attention_mask: Optional[mx.array] = None) -> List[mx.array]:
         x = hidden
@@ -219,15 +234,23 @@ class MiniLLMSpeculator(nn.Module):
         spec_len: int,
         spec_layers: int,
         init_weight: Optional[mx.array],
+        head_rank: Optional[int] = None,
     ) -> None:
         super().__init__()
         _, _, _, MiniLLMBlock, RMSNorm = _get_minillm_deps()
         self.layers = [MiniLLMBlock(i, config) for i in range(int(spec_layers))]
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.heads = [nn.Linear(config.hidden_size, config.vocab_size, bias=False) for _ in range(int(spec_len))]
-        if init_weight is not None:
-            for head in self.heads:
-                head.weight = init_weight
+        rank = int(head_rank) if head_rank is not None and int(head_rank) > 0 else 0
+        if rank > 0:
+            self.heads = [
+                LowRankHead(hidden_size=config.hidden_size, vocab_size=config.vocab_size, rank=rank)
+                for _ in range(int(spec_len))
+            ]
+        else:
+            self.heads = [nn.Linear(config.hidden_size, config.vocab_size, bias=False) for _ in range(int(spec_len))]
+            if init_weight is not None:
+                for head in self.heads:
+                    head.weight = init_weight
 
     def __call__(self, hidden: mx.array, attention_mask: Optional[mx.array] = None) -> List[mx.array]:
         x = hidden
@@ -245,6 +268,7 @@ def build_speculator(
     target: nn.Module,
     spec_len: int,
     spec_layers: int,
+    head_rank: Optional[int] = None,
 ) -> nn.Module:
     init_weight = None
     if hasattr(target, "args") and getattr(target.args, "tie_word_embeddings", False):
@@ -262,6 +286,7 @@ def build_speculator(
             spec_len=spec_len,
             spec_layers=spec_layers,
             init_weight=init_weight,
+            head_rank=head_rank,
         )
 
     if not hasattr(target, "args"):
@@ -272,6 +297,7 @@ def build_speculator(
         spec_len=spec_len,
         spec_layers=spec_layers,
         init_weight=init_weight,
+        head_rank=head_rank,
     )
 
 
@@ -283,6 +309,7 @@ def load_speculator(
     speculator_ckpt: Optional[Path],
     spec_len: int,
     spec_layers: int,
+    head_rank: Optional[int],
 ) -> Tuple[nn.Module, int]:
     cfg_path = speculator_dir / "speculator_config.json"
     if cfg_path.is_file():
@@ -291,12 +318,15 @@ def load_speculator(
         spec_len = int(cfg.get("spec_len", spec_len))
         spec_layers = int(cfg.get("spec_layers", spec_layers))
         target_arch = str(cfg.get("target_arch", target_arch))
+        if "head_rank" in cfg:
+            head_rank = cfg.get("head_rank", head_rank)
 
     speculator = build_speculator(
         target_arch=target_arch,
         target=target,
         spec_len=spec_len,
         spec_layers=spec_layers,
+        head_rank=head_rank,
     )
 
     if speculator_ckpt is None:
@@ -658,6 +688,12 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
     parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
+    parser.add_argument(
+        "--head_rank",
+        type=int,
+        default=None,
+        help="Low-rank speculator head size (reduces params; full head if unset).",
+    )
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--no_speculator", action="store_true")
     parser.add_argument("--no_cache", action="store_true")
@@ -698,6 +734,7 @@ def run_cli(*, optimized: bool) -> None:
     spec_len, spec_layers = _resolve_spec_config(
         args.spec_len, args.spec_layers, param_count=_count_params_mlx(target)
     )
+    head_rank = args.head_rank if args.head_rank is not None and int(args.head_rank) > 0 else None
     if not args.no_speculator:
         speculator_dir = Path(args.speculator_dir)
         speculator_ckpt = Path(args.speculator_ckpt) if args.speculator_ckpt else None
@@ -708,6 +745,7 @@ def run_cli(*, optimized: bool) -> None:
             speculator_ckpt=speculator_ckpt,
             spec_len=spec_len,
             spec_layers=spec_layers,
+            head_rank=head_rank,
         )
 
     start = time.time()

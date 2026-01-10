@@ -181,6 +181,16 @@ def sample_next_token(logits: torch.Tensor, *, temperature: float, top_p: float)
     return int(sorted_idx.gather(-1, picked).item())
 
 
+class LowRankHead(nn.Module):
+    def __init__(self, *, hidden_size: int, vocab_size: int, rank: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(hidden_size, int(rank), bias=False)
+        self.out = nn.Linear(int(rank), vocab_size, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.out(self.proj(x))
+
+
 class Eagle3Speculator(nn.Module):
     def __init__(
         self,
@@ -192,6 +202,7 @@ class Eagle3Speculator(nn.Module):
         spec_heads: int,
         dropout: float,
         init_weight: Optional[torch.Tensor],
+        head_rank: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList(
@@ -209,10 +220,16 @@ class Eagle3Speculator(nn.Module):
             ]
         )
         self.norm = nn.LayerNorm(hidden_size)
-        self.heads = nn.ModuleList([nn.Linear(hidden_size, vocab_size, bias=False) for _ in range(int(spec_len))])
-        if init_weight is not None:
-            for head in self.heads:
-                head.weight.data.copy_(init_weight)
+        rank = int(head_rank) if head_rank is not None and int(head_rank) > 0 else 0
+        if rank > 0:
+            self.heads = nn.ModuleList(
+                [LowRankHead(hidden_size=hidden_size, vocab_size=vocab_size, rank=rank) for _ in range(int(spec_len))]
+            )
+        else:
+            self.heads = nn.ModuleList([nn.Linear(hidden_size, vocab_size, bias=False) for _ in range(int(spec_len))])
+            if init_weight is not None:
+                for head in self.heads:
+                    head.weight.data.copy_(init_weight)
 
     def forward(self, hidden: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> List[torch.Tensor]:
         x = hidden
@@ -238,6 +255,7 @@ def load_speculator(
     spec_len: int,
     spec_layers: int,
     spec_heads: int,
+    head_rank: Optional[int],
     dropout: float,
 ) -> Tuple[Eagle3Speculator, int]:
     cfg_path = speculator_dir / "speculator_config.json"
@@ -247,6 +265,8 @@ def load_speculator(
         spec_len = int(cfg.get("spec_len", spec_len))
         spec_layers = int(cfg.get("spec_layers", spec_layers))
         spec_heads = int(cfg.get("spec_heads", spec_heads))
+        if "head_rank" in cfg:
+            head_rank = cfg.get("head_rank", head_rank)
 
     hidden_size = int(getattr(target.config, "hidden_size"))
     vocab_size = int(getattr(target.config, "vocab_size"))
@@ -271,6 +291,7 @@ def load_speculator(
         spec_heads=spec_heads,
         dropout=dropout,
         init_weight=init_weight,
+        head_rank=head_rank,
     )
 
     if speculator_ckpt is None:
@@ -491,6 +512,12 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
     parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
     parser.add_argument("--spec_heads", type=int, default=0)
+    parser.add_argument(
+        "--head_rank",
+        type=int,
+        default=None,
+        help="Low-rank speculator head size (reduces params; full head if unset).",
+    )
     parser.add_argument("--spec_dropout", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--no_speculator", action="store_true")
@@ -526,6 +553,7 @@ def run_cli(*, optimized: bool) -> None:
     spec_len, spec_layers = _resolve_spec_config(
         args.spec_len, args.spec_layers, param_count=_count_params_torch(target)
     )
+    head_rank = args.head_rank if args.head_rank is not None and int(args.head_rank) > 0 else None
     if not args.no_speculator:
         speculator_dir = Path(args.speculator_dir)
         speculator_ckpt = Path(args.speculator_ckpt) if args.speculator_ckpt else None
@@ -536,6 +564,7 @@ def run_cli(*, optimized: bool) -> None:
             spec_len=spec_len,
             spec_layers=spec_layers,
             spec_heads=args.spec_heads,
+            head_rank=head_rank,
             dropout=args.spec_dropout,
         )
         speculator = speculator.to(device)
