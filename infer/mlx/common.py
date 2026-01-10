@@ -462,15 +462,16 @@ def speculative_decode(
         if use_cache:
             draft_arr = mx.array([draft_tokens], dtype=mx.int32)
             block_hidden = target.model(draft_arr, cache=cache)
-            block_logits = _project_logits_qwen3(target, block_hidden)
+            prev_hidden = mx.concatenate([last_hidden, block_hidden], axis=1)[:, :-1, :]
+            block_logits = _project_logits_qwen3(target, prev_hidden)
             mx.eval(block_logits)
         else:
             full = mx.array([output_ids + draft_tokens], dtype=mx.int32)
             full_hidden = target.model(full, cache=None)
-            full_logits = _project_logits_qwen3(target, full_hidden)
-            mx.eval(full_logits)
-            block_logits = full_logits[:, -len(draft_tokens) :, :]
             block_hidden = full_hidden[:, -len(draft_tokens) :, :]
+            prev_hidden = mx.concatenate([last_hidden, block_hidden], axis=1)[:, :-1, :]
+            block_logits = _project_logits_qwen3(target, prev_hidden)
+            mx.eval(block_logits)
 
         posterior_tokens = [
             sample_next_token(block_logits[0, i, :], temperature=temperature, top_p=top_p)
@@ -604,10 +605,10 @@ def speculative_decode_minillm(
 
         full = mx.array([output_ids + draft_tokens], dtype=mx.int32)
         full_hidden = target.model(full)
-        full_logits = _project_logits_minillm(target, full_hidden)
-        mx.eval(full_logits)
-        block_logits = full_logits[:, -len(draft_tokens) :, :]
         block_hidden = full_hidden[:, -len(draft_tokens) :, :]
+        prev_hidden = mx.concatenate([last_hidden, block_hidden], axis=1)[:, :-1, :]
+        block_logits = _project_logits_minillm(target, prev_hidden)
+        mx.eval(block_logits)
 
         posterior_tokens = [
             sample_next_token(block_logits[0, i, :], temperature=temperature, top_p=top_p)

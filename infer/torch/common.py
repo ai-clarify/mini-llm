@@ -341,6 +341,7 @@ def speculative_decode(
     past = out.past_key_values if use_cache else None
     hidden = _extract_hidden_state(out)
     last_hidden = hidden[:, -1:, :]
+    last_logits = out.logits[:, -1, :]
 
     produced = 0
     consecutive_misses = 0
@@ -374,9 +375,10 @@ def speculative_decode(
             block_logits = block_out.logits[:, -len(draft_tokens) :, :]
             block_hidden = _extract_hidden_state(block_out)[:, -len(draft_tokens) :, :]
             past_snapshot = None
+        shifted_logits = torch.cat([last_logits.unsqueeze(1), block_logits[:, :-1, :]], dim=1)
 
         posterior_tokens = [
-            sample_next_token(block_logits[:, i, :], temperature=temperature, top_p=top_p)
+            sample_next_token(shifted_logits[:, i, :], temperature=temperature, top_p=top_p)
             for i in range(len(draft_tokens))
         ]
 
@@ -422,6 +424,7 @@ def speculative_decode(
             if accept_len == len(draft_tokens):
                 past = block_out.past_key_values
                 last_hidden = block_hidden[:, -1:, :]
+                last_logits = block_out.logits[:, -1, :]
             else:
                 if past_snapshot is None:
                     out = target(
@@ -432,6 +435,7 @@ def speculative_decode(
                     )
                     past = out.past_key_values if use_cache else None
                     last_hidden = _extract_hidden_state(out)[:, -1:, :]
+                    last_logits = out.logits[:, -1, :]
                 else:
                     past = past_snapshot
                     accept_tensor = torch.tensor([new_tokens], dtype=torch.long, device=device)
@@ -444,6 +448,7 @@ def speculative_decode(
                     )
                     past = accept_out.past_key_values
                     last_hidden = _extract_hidden_state(accept_out)[:, -1:, :]
+                    last_logits = accept_out.logits[:, -1, :]
         else:
             out = target(
                 input_ids=output_ids,
@@ -452,6 +457,7 @@ def speculative_decode(
                 return_dict=True,
             )
             last_hidden = _extract_hidden_state(out)[:, -1:, :]
+            last_logits = out.logits[:, -1, :]
 
     if optimized and produced < int(max_new_tokens):
         fallback_ids = baseline_decode(

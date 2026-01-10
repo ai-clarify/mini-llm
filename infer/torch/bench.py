@@ -441,6 +441,7 @@ def speculative_generate(
     )
     past = out.past_key_values if use_cache else None
     last_hidden = _extract_hidden_state(out)[:, -1:, :]
+    last_logits = out.logits[:, -1, :]
     time_to_first_token = time.perf_counter() - prefill_start
 
     output_ids = input_ids[0].tolist()
@@ -480,9 +481,10 @@ def speculative_generate(
             block_logits = block_out.logits[:, -block_len:, :]
             block_hidden = _extract_hidden_state(block_out)[:, -block_len:, :]
             past_snapshot = None
+        shifted_logits = torch.cat([last_logits.unsqueeze(1), block_logits[:, :-1, :]], dim=1)
 
         posterior_tokens = [
-            sample_next_token(block_logits[:, i, :], temperature=temperature, top_p=top_p)
+            sample_next_token(shifted_logits[:, i, :], temperature=temperature, top_p=top_p)
             for i in range(block_len)
         ]
 
@@ -512,6 +514,7 @@ def speculative_generate(
             if accept_len == block_len:
                 past = block_out.past_key_values
                 last_hidden = block_hidden[:, -1:, :]
+                last_logits = block_out.logits[:, -1, :]
             else:
                 if past_snapshot is None:
                     out = target(
@@ -522,6 +525,7 @@ def speculative_generate(
                     )
                     past = out.past_key_values if use_cache else None
                     last_hidden = _extract_hidden_state(out)[:, -1:, :]
+                    last_logits = out.logits[:, -1, :]
                 else:
                     past = past_snapshot
                     accept_tensor = torch.tensor([new_tokens], dtype=torch.long, device=input_ids.device)
@@ -534,6 +538,7 @@ def speculative_generate(
                     )
                     past = accept_out.past_key_values
                     last_hidden = _extract_hidden_state(accept_out)[:, -1:, :]
+                    last_logits = accept_out.logits[:, -1, :]
         else:
             out = target(
                 input_ids=input_ids.new_tensor([output_ids]),
@@ -542,6 +547,7 @@ def speculative_generate(
                 return_dict=True,
             )
             last_hidden = _extract_hidden_state(out)[:, -1:, :]
+            last_logits = out.logits[:, -1, :]
 
     total_decode_time = time.perf_counter() - decode_start
     num_output_tokens = max(len(output_ids) - num_input_tokens, 0)
