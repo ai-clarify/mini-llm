@@ -199,7 +199,7 @@ class MiniLLMVLM(MiniLLMForCausalLM):
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+        past_key_values: Optional[List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]]] = None,
         use_cache: bool = False,
         logits_to_keep: Union[int, torch.Tensor] = 0,
         pixel_values: Optional[torch.FloatTensor] = None,
@@ -212,9 +212,15 @@ class MiniLLMVLM(MiniLLMForCausalLM):
         if past_key_values is None:
             past_key_values_list = [None] * len(self.model.layers)
         else:
-            past_key_values_list = list(past_key_values)
+            past_key_values_list = [
+                None
+                if past_key_value is None or past_key_value[0] is None or past_key_value[1] is None
+                else past_key_value
+                for past_key_value in past_key_values
+            ]
 
-        start_pos = past_key_values_list[0][0].shape[1] if past_key_values_list[0] is not None else 0
+        first_past = past_key_values_list[0]
+        start_pos = first_past[0].shape[1] if first_past is not None else 0
 
         hidden_states = self.model.dropout(self.model.embed_tokens(input_ids))
 

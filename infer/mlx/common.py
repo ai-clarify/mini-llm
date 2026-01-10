@@ -133,6 +133,7 @@ def _token_prob_from_logits(
     temperature: float,
     top_p: float,
 ) -> float:
+    """Token probability under (temp, top_p). Time O(V) best/avg/worst, space O(V)."""
     logits = logits.reshape(-1)
     token_id = int(token)
     if temperature <= 0:
@@ -153,6 +154,39 @@ def _token_prob_from_logits(
     mask = sorted_idx == token_id
     prob = mx.sum(filtered_probs * mask)
     return float(prob.item())
+
+
+def _accept_reject_block(
+    *,
+    draft_tokens: List[int],
+    draft_logits_list: List[mx.array],
+    target_logits: mx.array,
+    temperature: float,
+    top_p: float,
+) -> Tuple[int, List[int], bool]:
+    """Reject-sampling acceptance for a draft block. Time O(k) best/avg/worst, space O(k), k=block_len."""
+    accept_len = 0
+    new_tokens: List[int] = []
+    rejected = False
+    for i, draft_token in enumerate(draft_tokens):
+        draft_logits = draft_logits_list[i][0, -1, :]
+        target_step_logits = target_logits[0, i, :]
+        q_prob = _token_prob_from_logits(
+            draft_logits, draft_token, temperature=temperature, top_p=top_p
+        )
+        p_prob = _token_prob_from_logits(
+            target_step_logits, draft_token, temperature=temperature, top_p=top_p
+        )
+        accept_prob = 0.0 if q_prob <= 0.0 else min(1.0, p_prob / q_prob)
+        if float(mx.random.uniform().item()) < accept_prob:
+            new_tokens.append(int(draft_token))
+            accept_len += 1
+            continue
+        token = sample_next_token(target_step_logits, temperature=temperature, top_p=top_p)
+        new_tokens.append(int(token))
+        rejected = True
+        break
+    return accept_len, new_tokens, rejected
 
 
 def _project_logits_qwen3(target: nn.Module, hidden: mx.array) -> mx.array:
@@ -518,29 +552,13 @@ def _speculative_decode_qwen3(
             block_logits = _project_logits_qwen3(target, prev_hidden)
             mx.eval(block_logits)
 
-        accept_len = 0
-        new_tokens: List[int] = []
-        rejected = False
-        for i in range(len(draft_tokens)):
-            draft_token = int(draft_tokens[i])
-            draft_logits = logits_list[i][0, -1, :]
-            target_logits = block_logits[0, i, :]
-            q_prob = _token_prob_from_logits(
-                draft_logits, draft_token, temperature=temperature, top_p=top_p
-            )
-            p_prob = _token_prob_from_logits(
-                target_logits, draft_token, temperature=temperature, top_p=top_p
-            )
-            accept_prob = 0.0 if q_prob <= 0.0 else min(1.0, p_prob / q_prob)
-            u = float(mx.random.uniform().item())
-            if u < accept_prob:
-                new_tokens.append(draft_token)
-                accept_len += 1
-                continue
-            token = sample_next_token(target_logits, temperature=temperature, top_p=top_p)
-            new_tokens.append(int(token))
-            rejected = True
-            break
+        accept_len, new_tokens, rejected = _accept_reject_block(
+            draft_tokens=draft_tokens,
+            draft_logits_list=logits_list,
+            target_logits=block_logits,
+            temperature=temperature,
+            top_p=top_p,
+        )
 
         bonus_added = False
         if not rejected and accept_len == len(draft_tokens) and remaining > len(draft_tokens):
@@ -754,29 +772,13 @@ def _speculative_decode_minillm(
         block_logits = _project_logits_minillm(target, prev_hidden)
         mx.eval(block_logits)
 
-        accept_len = 0
-        new_tokens: List[int] = []
-        rejected = False
-        for i in range(len(draft_tokens)):
-            draft_token = int(draft_tokens[i])
-            draft_logits = logits_list[i][0, -1, :]
-            target_logits = block_logits[0, i, :]
-            q_prob = _token_prob_from_logits(
-                draft_logits, draft_token, temperature=temperature, top_p=top_p
-            )
-            p_prob = _token_prob_from_logits(
-                target_logits, draft_token, temperature=temperature, top_p=top_p
-            )
-            accept_prob = 0.0 if q_prob <= 0.0 else min(1.0, p_prob / q_prob)
-            u = float(mx.random.uniform().item())
-            if u < accept_prob:
-                new_tokens.append(draft_token)
-                accept_len += 1
-                continue
-            token = sample_next_token(target_logits, temperature=temperature, top_p=top_p)
-            new_tokens.append(int(token))
-            rejected = True
-            break
+        accept_len, new_tokens, rejected = _accept_reject_block(
+            draft_tokens=draft_tokens,
+            draft_logits_list=logits_list,
+            target_logits=block_logits,
+            temperature=temperature,
+            top_p=top_p,
+        )
 
         if not rejected and accept_len == len(draft_tokens) and remaining > len(draft_tokens):
             bonus_logits = _project_logits_minillm(target, block_hidden[:, -1:, :])[:, -1, :]

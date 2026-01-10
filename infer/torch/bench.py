@@ -237,6 +237,7 @@ def _token_prob_from_logits(
     temperature: float,
     top_p: float,
 ) -> float:
+    """Token probability under (temp, top_p). Time O(V) best/avg/worst, space O(V)."""
     token_id = int(token)
     logits = logits.reshape(-1)
     if temperature <= 0:
