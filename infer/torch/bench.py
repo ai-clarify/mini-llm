@@ -230,6 +230,36 @@ def sample_next_token(logits: torch.Tensor, *, temperature: float, top_p: float)
     return int(sorted_idx.gather(-1, picked).item())
 
 
+def _token_prob_from_logits(
+    logits: torch.Tensor,
+    token: int,
+    *,
+    temperature: float,
+    top_p: float,
+) -> float:
+    token_id = int(token)
+    logits = logits.reshape(-1)
+    if temperature <= 0:
+        return 1.0 if int(torch.argmax(logits, dim=-1).item()) == token_id else 0.0
+    scaled = logits / float(temperature)
+    if top_p >= 1.0:
+        probs = torch.softmax(scaled, dim=-1)
+        return float(probs[token_id].item())
+    sorted_logits, sorted_idx = torch.sort(scaled, descending=True)
+    probs = torch.softmax(sorted_logits, dim=-1)
+    cumprobs = torch.cumsum(probs, dim=-1)
+    mask = cumprobs > float(top_p)
+    if mask[..., 0].item():
+        mask[..., 0] = False
+    filtered_logits = torch.where(
+        mask, torch.tensor(-1e9, device=logits.device), sorted_logits
+    )
+    filtered_probs = torch.softmax(filtered_logits, dim=-1)
+    token_mask = sorted_idx == token_id
+    prob = (filtered_probs * token_mask).sum()
+    return float(prob.item())
+
+
 class LowRankHead(torch.nn.Module):
     def __init__(self, *, hidden_size: int, vocab_size: int, rank: int) -> None:
         super().__init__()
@@ -487,26 +517,42 @@ def speculative_generate(
             past_snapshot = None
         shifted_logits = torch.cat([last_logits.unsqueeze(1), block_logits[:, :-1, :]], dim=1)
 
-        posterior_tokens = [
-            sample_next_token(shifted_logits[:, i, :], temperature=temperature, top_p=top_p)
-            for i in range(block_len)
-        ]
-
         accept_len = 0
+        new_tokens: List[int] = []
+        rejected = False
         for i in range(block_len):
-            if draft_tokens[i] == posterior_tokens[i]:
+            draft_token = int(draft_tokens[i])
+            draft_logits = logits_list[i][:, -1, :]
+            target_logits = shifted_logits[:, i, :]
+            q_prob = _token_prob_from_logits(
+                draft_logits, draft_token, temperature=temperature, top_p=top_p
+            )
+            p_prob = _token_prob_from_logits(
+                target_logits, draft_token, temperature=temperature, top_p=top_p
+            )
+            accept_prob = 0.0 if q_prob <= 0.0 else min(1.0, p_prob / q_prob)
+            u = float(torch.rand(1, device=input_ids.device).item())
+            if u < accept_prob:
+                new_tokens.append(draft_token)
                 accept_len += 1
-            else:
-                break
+                continue
+            token = sample_next_token(target_logits, temperature=temperature, top_p=top_p)
+            new_tokens.append(int(token))
+            rejected = True
+            break
+
+        bonus_added = False
+        if not rejected and accept_len == block_len and remaining > block_len:
+            bonus_logits = block_logits[:, -1, :]
+            bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
+            new_tokens.append(int(bonus_token))
+            bonus_added = True
         acceptance_lengths.append(int(accept_len))
         if accept_len == 0:
             consecutive_misses += 1
         else:
             consecutive_misses = 0
 
-        new_tokens = list(draft_tokens[:accept_len])
-        if accept_len < block_len:
-            new_tokens.append(int(posterior_tokens[accept_len]))
         if not new_tokens:
             break
 
@@ -524,6 +570,20 @@ def speculative_generate(
                 past = block_out.past_key_values
                 last_hidden = block_hidden[:, -1:, :]
                 last_logits = block_out.logits[:, -1, :]
+                if bonus_added:
+                    bonus_tensor = torch.tensor(
+                        [[new_tokens[-1]]], dtype=torch.long, device=input_ids.device
+                    )
+                    bonus_out = target(
+                        input_ids=bonus_tensor,
+                        past_key_values=past,
+                        use_cache=True,
+                        output_hidden_states=True,
+                        return_dict=True,
+                    )
+                    past = bonus_out.past_key_values
+                    last_hidden = _extract_hidden_state(bonus_out)[:, -1:, :]
+                    last_logits = bonus_out.logits[:, -1, :]
             else:
                 if past_snapshot is None:
                     out = target(

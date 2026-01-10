@@ -126,6 +126,35 @@ def sample_next_token(logits: mx.array, *, temperature: float, top_p: float) -> 
     return int(sorted_idx[picked_i].item())
 
 
+def _token_prob_from_logits(
+    logits: mx.array,
+    token: int,
+    *,
+    temperature: float,
+    top_p: float,
+) -> float:
+    logits = logits.reshape(-1)
+    token_id = int(token)
+    if temperature <= 0:
+        return 1.0 if int(mx.argmax(logits).item()) == token_id else 0.0
+    scaled = logits / float(temperature)
+    if top_p >= 1.0:
+        probs = mx.softmax(scaled, axis=-1)
+        return float(probs[token_id].item())
+    sorted_idx = mx.argsort(-scaled, axis=-1)
+    sorted_logits = mx.take_along_axis(scaled, sorted_idx, axis=-1)
+    sorted_probs = mx.softmax(sorted_logits, axis=-1)
+    cumprobs = mx.cumsum(sorted_probs, axis=-1)
+    remove = cumprobs > float(top_p)
+    remove = mx.concatenate([mx.array([False]), remove[:-1]], axis=-1)
+    neg_inf = mx.array(-1e9, dtype=sorted_logits.dtype)
+    filtered_logits = mx.where(remove, neg_inf, sorted_logits)
+    filtered_probs = mx.softmax(filtered_logits, axis=-1)
+    mask = sorted_idx == token_id
+    prob = mx.sum(filtered_probs * mask)
+    return float(prob.item())
+
+
 def _project_logits_qwen3(target: nn.Module, hidden: mx.array) -> mx.array:
     if target.args.tie_word_embeddings:
         return target.model.embed_tokens.as_linear(hidden)
@@ -489,17 +518,37 @@ def _speculative_decode_qwen3(
             block_logits = _project_logits_qwen3(target, prev_hidden)
             mx.eval(block_logits)
 
-        posterior_tokens = [
-            sample_next_token(block_logits[0, i, :], temperature=temperature, top_p=top_p)
-            for i in range(len(draft_tokens))
-        ]
-
         accept_len = 0
+        new_tokens: List[int] = []
+        rejected = False
         for i in range(len(draft_tokens)):
-            if draft_tokens[i] == posterior_tokens[i]:
+            draft_token = int(draft_tokens[i])
+            draft_logits = logits_list[i][0, -1, :]
+            target_logits = block_logits[0, i, :]
+            q_prob = _token_prob_from_logits(
+                draft_logits, draft_token, temperature=temperature, top_p=top_p
+            )
+            p_prob = _token_prob_from_logits(
+                target_logits, draft_token, temperature=temperature, top_p=top_p
+            )
+            accept_prob = 0.0 if q_prob <= 0.0 else min(1.0, p_prob / q_prob)
+            u = float(mx.random.uniform().item())
+            if u < accept_prob:
+                new_tokens.append(draft_token)
                 accept_len += 1
-            else:
-                break
+                continue
+            token = sample_next_token(target_logits, temperature=temperature, top_p=top_p)
+            new_tokens.append(int(token))
+            rejected = True
+            break
+
+        bonus_added = False
+        if not rejected and accept_len == len(draft_tokens) and remaining > len(draft_tokens):
+            bonus_logits = _project_logits_qwen3(target, block_hidden[:, -1:, :])[:, -1, :]
+            mx.eval(bonus_logits)
+            bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
+            new_tokens.append(int(bonus_token))
+            bonus_added = True
 
         if collect_stats:
             total_accept += int(accept_len)
@@ -513,10 +562,6 @@ def _speculative_decode_qwen3(
         else:
             consecutive_misses = 0
 
-        new_tokens = list(draft_tokens[:accept_len])
-        if accept_len < len(draft_tokens):
-            new_tokens.append(posterior_tokens[accept_len])
-
         output_ids.extend(int(t) for t in new_tokens)
         produced += len(new_tokens)
 
@@ -529,7 +574,13 @@ def _speculative_decode_qwen3(
 
         if use_cache:
             if accept_len == len(draft_tokens):
-                last_hidden = block_hidden[:, -1:, :]
+                if bonus_added:
+                    step = mx.array([[int(new_tokens[-1])]], dtype=mx.int32)
+                    hidden = target.model(step, cache=cache)
+                    mx.eval(hidden)
+                    last_hidden = hidden[:, -1:, :]
+                else:
+                    last_hidden = block_hidden[:, -1:, :]
             else:
                 if not mlx_cache.can_trim_prompt_cache(cache):
                     cache = mlx_cache.make_prompt_cache(target.model)
@@ -703,17 +754,35 @@ def _speculative_decode_minillm(
         block_logits = _project_logits_minillm(target, prev_hidden)
         mx.eval(block_logits)
 
-        posterior_tokens = [
-            sample_next_token(block_logits[0, i, :], temperature=temperature, top_p=top_p)
-            for i in range(len(draft_tokens))
-        ]
-
         accept_len = 0
+        new_tokens: List[int] = []
+        rejected = False
         for i in range(len(draft_tokens)):
-            if draft_tokens[i] == posterior_tokens[i]:
+            draft_token = int(draft_tokens[i])
+            draft_logits = logits_list[i][0, -1, :]
+            target_logits = block_logits[0, i, :]
+            q_prob = _token_prob_from_logits(
+                draft_logits, draft_token, temperature=temperature, top_p=top_p
+            )
+            p_prob = _token_prob_from_logits(
+                target_logits, draft_token, temperature=temperature, top_p=top_p
+            )
+            accept_prob = 0.0 if q_prob <= 0.0 else min(1.0, p_prob / q_prob)
+            u = float(mx.random.uniform().item())
+            if u < accept_prob:
+                new_tokens.append(draft_token)
                 accept_len += 1
-            else:
-                break
+                continue
+            token = sample_next_token(target_logits, temperature=temperature, top_p=top_p)
+            new_tokens.append(int(token))
+            rejected = True
+            break
+
+        if not rejected and accept_len == len(draft_tokens) and remaining > len(draft_tokens):
+            bonus_logits = _project_logits_minillm(target, block_hidden[:, -1:, :])[:, -1, :]
+            mx.eval(bonus_logits)
+            bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
+            new_tokens.append(int(bonus_token))
 
         if collect_stats:
             total_accept += int(accept_len)
@@ -726,10 +795,6 @@ def _speculative_decode_minillm(
             consecutive_misses += 1
         else:
             consecutive_misses = 0
-
-        new_tokens = list(draft_tokens[:accept_len])
-        if accept_len < len(draft_tokens):
-            new_tokens.append(posterior_tokens[accept_len])
 
         output_ids.extend(int(t) for t in new_tokens)
         produced += len(new_tokens)
