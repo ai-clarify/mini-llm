@@ -215,7 +215,7 @@ def main() -> None:
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=32)
     parser.add_argument("--max_new_tokens", type=int, default=256)
-    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
     parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")

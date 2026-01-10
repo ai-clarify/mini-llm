@@ -486,7 +486,7 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--prompt", type=str, default="Hello")
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--max_new_tokens", type=int, default=256)
-    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
