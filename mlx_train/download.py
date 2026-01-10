@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import os
 import shutil
 from pathlib import Path
@@ -187,16 +188,38 @@ def ensure_ms_dataset_file(
         return os.fspath(local_path)
 
     Path(data_dir).mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id,
-        repo_type="dataset",
-        local_dir=data_dir,
-        local_dir_use_symlinks=False,
-        allow_patterns=[filename],
-        revision=revision,
-        cache_dir=cache_dir,
-        force_download=force,
-    )
+    if force and local_path.exists():
+        try:
+            local_path.unlink()
+        except OSError:
+            pass
+
+    sig = inspect.signature(snapshot_download)
+    params = sig.parameters
+    kwargs = {}
+    if "local_dir" in params:
+        kwargs["local_dir"] = data_dir
+    if "local_dir_use_symlinks" in params:
+        kwargs["local_dir_use_symlinks"] = False
+    if "cache_dir" in params and cache_dir is not None:
+        kwargs["cache_dir"] = cache_dir
+    if "revision" in params and revision is not None:
+        kwargs["revision"] = revision
+    if "force_download" in params:
+        kwargs["force_download"] = force
+    elif "force" in params:
+        kwargs["force"] = force
+    if "repo_type" in params:
+        kwargs["repo_type"] = "dataset"
+
+    if "allow_file_pattern" in params:
+        kwargs["allow_file_pattern"] = [filename]
+    elif "allow_patterns" in params:
+        kwargs["allow_patterns"] = [filename]
+    elif "allow_pattern" in params:
+        kwargs["allow_pattern"] = [filename]
+
+    snapshot_download(repo_id, **kwargs)
 
     candidate = local_path
     if not candidate.exists():
