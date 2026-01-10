@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,6 +14,14 @@ try:
     import mlx.nn as nn
 except ImportError as exc:  # pragma: no cover - dependency check
     raise ImportError("Missing MLX core dependencies. Install mlx first.") from exc
+
+
+@dataclass(frozen=True)
+class SpecStats:
+    total_accept: int
+    total_draft: int
+    zero_accept: int
+    steps: int
 
 
 def _load_qwen3_deps():
@@ -426,7 +435,7 @@ def baseline_decode(
     return output_ids
 
 
-def speculative_decode(
+def _speculative_decode_qwen3(
     *,
     target: nn.Module,
     speculator: nn.Module,
@@ -438,12 +447,17 @@ def speculative_decode(
     eos_token_id: Optional[int],
     use_cache: bool,
     optimized: bool,
-    max_consecutive_misses: int = 2,
-) -> List[int]:
+    max_consecutive_misses: int,
+    collect_stats: bool,
+) -> Tuple[List[int], Optional[SpecStats]]:
     _, mlx_cache, _, _ = _get_qwen3_deps()
     output_ids = list(input_ids)
     produced = 0
     consecutive_misses = 0
+    total_accept = 0
+    total_draft = 0
+    zero_accept = 0
+    steps = 0
 
     cache = mlx_cache.make_prompt_cache(target.model) if use_cache else None
     prompt = mx.array([output_ids], dtype=mx.int32)
@@ -452,11 +466,13 @@ def speculative_decode(
     last_hidden = hidden[:, -1:, :]
 
     while produced < int(max_new_tokens):
+        remaining = int(max_new_tokens) - produced
+        block_len = min(int(spec_len), int(remaining))
         logits_list = speculator(last_hidden)
         mx.eval(*logits_list)
         draft_tokens = [
             sample_next_token(logits_list[i][0, -1, :], temperature=temperature, top_p=top_p)
-            for i in range(int(spec_len))
+            for i in range(int(block_len))
         ]
 
         if use_cache:
@@ -485,6 +501,13 @@ def speculative_decode(
             else:
                 break
 
+        if collect_stats:
+            total_accept += int(accept_len)
+            total_draft += int(block_len)
+            steps += 1
+            if accept_len == 0:
+                zero_accept += 1
+
         if accept_len == 0:
             consecutive_misses += 1
         else:
@@ -493,13 +516,6 @@ def speculative_decode(
         new_tokens = list(draft_tokens[:accept_len])
         if accept_len < len(draft_tokens):
             new_tokens.append(posterior_tokens[accept_len])
-
-        remaining = int(max_new_tokens) - produced
-        if len(new_tokens) > remaining:
-            new_tokens = new_tokens[:remaining]
-
-        if not new_tokens:
-            break
 
         output_ids.extend(int(t) for t in new_tokens)
         produced += len(new_tokens)
@@ -548,7 +564,77 @@ def speculative_decode(
             last_hidden=last_hidden,
         )
 
+    stats = None
+    if collect_stats:
+        stats = SpecStats(
+            total_accept=int(total_accept),
+            total_draft=int(total_draft),
+            zero_accept=int(zero_accept),
+            steps=int(steps),
+        )
+    return output_ids, stats
+
+
+def speculative_decode(
+    *,
+    target: nn.Module,
+    speculator: nn.Module,
+    input_ids: List[int],
+    max_new_tokens: int,
+    spec_len: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+    use_cache: bool,
+    optimized: bool,
+    max_consecutive_misses: int = 2,
+) -> List[int]:
+    output_ids, _ = _speculative_decode_qwen3(
+        target=target,
+        speculator=speculator,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        spec_len=spec_len,
+        temperature=temperature,
+        top_p=top_p,
+        eos_token_id=eos_token_id,
+        use_cache=use_cache,
+        optimized=optimized,
+        max_consecutive_misses=max_consecutive_misses,
+        collect_stats=False,
+    )
     return output_ids
+
+
+def speculative_decode_with_stats(
+    *,
+    target: nn.Module,
+    speculator: nn.Module,
+    input_ids: List[int],
+    max_new_tokens: int,
+    spec_len: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+    use_cache: bool,
+    optimized: bool,
+    max_consecutive_misses: int = 2,
+) -> Tuple[List[int], SpecStats]:
+    output_ids, stats = _speculative_decode_qwen3(
+        target=target,
+        speculator=speculator,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        spec_len=spec_len,
+        temperature=temperature,
+        top_p=top_p,
+        eos_token_id=eos_token_id,
+        use_cache=use_cache,
+        optimized=optimized,
+        max_consecutive_misses=max_consecutive_misses,
+        collect_stats=True,
+    )
+    return output_ids, stats
 
 
 def baseline_decode_minillm(
@@ -573,7 +659,7 @@ def baseline_decode_minillm(
     return output_ids
 
 
-def speculative_decode_minillm(
+def _speculative_decode_minillm(
     *,
     target: nn.Module,
     speculator: nn.Module,
@@ -584,11 +670,16 @@ def speculative_decode_minillm(
     top_p: float,
     eos_token_id: Optional[int],
     optimized: bool,
-    max_consecutive_misses: int = 2,
-) -> List[int]:
+    max_consecutive_misses: int,
+    collect_stats: bool,
+) -> Tuple[List[int], Optional[SpecStats]]:
     output_ids = list(input_ids)
     produced = 0
     consecutive_misses = 0
+    total_accept = 0
+    total_draft = 0
+    zero_accept = 0
+    steps = 0
 
     while produced < int(max_new_tokens):
         prompt = mx.array([output_ids], dtype=mx.int32)
@@ -596,11 +687,13 @@ def speculative_decode_minillm(
         mx.eval(hidden)
         last_hidden = hidden[:, -1:, :]
 
+        remaining = int(max_new_tokens) - produced
+        block_len = min(int(spec_len), int(remaining))
         logits_list = speculator(last_hidden)
         mx.eval(*logits_list)
         draft_tokens = [
             sample_next_token(logits_list[i][0, -1, :], temperature=temperature, top_p=top_p)
-            for i in range(int(spec_len))
+            for i in range(int(block_len))
         ]
 
         full = mx.array([output_ids + draft_tokens], dtype=mx.int32)
@@ -622,6 +715,13 @@ def speculative_decode_minillm(
             else:
                 break
 
+        if collect_stats:
+            total_accept += int(accept_len)
+            total_draft += int(block_len)
+            steps += 1
+            if accept_len == 0:
+                zero_accept += 1
+
         if accept_len == 0:
             consecutive_misses += 1
         else:
@@ -630,13 +730,6 @@ def speculative_decode_minillm(
         new_tokens = list(draft_tokens[:accept_len])
         if accept_len < len(draft_tokens):
             new_tokens.append(posterior_tokens[accept_len])
-
-        remaining = int(max_new_tokens) - produced
-        if len(new_tokens) > remaining:
-            new_tokens = new_tokens[:remaining]
-
-        if not new_tokens:
-            break
 
         output_ids.extend(int(t) for t in new_tokens)
         produced += len(new_tokens)
@@ -661,7 +754,73 @@ def speculative_decode_minillm(
             eos_token_id=eos_token_id,
         )
 
+    stats = None
+    if collect_stats:
+        stats = SpecStats(
+            total_accept=int(total_accept),
+            total_draft=int(total_draft),
+            zero_accept=int(zero_accept),
+            steps=int(steps),
+        )
+    return output_ids, stats
+
+
+def speculative_decode_minillm(
+    *,
+    target: nn.Module,
+    speculator: nn.Module,
+    input_ids: List[int],
+    max_new_tokens: int,
+    spec_len: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+    optimized: bool,
+    max_consecutive_misses: int = 2,
+) -> List[int]:
+    output_ids, _ = _speculative_decode_minillm(
+        target=target,
+        speculator=speculator,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        spec_len=spec_len,
+        temperature=temperature,
+        top_p=top_p,
+        eos_token_id=eos_token_id,
+        optimized=optimized,
+        max_consecutive_misses=max_consecutive_misses,
+        collect_stats=False,
+    )
     return output_ids
+
+
+def speculative_decode_minillm_with_stats(
+    *,
+    target: nn.Module,
+    speculator: nn.Module,
+    input_ids: List[int],
+    max_new_tokens: int,
+    spec_len: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+    optimized: bool,
+    max_consecutive_misses: int = 2,
+) -> Tuple[List[int], SpecStats]:
+    output_ids, stats = _speculative_decode_minillm(
+        target=target,
+        speculator=speculator,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        spec_len=spec_len,
+        temperature=temperature,
+        top_p=top_p,
+        eos_token_id=eos_token_id,
+        optimized=optimized,
+        max_consecutive_misses=max_consecutive_misses,
+        collect_stats=True,
+    )
+    return output_ids, stats
 
 
 def build_arg_parser(description: str) -> argparse.ArgumentParser:

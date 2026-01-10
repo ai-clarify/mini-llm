@@ -592,12 +592,15 @@ def main() -> None:
     parser.add_argument("--spec_dropout", type=float, default=0.0)
     parser.add_argument("--no_speculator", action="store_true")
     parser.add_argument("--no_cache", action="store_true")
+    parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
 
-    torch.manual_seed(int(args.seed))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(args.seed))
+    def seed_round(round_idx: int) -> None:
+        seed = int(args.seed) + int(round_idx)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
     device = torch.device(args.device)
     dtype = _resolve_dtype(args.dtype)
@@ -627,35 +630,37 @@ def main() -> None:
         prompt_messages = prompt_messages[: int(args.max_samples)]
 
     responses = []
-    for messages in prompt_messages:
-        prompt_text = _apply_chat_template(tokenizer, messages, add_generation_prompt=True)
-        input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+    for round_idx in range(int(args.rounds)):
+        seed_round(round_idx)
+        for messages in prompt_messages:
+            prompt_text = _apply_chat_template(tokenizer, messages, add_generation_prompt=True)
+            input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
 
-        baseline = baseline_generate(
-            target=target,
-            input_ids=input_ids,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            eos_token_id=tokenizer.eos_token_id,
-        )
-
-        if speculator is None:
-            spec = baseline
-        else:
-            spec = speculative_generate(
+            baseline = baseline_generate(
                 target=target,
-                speculator=speculator,
                 input_ids=input_ids,
                 max_new_tokens=args.max_new_tokens,
-                spec_len=spec_len,
                 temperature=args.temperature,
                 top_p=args.top_p,
                 eos_token_id=tokenizer.eos_token_id,
-                use_cache=not args.no_cache,
             )
 
-        responses.append({1: baseline, spec_len: spec})
+            if speculator is None:
+                spec = baseline
+            else:
+                spec = speculative_generate(
+                    target=target,
+                    speculator=speculator,
+                    input_ids=input_ids,
+                    max_new_tokens=args.max_new_tokens,
+                    spec_len=spec_len,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    eos_token_id=tokenizer.eos_token_id,
+                    use_cache=not args.no_cache,
+                )
+
+            responses.append({1: baseline, spec_len: spec})
 
     prompt_lens = [r[1].num_input_tokens for r in responses]
     out_lens_base = [r[1].num_output_tokens for r in responses]
@@ -686,8 +691,8 @@ def main() -> None:
         accept_rate = sum(acceptance_lengths) / (len(acceptance_lengths) * spec_len)
         zero_accept = sum(1 for x in acceptance_lengths if x == 0) / len(acceptance_lengths)
 
-    print(f"[bench] spec_len={spec_len} temp={args.temperature} top_p={args.top_p} dtype={args.dtype}")
-    print(f"Samples: {len(responses)} | prompts={len(prompt_messages)}")
+    print(f"[bench] rounds={int(args.rounds)} spec_len={spec_len} temp={args.temperature} top_p={args.top_p} dtype={args.dtype}")
+    print(f"Samples: {len(responses)} | prompts={len(prompt_messages)} | rounds={int(args.rounds)}")
     print(f"Prompt tokens: {_fmt(_stats(prompt_lens))}")
     print(f"Output tokens (baseline): {_fmt(_stats(out_lens_base))}")
     print(f"Output tokens (spec): {_fmt(_stats(out_lens_spec))}")

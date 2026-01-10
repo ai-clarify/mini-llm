@@ -18,11 +18,12 @@ from infer.mlx.common import (
     _count_params_mlx,
     _load_target,
     _resolve_spec_config,
+    SpecStats,
     baseline_decode,
     baseline_decode_minillm,
     load_speculator,
-    speculative_decode,
-    speculative_decode_minillm,
+    speculative_decode_minillm_with_stats,
+    speculative_decode_with_stats,
 )
 
 
@@ -41,6 +42,18 @@ class BenchResult:
     num_input_tokens: int
     num_output_tokens: int
     elapsed_s: float
+
+    @property
+    def tok_per_s(self) -> float:
+        return self.num_output_tokens / max(self.elapsed_s, 1e-6)
+
+
+@dataclass(frozen=True)
+class SpecBenchResult:
+    num_input_tokens: int
+    num_output_tokens: int
+    elapsed_s: float
+    stats: SpecStats
 
     @property
     def tok_per_s(self) -> float:
@@ -128,9 +141,9 @@ def _run_spec_qwen3(
     top_p: float,
     eos_token_id: Optional[int],
     use_cache: bool,
-) -> BenchResult:
+) -> SpecBenchResult:
     start = time.perf_counter()
-    output_ids = speculative_decode(
+    output_ids, stats = speculative_decode_with_stats(
         target=target,
         speculator=speculator,
         input_ids=input_ids,
@@ -145,7 +158,7 @@ def _run_spec_qwen3(
     elapsed = time.perf_counter() - start
     num_input = len(input_ids)
     num_output = max(len(output_ids) - num_input, 0)
-    return BenchResult(num_input, num_output, elapsed)
+    return SpecBenchResult(num_input, num_output, elapsed, stats)
 
 
 def _run_baseline_minillm(
@@ -182,9 +195,9 @@ def _run_spec_minillm(
     temperature: float,
     top_p: float,
     eos_token_id: Optional[int],
-) -> BenchResult:
+) -> SpecBenchResult:
     start = time.perf_counter()
-    output_ids = speculative_decode_minillm(
+    output_ids, stats = speculative_decode_minillm_with_stats(
         target=target,
         speculator=speculator,
         input_ids=input_ids,
@@ -198,7 +211,7 @@ def _run_spec_minillm(
     elapsed = time.perf_counter() - start
     num_input = len(input_ids)
     num_output = max(len(output_ids) - num_input, 0)
-    return BenchResult(num_input, num_output, elapsed)
+    return SpecBenchResult(num_input, num_output, elapsed, stats)
 
 
 def main() -> None:
@@ -228,10 +241,9 @@ def main() -> None:
     parser.add_argument("--no_speculator", action="store_true")
     parser.add_argument("--no_cache", action="store_true")
     parser.add_argument("--no_chat_template", action="store_true")
+    parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
-
-    mx.random.seed(int(args.seed))
 
     target, tokenizer = _load_target(
         target_arch=args.target_arch,
@@ -264,61 +276,65 @@ def main() -> None:
     if args.max_samples is not None:
         prompt_messages = prompt_messages[: int(args.max_samples)]
 
-    baseline_results: List[BenchResult] = []
-    spec_results: List[BenchResult] = []
-
+    prompt_inputs: List[List[int]] = []
     for messages in prompt_messages:
         if args.no_chat_template:
             prompt_text = messages[-1]["content"]
         else:
             prompt_text = _apply_chat_template(tokenizer, messages, add_generation_prompt=True)
-        input_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
+        prompt_inputs.append(tokenizer.encode(prompt_text, add_special_tokens=False))
 
-        if args.target_arch == "minillm":
-            baseline = _run_baseline_minillm(
-                target=target,
-                input_ids=input_ids,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        else:
-            baseline = _run_baseline_qwen3(
-                target=target,
-                input_ids=input_ids,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                eos_token_id=tokenizer.eos_token_id,
-            )
-        baseline_results.append(baseline)
+    baseline_results: List[BenchResult] = []
+    spec_results: List[SpecBenchResult] = []
 
-        if speculator is not None:
+    for round_idx in range(int(args.rounds)):
+        mx.random.seed(int(args.seed) + int(round_idx))
+        for input_ids in prompt_inputs:
             if args.target_arch == "minillm":
-                spec = _run_spec_minillm(
+                baseline = _run_baseline_minillm(
                     target=target,
-                    speculator=speculator,
                     input_ids=input_ids,
                     max_new_tokens=args.max_new_tokens,
-                    spec_len=spec_len,
                     temperature=args.temperature,
                     top_p=args.top_p,
                     eos_token_id=tokenizer.eos_token_id,
                 )
             else:
-                spec = _run_spec_qwen3(
+                baseline = _run_baseline_qwen3(
                     target=target,
-                    speculator=speculator,
                     input_ids=input_ids,
                     max_new_tokens=args.max_new_tokens,
-                    spec_len=spec_len,
                     temperature=args.temperature,
                     top_p=args.top_p,
                     eos_token_id=tokenizer.eos_token_id,
-                    use_cache=not args.no_cache,
                 )
-            spec_results.append(spec)
+            baseline_results.append(baseline)
+
+            if speculator is not None:
+                if args.target_arch == "minillm":
+                    spec = _run_spec_minillm(
+                        target=target,
+                        speculator=speculator,
+                        input_ids=input_ids,
+                        max_new_tokens=args.max_new_tokens,
+                        spec_len=spec_len,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        eos_token_id=tokenizer.eos_token_id,
+                    )
+                else:
+                    spec = _run_spec_qwen3(
+                        target=target,
+                        speculator=speculator,
+                        input_ids=input_ids,
+                        max_new_tokens=args.max_new_tokens,
+                        spec_len=spec_len,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        eos_token_id=tokenizer.eos_token_id,
+                        use_cache=not args.no_cache,
+                    )
+                spec_results.append(spec)
 
     def summarize(rows: List[BenchResult]) -> Dict[str, float]:
         total_out = sum(r.num_output_tokens for r in rows)
@@ -331,16 +347,43 @@ def main() -> None:
             "tok_per_s": float(total_out / max(total_time, 1e-6)),
         }
 
+    def summarize_acceptance(rows: List[SpecBenchResult]) -> Dict[str, float]:
+        total_accept = sum(r.stats.total_accept for r in rows)
+        total_draft = sum(r.stats.total_draft for r in rows)
+        total_steps = sum(r.stats.steps for r in rows)
+        zero_accept = sum(r.stats.zero_accept for r in rows)
+        accept_rate = float(total_accept / total_draft) if total_draft else 0.0
+        mean_accept = float(total_accept / total_steps) if total_steps else 0.0
+        zero_rate = float(zero_accept / total_steps) if total_steps else 0.0
+        return {
+            "accept_rate": accept_rate,
+            "mean_accept": mean_accept,
+            "zero_rate": zero_rate,
+        }
+
     base_stats = summarize(baseline_results)
-    print(f"[bench] baseline output_tokens={base_stats['output_tokens']:.0f} time_s={base_stats['total_time_s']:.2f} tok/s={base_stats['tok_per_s']:.2f}")
+    print(
+        f"[bench] rounds={int(args.rounds)} samples={len(baseline_results)} prompts={len(prompt_inputs)} "
+        f"temp={args.temperature} top_p={args.top_p}"
+    )
+    print(
+        f"[bench] baseline output_tokens={base_stats['output_tokens']:.0f} "
+        f"time_s={base_stats['total_time_s']:.2f} tok/s={base_stats['tok_per_s']:.2f}"
+    )
 
     if spec_results:
         spec_stats = summarize(spec_results)
         speedup = base_stats["total_time_s"] / max(spec_stats["total_time_s"], 1e-6)
+        accept_stats = summarize_acceptance(spec_results)
         print(
             f"[bench] spec_len={spec_len} output_tokens={spec_stats['output_tokens']:.0f} "
             f"time_s={spec_stats['total_time_s']:.2f} tok/s={spec_stats['tok_per_s']:.2f} "
             f"speedup={speedup:.2f}x"
+        )
+        print(
+            f"[bench] acceptance mean={accept_stats['mean_accept']:.2f} "
+            f"rate={accept_stats['accept_rate'] * 100:.2f}% "
+            f"zero_accept={accept_stats['zero_rate'] * 100:.2f}%"
         )
 
 
