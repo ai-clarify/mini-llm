@@ -140,7 +140,6 @@ def _run_spec_qwen3(
     temperature: float,
     top_p: float,
     eos_token_id: Optional[int],
-    use_cache: bool,
 ) -> SpecBenchResult:
     start = time.perf_counter()
     output_ids, stats = speculative_decode_with_stats(
@@ -152,8 +151,8 @@ def _run_spec_qwen3(
         temperature=temperature,
         top_p=top_p,
         eos_token_id=eos_token_id,
-        use_cache=use_cache,
-        optimized=False,
+        use_cache=True,
+        optimized=True,
     )
     elapsed = time.perf_counter() - start
     num_input = len(input_ids)
@@ -206,7 +205,7 @@ def _run_spec_minillm(
         temperature=temperature,
         top_p=top_p,
         eos_token_id=eos_token_id,
-        optimized=False,
+        optimized=True,
     )
     elapsed = time.perf_counter() - start
     num_input = len(input_ids)
@@ -239,7 +238,6 @@ def main() -> None:
         help="Low-rank speculator head size (overrides config if set; full head if unset).",
     )
     parser.add_argument("--no_speculator", action="store_true")
-    parser.add_argument("--no_cache", action="store_true")
     parser.add_argument("--no_chat_template", action="store_true")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1337)
@@ -332,7 +330,6 @@ def main() -> None:
                         temperature=args.temperature,
                         top_p=args.top_p,
                         eos_token_id=tokenizer.eos_token_id,
-                        use_cache=not args.no_cache,
                     )
                 spec_results.append(spec)
 

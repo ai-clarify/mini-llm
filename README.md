@@ -105,9 +105,6 @@ OLLAMA_MODEL=qwen3:0.6b DATA_JSONL=out/distill_ollama_qwen3_0.6b/synth.jsonl OUT
 
 ### EAGLE-3 speculator（Qwen3-0.6B / MiniLLM，纯合成数据）
 
-> 兼容性说明：
-> - Qwen3-0.6B：Torch/MLX 可用（MLX 依赖 `mlx-lm`）。
-> - MiniLLM：Torch 使用本仓 PyTorch checkpoint；MLX 使用 `mlx_train` 产出的 checkpoint（含 `config.json` + `model.safetensors`），MLX 推理默认不使用 cache。
 > - speculator 默认会根据目标模型大小自动设置；可用 `--spec_len`/`--spec_layers` 显式覆盖。
 > - `--head_rank` 默认自动设置（hidden_size/8，范围 32-256）；可显式指定或设为 0 关闭低秩头。
 
@@ -116,19 +113,6 @@ OLLAMA_MODEL=qwen3:0.6b DATA_JSONL=out/distill_ollama_qwen3_0.6b/synth.jsonl OUT
 ```bash
 # Torch：自动生成合成数据 + 训练 EAGLE-3 style speculator
 python train/torch/train_eagle3_speculator.py
-```
-
-```bash
-# Torch：推理（speculative decoding）
-python infer/torch/spec_decode.py --prompt "Hi"
-```
-
-```bash
-# Torch：推理（优化版，连续两次命中失败则切回基线）
-python infer/torch/spec_decode_optimized.py --prompt "Hi"
-```
-
-```bash
 # Torch：基准对比（baseline vs speculator）
 python infer/torch/bench.py --max_samples 16
 ```
@@ -136,28 +120,10 @@ python infer/torch/bench.py --max_samples 16
 #### Qwen3-0.6B（MLX）
 
 ```bash
-# MLX：先转换 HF 模型（或直接传 --hf_repo 让 mlx-lm 下载）
-python -m mlx_train.hf_convert --hf_repo Qwen/Qwen3-0.6B
-```
-
-```bash
 # MLX：自动生成合成数据 + 训练 speculator
-python train/mlx/train_eagle3_speculator.py --model_dir out/mlx_hf/qwen_qwen3_0_6b
-```
-
-```bash
-# MLX：推理（speculative decoding）
-python infer/mlx/spec_decode.py --model_dir out/mlx_hf/qwen_qwen3_0_6b --prompt "Hi"
-```
-
-```bash
-# MLX：推理（优化版，连续两次命中失败则切回基线）
-python infer/mlx/spec_decode_optimized.py --model_dir out/mlx_hf/qwen_qwen3_0_6b --prompt "Hi"
-```
-
-```bash
+python train/mlx/train_eagle3_speculator.py --hf_repo Qwen/Qwen3-0.6B
 # MLX：基准对比（baseline vs speculator）
-python infer/mlx/bench.py --model_dir out/mlx_hf/qwen_qwen3_0_6b --max_samples 16
+python infer/mlx/bench.py --hf_repo Qwen/Qwen3-0.6B --max_samples 16
 ```
 
 #### MiniLLM（Torch）
@@ -168,18 +134,6 @@ python train/torch/train_eagle3_speculator.py \
   --target_arch minillm \
   --minillm_ckpt out/pretrain_512.pth \
   --minillm_tokenizer ./model
-```
-
-```bash
-# Torch：推理（speculative decoding）
-python infer/torch/spec_decode.py \
-  --target_arch minillm \
-  --minillm_ckpt out/pretrain_512.pth \
-  --minillm_tokenizer ./model \
-  --prompt "Hi"
-```
-
-```bash
 # Torch：基准对比
 python infer/torch/bench.py \
   --target_arch minillm \
@@ -195,22 +149,11 @@ python train/mlx/train_eagle3_speculator.py \
   --target_arch minillm \
   --minillm_ckpt_dir out/mlx/sft/checkpoints/step_00000050 \
   --minillm_tokenizer ./model
-```
-
-```bash
-# MLX：推理（speculative decoding）
-python infer/mlx/spec_decode.py \
+# MLX：基准对比
+python infer/mlx/bench.py \
   --target_arch minillm \
   --minillm_ckpt_dir out/mlx/sft/checkpoints/step_00000050 \
-  --minillm_tokenizer ./model \
-  --prompt "Hi"
-```
-
-```bash
-# 兼容旧脚本（仍可用）
-python scripts/train_eagle3_speculator.py
-python scripts/infer_eagle3_speculator.py --prompt "Hi"
-python scripts/bench_eagle3_speculator.py --max_samples 16
+  --minillm_tokenizer ./model
 ```
 
 > MLX 推理/训练依赖 `mlx-lm`（当前与 transformers==5.0.0rc1 绑定），建议使用独立虚拟环境。
@@ -244,7 +187,7 @@ python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir
 ├── mlx_train/           # MLX 训练与推理
 ├── model/               # MiniLLM Dense/MoE 实现
 ├── pipelines/           # 一键训练/推理流水线脚本（主逻辑）
-├── scripts/             # 兼容入口（薄封装，指向 apps/tools/pipelines）
+├── scripts/             # 脚本与工具
 ├── tokenizer/           # RustBPE 分词与词表
 ├── trainer/             # 训练/对齐/蒸馏脚本
 ├── train/               # Speculator 训练入口（torch/mlx）

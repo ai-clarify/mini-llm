@@ -118,53 +118,15 @@ python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir
 ```bash
 # Torch: auto-generate synthetic data + train EAGLE-3 style speculator
 python train/torch/train_eagle3_speculator.py
-```
-
-```bash
-# Torch: inference (speculative decoding)
-python infer/torch/spec_decode.py --prompt "Hi"
-```
-
-```bash
-# Torch: inference (optimized, stop after 2 consecutive misses)
-python infer/torch/spec_decode_optimized.py --prompt "Hi"
-```
-
-```bash
 # Torch: benchmark (baseline vs speculator)
 python infer/torch/bench.py --max_samples 16
 ```
 
 ```bash
-# MLX: convert the HF model first (or pass --hf_repo to let mlx-lm download)
-python -m mlx_train.hf_convert --hf_repo Qwen/Qwen3-0.6B
-```
-
-```bash
 # MLX: auto-generate synthetic data + train speculator
-python train/mlx/train_eagle3_speculator.py --model_dir out/mlx_hf/qwen_qwen3_0_6b
-```
-
-```bash
-# MLX: inference (speculative decoding)
-python infer/mlx/spec_decode.py --model_dir out/mlx_hf/qwen_qwen3_0_6b --prompt "Hi"
-```
-
-```bash
-# MLX: inference (optimized, stop after 2 consecutive misses)
-python infer/mlx/spec_decode_optimized.py --model_dir out/mlx_hf/qwen_qwen3_0_6b --prompt "Hi"
-```
-
-```bash
+python train/mlx/train_eagle3_speculator.py --hf_repo Qwen/Qwen3-0.6B
 # MLX: benchmark (baseline vs speculator)
-python infer/mlx/bench.py --model_dir out/mlx_hf/qwen_qwen3_0_6b --max_samples 16
-```
-
-```bash
-# Legacy wrappers (still available)
-python scripts/train_eagle3_speculator.py
-python scripts/infer_eagle3_speculator.py --prompt "Hi"
-python scripts/bench_eagle3_speculator.py --max_samples 16
+python infer/mlx/bench.py --hf_repo Qwen/Qwen3-0.6B --max_samples 16
 ```
 
 > MLX inference/training requires `mlx-lm` (currently pinned to transformers==5.0.0rc1). Use a clean venv if needed.
@@ -191,7 +153,7 @@ python scripts/bench_eagle3_speculator.py --max_samples 16
 ├── mlx_train/           # MLX training and inference
 ├── model/               # MiniLLM Dense/MoE implementations
 ├── pipelines/           # One-click pipeline scripts (main logic)
-├── scripts/             # Legacy entrypoints (thin wrappers to apps/tools/pipelines)
+├── scripts/             # Scripts and utilities
 ├── tokenizer/           # RustBPE tokenizer assets
 ├── trainer/             # Training/alignment/distillation scripts
 ├── train/               # Speculator training entrypoints (torch/mlx)

@@ -10,4 +10,4 @@ from infer.torch.common import run_cli
 
 
 if __name__ == "__main__":
-    run_cli(optimized=False)
+    run_cli()

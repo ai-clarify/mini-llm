@@ -502,17 +502,16 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--spec_dropout", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--no_speculator", action="store_true")
-    parser.add_argument("--no_cache", action="store_true")
     return parser
 
 
-def run_cli(*, optimized: bool) -> None:
+def run_cli() -> None:
     parser = build_arg_parser(
         description="Speculative decoding with EAGLE-3 speculator (Torch backend)."
-        if not optimized
-        else "Speculative decoding with EAGLE-3 speculator (Torch backend, optimized)."
     )
     args = parser.parse_args()
+    optimized = True
+    use_cache = True
 
     torch.manual_seed(int(args.seed))
     if torch.cuda.is_available():
@@ -559,7 +558,7 @@ def run_cli(*, optimized: bool) -> None:
             temperature=args.temperature,
             top_p=args.top_p,
             eos_token_id=tokenizer.eos_token_id,
-            use_cache=not args.no_cache,
+            use_cache=use_cache,
         )
     else:
         output_ids = speculative_decode(
@@ -571,7 +570,7 @@ def run_cli(*, optimized: bool) -> None:
             temperature=args.temperature,
             top_p=args.top_p,
             eos_token_id=tokenizer.eos_token_id,
-            use_cache=not args.no_cache,
+            use_cache=use_cache,
             optimized=optimized,
         )
     elapsed = time.time() - start

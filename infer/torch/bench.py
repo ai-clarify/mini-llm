@@ -431,6 +431,10 @@ def speculative_generate(
 ) -> SimpleNamespace:
     num_input_tokens = int(input_ids.shape[1])
     max_length = num_input_tokens + int(max_new_tokens)
+    optimized = True
+    max_consecutive_misses = 2
+    consecutive_misses = 0
+    eos_reached = False
 
     prefill_start = time.perf_counter()
     out = target(
@@ -495,6 +499,10 @@ def speculative_generate(
             else:
                 break
         acceptance_lengths.append(int(accept_len))
+        if accept_len == 0:
+            consecutive_misses += 1
+        else:
+            consecutive_misses = 0
 
         new_tokens = list(draft_tokens[:accept_len])
         if accept_len < block_len:
@@ -508,6 +516,7 @@ def speculative_generate(
             tail = len(new_tokens) - eos_idx - 1
             if tail > 0:
                 output_ids = output_ids[:-tail]
+            eos_reached = True
             break
 
         if use_cache:
@@ -548,6 +557,22 @@ def speculative_generate(
             )
             last_hidden = _extract_hidden_state(out)[:, -1:, :]
             last_logits = out.logits[:, -1, :]
+
+        if optimized and consecutive_misses >= max_consecutive_misses:
+            break
+
+    if optimized and not eos_reached and len(output_ids) < max_length:
+        remaining = max_length - len(output_ids)
+        if remaining > 0:
+            fallback = baseline_generate(
+                target=target,
+                input_ids=input_ids.new_tensor([output_ids]),
+                max_new_tokens=remaining,
+                temperature=temperature,
+                top_p=top_p,
+                eos_token_id=eos_token_id,
+            )
+            output_ids = fallback.output_ids
 
     total_decode_time = time.perf_counter() - decode_start
     num_output_tokens = max(len(output_ids) - num_input_tokens, 0)
@@ -591,7 +616,6 @@ def main() -> None:
     )
     parser.add_argument("--spec_dropout", type=float, default=0.0)
     parser.add_argument("--no_speculator", action="store_true")
-    parser.add_argument("--no_cache", action="store_true")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1337)
     args = parser.parse_args()
@@ -657,7 +681,7 @@ def main() -> None:
                     temperature=args.temperature,
                     top_p=args.top_p,
                     eos_token_id=tokenizer.eos_token_id,
-                    use_cache=not args.no_cache,
+                    use_cache=True,
                 )
 
             responses.append({1: baseline, spec_len: spec})
