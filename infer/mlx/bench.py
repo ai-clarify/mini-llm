@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import mlx.core as mx
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from infer.mlx.common import (
     _apply_chat_template,
@@ -96,7 +101,6 @@ def _run_baseline_qwen3(
     temperature: float,
     top_p: float,
     eos_token_id: Optional[int],
-    use_cache: bool,
 ) -> BenchResult:
     start = time.perf_counter()
     output_ids = baseline_decode(
@@ -106,7 +110,6 @@ def _run_baseline_qwen3(
         temperature=temperature,
         top_p=top_p,
         eos_token_id=eos_token_id,
-        use_cache=use_cache,
     )
     elapsed = time.perf_counter() - start
     num_input = len(input_ids)
@@ -288,7 +291,6 @@ def main() -> None:
                 temperature=args.temperature,
                 top_p=args.top_p,
                 eos_token_id=tokenizer.eos_token_id,
-                use_cache=not args.no_cache,
             )
         baseline_results.append(baseline)
 
