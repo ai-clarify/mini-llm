@@ -321,7 +321,17 @@ def _load_target(
     else:
         model_path = _default_model_dir(hf_repo)
         path = str(model_path) if model_path.exists() else hf_repo
-    model, tokenizer = qwen3_load(path, revision=revision)
+    try:
+        model, tokenizer = qwen3_load(path, revision=revision)
+    except AttributeError as exc:
+        if "keys" in str(exc) and "list" in str(exc):
+            model, tokenizer = qwen3_load(
+                path,
+                revision=revision,
+                tokenizer_config={"extra_special_tokens": {}},
+            )
+        else:
+            raise
     model.eval()
     return model, tokenizer
 
