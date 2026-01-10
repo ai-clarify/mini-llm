@@ -105,6 +105,9 @@ OLLAMA_MODEL=qwen3:0.6b DATA_JSONL=out/distill_ollama_qwen3_0.6b/synth.jsonl OUT
 
 ### EAGLE-3 speculator（Qwen3-0.6B，纯合成数据）
 
+> 兼容性说明：当前仅验证 Qwen3-0.6B。MiniLLM 尚未接入 speculator 训练/推理；
+> 如需尝试，需要提供 HF 兼容权重并自行适配脚本（MLX 侧仍依赖 mlx-lm 的 Qwen3 架构）。
+
 ```bash
 # Torch：自动生成合成数据 + 训练 EAGLE-3 style speculator
 python train/torch/train_eagle3_speculator.py
