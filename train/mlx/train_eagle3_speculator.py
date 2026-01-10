@@ -438,58 +438,67 @@ def main() -> None:
         early_stop_patience = 1
     early_stop_hits = 0
 
-    for step in range(1, int(args.max_steps) + 1):
-        loss_sum = mx.array(0.0, dtype=mx.float32)
-        grad_accum = mlx_utils.tree_map(lambda p: p, grad_template)
-        tokens_seen = 0.0
+    last_step = 0
+    try:
+        for step in range(1, int(args.max_steps) + 1):
+            loss_sum = mx.array(0.0, dtype=mx.float32)
+            grad_accum = mlx_utils.tree_map(lambda p: p, grad_template)
+            tokens_seen = 0.0
 
-        for _ in range(accum_steps):
-            input_ids, attention_mask, loss_mask = dataset.sample_batch(
-                batch_size=args.batch_size, rng=rng
-            )
-            tokens_seen += _count_tokens(loss_mask, attention_mask, spec_len=args.spec_len)
-            loss, grads = value_and_grad(input_ids, attention_mask, loss_mask)
-            loss_sum = loss_sum + loss.astype(mx.float32)
-            grad_accum = mlx_utils.tree_map(lambda a, b: a + b, grad_accum, grads)
+            for _ in range(accum_steps):
+                input_ids, attention_mask, loss_mask = dataset.sample_batch(
+                    batch_size=args.batch_size, rng=rng
+                )
+                tokens_seen += _count_tokens(loss_mask, attention_mask, spec_len=args.spec_len)
+                loss, grads = value_and_grad(input_ids, attention_mask, loss_mask)
+                loss_sum = loss_sum + loss.astype(mx.float32)
+                grad_accum = mlx_utils.tree_map(lambda a, b: a + b, grad_accum, grads)
 
-        grad_accum = mlx_utils.tree_map(lambda g: g / float(accum_steps), grad_accum)
-        if args.grad_clip > 0:
-            grad_accum, grad_norm = optim.clip_grad_norm(grad_accum, max_norm=float(args.grad_clip))
-        else:
-            grad_norm = mx.array(0.0, dtype=mx.float32)
-
-        optimizer.update(speculator, grad_accum)
-        mx.eval(loss_sum, grad_norm)
-
-        loss_val = float((loss_sum / float(accum_steps)).item())
-        stop_training = False
-        if early_stop_loss is not None:
-            if loss_val <= float(early_stop_loss):
-                early_stop_hits += 1
-                if early_stop_hits >= early_stop_patience:
-                    print(
-                        f"[train] early stop at step={step} loss={loss_val:.4f} "
-                        f"target={float(early_stop_loss):.4f}"
-                    )
-                    stop_training = True
+            grad_accum = mlx_utils.tree_map(lambda g: g / float(accum_steps), grad_accum)
+            if args.grad_clip > 0:
+                grad_accum, grad_norm = optim.clip_grad_norm(grad_accum, max_norm=float(args.grad_clip))
             else:
-                early_stop_hits = 0
+                grad_norm = mx.array(0.0, dtype=mx.float32)
 
-        if step % args.log_interval == 0:
-            elapsed = time.time() - start_time
-            tok_s = tokens_seen / max(elapsed, 1e-6)
-            print(f"[train] step={step} loss={loss_val:.4f} tok/s={tok_s:.2f}")
-            start_time = time.time()
+            optimizer.update(speculator, grad_accum)
+            mx.eval(loss_sum, grad_norm)
 
-        saved = False
-        if step % args.save_interval == 0 or step == int(args.max_steps):
-            _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
-            saved = True
+            loss_val = float((loss_sum / float(accum_steps)).item())
+            stop_training = False
+            if early_stop_loss is not None:
+                if loss_val <= float(early_stop_loss):
+                    early_stop_hits += 1
+                    if early_stop_hits >= early_stop_patience:
+                        print(
+                            f"[train] early stop at step={step} loss={loss_val:.4f} "
+                            f"target={float(early_stop_loss):.4f}"
+                        )
+                        stop_training = True
+                else:
+                    early_stop_hits = 0
 
-        if stop_training:
-            if not saved:
+            if step % args.log_interval == 0:
+                elapsed = time.time() - start_time
+                tok_s = tokens_seen / max(elapsed, 1e-6)
+                print(f"[train] step={step} loss={loss_val:.4f} tok/s={tok_s:.2f}")
+                start_time = time.time()
+
+            saved = False
+            if step % args.save_interval == 0 or step == int(args.max_steps):
                 _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
-            break
+                saved = True
+
+            last_step = step
+            if stop_training:
+                if not saved:
+                    _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+                break
+    except KeyboardInterrupt:
+        if last_step > 0:
+            print(f"[train] interrupted at step={last_step}, saving checkpoint")
+            _save_checkpoint(step=last_step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+        else:
+            print("[train] interrupted before first step; no checkpoint saved")
 
 
 if __name__ == "__main__":

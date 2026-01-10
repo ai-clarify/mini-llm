@@ -503,68 +503,77 @@ def main() -> None:
     if early_stop_loss is not None and early_stop_patience <= 0:
         early_stop_patience = 1
     early_stop_hits = 0
-    for step in range(1, int(args.max_steps) + 1):
-        input_ids, attention_mask, loss_mask = next(data_iter)
-        input_ids = input_ids.to(device)
-        attention_mask = attention_mask.to(device)
-        loss_mask = loss_mask.to(device)
+    last_step = 0
+    try:
+        for step in range(1, int(args.max_steps) + 1):
+            input_ids, attention_mask, loss_mask = next(data_iter)
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            loss_mask = loss_mask.to(device)
 
-        with torch.no_grad():
-            hidden = _forward_hidden(target, input_ids, attention_mask)
+            with torch.no_grad():
+                hidden = _forward_hidden(target, input_ids, attention_mask)
 
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-            logits_list = speculator(hidden, attention_mask)
-            loss, tokens = _spec_loss(logits_list, input_ids, loss_mask, attention_mask)
-            if tokens.item() == 0:
-                continue
-            loss = loss / accum_steps
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                logits_list = speculator(hidden, attention_mask)
+                loss, tokens = _spec_loss(logits_list, input_ids, loss_mask, attention_mask)
+                if tokens.item() == 0:
+                    continue
+                loss = loss / accum_steps
 
-        if scaler.is_enabled():
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-
-        loss_val = float(loss.item() * accum_steps)
-        stop_training = False
-        if early_stop_loss is not None:
-            if loss_val <= float(early_stop_loss):
-                early_stop_hits += 1
-                if early_stop_hits >= early_stop_patience:
-                    print(
-                        f"[train] early stop at step={step} loss={loss_val:.4f} "
-                        f"target={float(early_stop_loss):.4f}"
-                    )
-                    stop_training = True
-            else:
-                early_stop_hits = 0
-
-        if step % accum_steps == 0:
             if scaler.is_enabled():
-                scaler.unscale_(optimizer)
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(speculator.parameters(), args.grad_clip)
-            if scaler.is_enabled():
-                scaler.step(optimizer)
-                scaler.update()
+                scaler.scale(loss).backward()
             else:
-                optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+                loss.backward()
 
-        if step % args.log_interval == 0:
-            elapsed = time.time() - start_time
-            tok_s = tokens.item() / max(elapsed, 1e-6)
-            print(f"[train] step={step} loss={loss_val:.4f} tok/s={tok_s:.2f}")
-            start_time = time.time()
+            loss_val = float(loss.item() * accum_steps)
+            stop_training = False
+            if early_stop_loss is not None:
+                if loss_val <= float(early_stop_loss):
+                    early_stop_hits += 1
+                    if early_stop_hits >= early_stop_patience:
+                        print(
+                            f"[train] early stop at step={step} loss={loss_val:.4f} "
+                            f"target={float(early_stop_loss):.4f}"
+                        )
+                        stop_training = True
+                else:
+                    early_stop_hits = 0
 
-        saved = False
-        if step % args.save_interval == 0 or step == int(args.max_steps):
-            _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
-            saved = True
+            if step % accum_steps == 0:
+                if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(speculator.parameters(), args.grad_clip)
+                if scaler.is_enabled():
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
-        if stop_training:
-            if not saved:
+            if step % args.log_interval == 0:
+                elapsed = time.time() - start_time
+                tok_s = tokens.item() / max(elapsed, 1e-6)
+                print(f"[train] step={step} loss={loss_val:.4f} tok/s={tok_s:.2f}")
+                start_time = time.time()
+
+            saved = False
+            if step % args.save_interval == 0 or step == int(args.max_steps):
                 _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
-            break
+                saved = True
+
+            last_step = step
+            if stop_training:
+                if not saved:
+                    _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+                break
+    except KeyboardInterrupt:
+        if last_step > 0:
+            print(f"[train] interrupted at step={last_step}, saving checkpoint")
+            _save_checkpoint(step=last_step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+        else:
+            print("[train] interrupted before first step; no checkpoint saved")
 
 
 if __name__ == "__main__":
