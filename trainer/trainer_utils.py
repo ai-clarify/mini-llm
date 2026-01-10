@@ -107,11 +107,7 @@ def vlm_checkpoint(
 
         wandb_id = None
         if wandb:
-            if hasattr(wandb, "get_run"):
-                run = wandb.get_run()
-                wandb_id = getattr(run, "id", None) if run else None
-            else:
-                wandb_id = getattr(wandb, "id", None)
+            wandb_id = wandb.run.id
 
         resume_data = {
             "model": state_dict,
@@ -124,10 +120,7 @@ def vlm_checkpoint(
         for key, value in kwargs.items():
             if value is None:
                 continue
-            if hasattr(value, "state_dict"):
-                resume_data[key] = value.state_dict()
-            else:
-                resume_data[key] = value
+            resume_data[key] = value.state_dict()
 
         resume_tmp = resume_path + ".tmp"
         torch.save(resume_data, resume_tmp)

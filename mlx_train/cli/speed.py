@@ -42,25 +42,19 @@ def _bytes_to_mib(x: int) -> float:
 
 
 def _clear_cache() -> None:
-    if hasattr(mx, "clear_cache"):
-        mx.clear_cache()
-    else:
-        mx.metal.clear_cache()
+    mx.clear_cache()
 
 
 def _reset_peak_memory() -> None:
-    if hasattr(mx, "reset_peak_memory"):
-        mx.reset_peak_memory()
-    else:
-        mx.metal.reset_peak_memory()
+    mx.reset_peak_memory()
 
 
 def _get_peak_memory() -> int:
-    return int(mx.get_peak_memory() if hasattr(mx, "get_peak_memory") else mx.metal.get_peak_memory())
+    return int(mx.get_peak_memory())
 
 
 def _get_active_memory() -> int:
-    return int(mx.get_active_memory() if hasattr(mx, "get_active_memory") else mx.metal.get_active_memory())
+    return int(mx.get_active_memory())
 
 
 def _restore_tree_in_place(dst: Any, src: Any) -> Any:

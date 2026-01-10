@@ -19,10 +19,12 @@ class LoRA(nn.Module):
 
 
 def apply_lora(model, rank=8):
+    lora_module_names = []
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and module.weight.shape[0] == module.weight.shape[1]:
             lora = LoRA(module.weight.shape[0], module.weight.shape[1], rank=rank).to(model.device)
             setattr(module, "lora", lora)
+            lora_module_names.append(name)
             original_forward = module.forward
 
             # 显式绑定
@@ -30,20 +32,21 @@ def apply_lora(model, rank=8):
                 return layer1(x) + layer2(x)
 
             module.forward = forward_with_lora
+    model.lora_module_names = lora_module_names
 
 
 def load_lora(model, path):
     state_dict = torch.load(path, map_location=model.device)
-    for name, module in model.named_modules():
-        if hasattr(module, 'lora'):
-            lora_state = {k.replace(f'{name}.lora.', ''): v for k, v in state_dict.items() if f'{name}.lora.' in k}
-            module.lora.load_state_dict(lora_state)
+    for name in model.lora_module_names:
+        module = model.get_submodule(name)
+        lora_state = {k.replace(f'{name}.lora.', ''): v for k, v in state_dict.items() if f'{name}.lora.' in k}
+        module.lora.load_state_dict(lora_state)
 
 
 def save_lora(model, path):
     state_dict = {}
-    for name, module in model.named_modules():
-        if hasattr(module, 'lora'):
-            lora_state = {f'{name}.lora.{k}': v for k, v in module.lora.state_dict().items()}
-            state_dict.update(lora_state)
+    for name in model.lora_module_names:
+        module = model.get_submodule(name)
+        lora_state = {f'{name}.lora.{k}': v for k, v in module.lora.state_dict().items()}
+        state_dict.update(lora_state)
     torch.save(state_dict, path)

@@ -32,21 +32,12 @@ def _count_jsonl_lines(path: Path, *, max_lines: Optional[int] = None) -> int:
 
 
 def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_generation_prompt: bool) -> str:
-    if hasattr(tokenizer, "apply_chat_template"):
-        try:
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-                enable_thinking=False,
-            )
-        except TypeError:
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-            )
-    return "\n\n".join([str(m.get("content", "")) for m in messages])
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+        enable_thinking=False,
+    )
 
 
 def _split_prompt(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -277,31 +268,28 @@ def _load_minillm_config(path: Optional[str]) -> MiniLLMConfig:
     return MiniLLMConfig(**data)
 
 
-def _extract_hidden_state(output: Any) -> torch.Tensor:
-    if isinstance(output, (tuple, list)) and output:
-        return output[0]
-    if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
-        return output.last_hidden_state
-    if hasattr(output, "hidden_states") and output.hidden_states:
-        return output.hidden_states[-1]
-    raise AttributeError("Unable to extract hidden states from target output")
-
-
-def _forward_hidden(
+def _forward_hidden_qwen3(
     target: nn.Module, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor]
 ) -> torch.Tensor:
-    base = getattr(target, "model", None) or getattr(target, "base_model", None) or target
-    try:
-        out = base(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-    except TypeError:
-        out = base(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
-    return _extract_hidden_state(out)
+    out = target.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+    return out.last_hidden_state
+
+
+def _forward_hidden_minillm(
+    target: nn.Module, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor]
+) -> torch.Tensor:
+    hidden, _, _ = target.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+    )
+    return hidden
 
 
 def _ensure_synth_data(args) -> None:
@@ -459,11 +447,11 @@ def main() -> None:
         else:
             print(f"[speculator] auto spec_len={spec_len} spec_layers={spec_layers}")
 
-    hidden_size = int(getattr(target.config, "hidden_size"))
-    vocab_size = int(getattr(target.config, "vocab_size", len(tokenizer)))
+    hidden_size = int(target.config.hidden_size)
+    vocab_size = int(target.config.vocab_size)
     spec_heads = int(args.spec_heads)
     if spec_heads <= 0:
-        cfg_heads = int(getattr(target.config, "num_attention_heads", 0) or 0)
+        cfg_heads = int(target.config.num_attention_heads)
         if cfg_heads > 0:
             spec_heads = cfg_heads
         else:
@@ -471,9 +459,7 @@ def main() -> None:
         while spec_heads > 1 and hidden_size % spec_heads != 0:
             spec_heads -= 1
 
-    init_weight = None
-    if hasattr(target, "lm_head") and isinstance(target.lm_head, nn.Linear):
-        init_weight = target.lm_head.weight.detach().clone()
+    init_weight = target.lm_head.weight.detach().clone()
 
     if args.head_rank is None:
         head_rank = _default_head_rank(hidden_size)
@@ -550,8 +536,11 @@ def main() -> None:
             attention_mask = attention_mask.to(device)
             loss_mask = loss_mask.to(device)
 
-            with torch.no_grad():
-                hidden = _forward_hidden(target, input_ids, attention_mask)
+        with torch.no_grad():
+            if args.target_arch == "minillm":
+                hidden = _forward_hidden_minillm(target, input_ids, attention_mask)
+            else:
+                hidden = _forward_hidden_qwen3(target, input_ids, attention_mask)
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 logits_list = speculator(hidden, attention_mask)

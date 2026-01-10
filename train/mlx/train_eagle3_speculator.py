@@ -36,21 +36,12 @@ def _count_jsonl_lines(path: Path, *, max_lines: Optional[int] = None) -> int:
 
 
 def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_generation_prompt: bool) -> str:
-    if hasattr(tokenizer, "apply_chat_template"):
-        try:
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-                enable_thinking=False,
-            )
-        except TypeError:
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-            )
-    return "\n\n".join([str(m.get("content", "")) for m in messages])
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+        enable_thinking=False,
+    )
 
 
 def _split_prompt(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
@@ -68,9 +59,9 @@ class SyntheticChatDataset:
     def __init__(self, jsonl_path: Path, tokenizer, *, max_seq_len: int) -> None:
         self.samples: List[Tuple[List[int], List[int], List[float]]] = []
         self.max_seq_len = int(max_seq_len)
-        self.pad_id = getattr(tokenizer, "pad_token_id", None)
+        self.pad_id = tokenizer.pad_token_id
         if self.pad_id is None:
-            self.pad_id = getattr(tokenizer, "eos_token_id", 0) or 0
+            self.pad_id = tokenizer.eos_token_id or 0
 
         with jsonl_path.open("r", encoding="utf-8") as f:
             for line in f:
@@ -204,9 +195,7 @@ def _count_trainable_params(params: Any) -> int:
     mlx_utils.tree_flatten(params, destination=flat)
     total = 0
     for _, value in flat:
-        size = getattr(value, "size", None)
-        if size is not None:
-            total += int(size)
+        total += int(value.size)
     return total
 
 
@@ -355,16 +344,13 @@ def main() -> None:
     )
     target.eval()
 
-    if getattr(tokenizer, "pad_token_id", None) is None:
-        try:
-            tokenizer.pad_token_id = tokenizer.eos_token_id or 0
-        except Exception:
-            pass
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id or 0
 
     if args.target_arch == "minillm":
-        hidden_size = int(getattr(target.config, "hidden_size", 0) or 0)
+        hidden_size = int(target.config.hidden_size)
     else:
-        hidden_size = int(getattr(target.args, "hidden_size", 0) or 0)
+        hidden_size = int(target.args.hidden_size)
 
     param_count = _count_params_mlx(target)
     auto_spec = (

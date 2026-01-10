@@ -132,7 +132,7 @@ class Attention(nn.Module):
         else:
             mask = "causal" if attention_mask is None else attention_mask
 
-        if trace is not None and getattr(trace, "cfg", None) is not None and bool(trace.cfg.record_attn):
+        if trace is not None and trace.cfg is not None and bool(trace.cfg.record_attn):
             # Record attention weights (top-k keys per head) for interpretability.
             # This is an extra compute path and is only enabled when tracing.
             rep = int(self.n_heads // self.n_kv_heads)

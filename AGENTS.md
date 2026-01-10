@@ -38,8 +38,40 @@ both PyTorch and MLX (Apple Silicon), plus data preparation utilities and eval.
 - Preserve checkpoint layout under `out/mlx/{pretrain,sft,r1}`.
 - Keep large artifacts in `out/` or `dataset/`; do not commit them.
 - Prefer minimal changes with clear docs updates.
+- Avoid unnecessary defensive code; if context guarantees invariants, use direct access instead of `getattr` or guard clauses.
 - Deliver professional, well-considered results; ensure changes are coherent, documented, and ready to run.
 - Benchmark outputs should include progress and actionable failure guidance.
+
+## Implementation standards for algorithms
+
+- Prefer pure functions and immutable inputs where reasonable.
+- Must handle edge cases explicitly: empty input, single element, duplicates, negative numbers, very large values, already-sorted, reverse-sorted.
+- Complexity must be stated in docstring: time and space, include best/average/worst when relevant.
+- Determinism required: do not rely on hash iteration order; if randomness is needed, seed it and expose the seed parameter.
+- Avoid premature micro-optimizations; optimize only with a failing benchmark or a measured hotspot.
+
+## Testing standards
+
+- Every new algorithm needs tests that cover:
+  - representative examples
+  - edge cases
+  - randomized/property-style tests when appropriate (keep deterministic seeds)
+  - regression test for any bug fix
+- Keep tests fast; if a test is slow, mark it and justify.
+
+## Style conventions
+
+- Follow existing naming and docstring style in nearby files.
+- Prefer explicit types for public functions.
+- Keep functions small; extract helpers instead of deeply nested logic.
+- No print debugging in committed code.
+
+## Dependency policy and boundaries
+
+- Do not add new runtime dependencies without asking first.
+- Do not change public APIs (function names/signatures) unless the task explicitly requires it.
+- Never commit secrets, tokens, or local paths.
+- Do not edit generated files or vendor directories (if present).
 
 ## Validation
 

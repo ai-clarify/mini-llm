@@ -144,9 +144,9 @@ def ensure_hf_dataset_file(
     if max_bytes is not None:
         api = HfApi(endpoint=endpoint) if endpoint else HfApi()
         for item in api.list_repo_tree(repo_id, repo_type="dataset", recursive=True, expand=True):
-            if getattr(item, "path", None) == filename:
-                size = getattr(item, "size", None)
-                if size is not None and size > max_bytes:
+            if item.path == filename:
+                size = item.size
+                if size > max_bytes:
                     raise DataDownloadError(
                         f"Refusing to download {repo_id}/{filename} ({size/1024/1024:.1f} MiB) because it exceeds "
                         f"--max_download_mb={max_download_mb}. Increase the limit or set it to 0."

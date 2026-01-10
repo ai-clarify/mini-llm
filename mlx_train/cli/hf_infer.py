@@ -51,7 +51,7 @@ def main() -> None:
     model, tokenizer = load(str(model_dir))
 
     prompt_text = args.prompt
-    if not args.no_chat_template and hasattr(tokenizer, "apply_chat_template"):
+    if not args.no_chat_template:
         messages = []
         if args.system:
             messages.append({"role": "system", "content": args.system})

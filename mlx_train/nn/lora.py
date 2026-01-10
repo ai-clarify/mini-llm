@@ -68,7 +68,7 @@ class LoRALinear(nn.Module):
         alpha: float,
         dropout: float,
     ) -> "LoRALinear":
-        bias = getattr(linear, "bias", None)
+        bias = linear.bias
         base = nn.Linear(
             int(linear.weight.shape[1]),
             int(linear.weight.shape[0]),
@@ -141,7 +141,7 @@ def _get_parent_by_path(root: nn.Module, path: List[str]) -> Tuple[object, str]:
         if part.isdigit():
             cur = cur[int(part)]  # type: ignore[index]
         else:
-            cur = getattr(cur, part)
+            cur = cur.__getattribute__(part)
     return cur, path[-1]
 
 

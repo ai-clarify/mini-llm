@@ -79,13 +79,7 @@ def _load_minillm_config(path: Optional[str]) -> MiniLLMConfig:
 
 
 def _extract_hidden_state(output: Any) -> torch.Tensor:
-    if isinstance(output, (tuple, list)) and output:
-        return output[0]
-    if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
-        return output.last_hidden_state
-    if hasattr(output, "hidden_states") and output.hidden_states:
-        return output.hidden_states[-1]
-    raise AttributeError("Unable to extract hidden states from target output")
+    return output.last_hidden_state
 
 
 def _load_target_and_tokenizer(args, device: torch.device, dtype: torch.dtype):
@@ -117,21 +111,12 @@ def _load_target_and_tokenizer(args, device: torch.device, dtype: torch.dtype):
 
 
 def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_generation_prompt: bool) -> str:
-    if hasattr(tokenizer, "apply_chat_template"):
-        try:
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-                enable_thinking=False,
-            )
-        except TypeError:
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-            )
-    return "\n\n".join([str(m.get("content", "")) for m in messages])
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+        enable_thinking=False,
+    )
 
 
 def _add_system(messages: List[Dict[str, Any]], system: Optional[str]) -> List[Dict[str, Any]]:
@@ -218,15 +203,7 @@ def _fmt(stats: Optional[Dict[str, float]], *, scale: float = 1.0, unit: str = "
 def _clone_past_key_values(past):
     if past is None:
         return None
-    if hasattr(past, "clone"):
-        try:
-            return past.clone()
-        except Exception:
-            pass
-    try:
-        return tuple((k.clone(), v.clone()) for (k, v) in past)
-    except Exception:
-        return None
+    return tuple((k.clone(), v.clone()) for (k, v) in past)
 
 
 def sample_next_token(logits: torch.Tensor, *, temperature: float, top_p: float) -> int:
@@ -334,10 +311,10 @@ def load_speculator(
         if "head_rank" in cfg:
             head_rank = cfg.get("head_rank", head_rank)
 
-    hidden_size = int(getattr(target.config, "hidden_size"))
-    vocab_size = int(getattr(target.config, "vocab_size"))
+    hidden_size = int(target.config.hidden_size)
+    vocab_size = int(target.config.vocab_size)
     if spec_heads <= 0:
-        cfg_heads = int(getattr(target.config, "num_attention_heads", 0) or 0)
+        cfg_heads = int(target.config.num_attention_heads)
         if cfg_heads > 0:
             spec_heads = cfg_heads
         else:
@@ -345,9 +322,7 @@ def load_speculator(
         while spec_heads > 1 and hidden_size % spec_heads != 0:
             spec_heads -= 1
 
-    init_weight = None
-    if hasattr(target, "lm_head") and isinstance(target.lm_head, torch.nn.Linear):
-        init_weight = target.lm_head.weight.detach().clone()
+    init_weight = target.lm_head.weight.detach().clone()
 
     speculator = Eagle3Speculator(
         hidden_size=hidden_size,

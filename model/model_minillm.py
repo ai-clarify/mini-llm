@@ -165,7 +165,7 @@ class Attention(nn.Module):
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and args.flash_attn
+        self.flash = args.flash_attn
         # print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
     def forward(self,
@@ -407,9 +407,6 @@ class MiniLLMModel(nn.Module):
         if input_ids is None:
             raise ValueError("input_ids must not be None")
         batch_size, seq_length = input_ids.shape
-        if past_key_values is not None and hasattr(past_key_values, 'layers'):
-            past_key_values = None
-
         past_key_values_list: List[Optional[Tuple[torch.Tensor, torch.Tensor]]]
         if past_key_values is None:
             past_key_values_list = [None] * len(self.layers)

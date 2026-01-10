@@ -208,9 +208,6 @@ class MiniLLMVLM(MiniLLMForCausalLM):
         if input_ids is None:
             raise ValueError("input_ids must not be None")
         _, seq_length = input_ids.shape
-        if past_key_values is not None and hasattr(past_key_values, "layers"):
-            past_key_values = None
-
         past_key_values_list: List[Optional[Tuple[torch.Tensor, torch.Tensor]]]
         if past_key_values is None:
             past_key_values_list = [None] * len(self.model.layers)

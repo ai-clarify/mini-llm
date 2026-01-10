@@ -515,15 +515,12 @@ def _choose_device(value: str | None) -> str | None:
         return None
     if value != "auto":
         return value
-    try:
-        import torch  # type: ignore
+    import torch  # type: ignore
 
-        if torch.cuda.is_available():
-            return "cuda:0"
-        if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-            return "mps"
-    except Exception:
-        pass
+    if torch.cuda.is_available():
+        return "cuda:0"
+    if torch.backends.mps.is_available():
+        return "mps"
     return "cpu"
 
 

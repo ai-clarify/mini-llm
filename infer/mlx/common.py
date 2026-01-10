@@ -87,21 +87,12 @@ def _resolve_spec_config(
 
 
 def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_generation_prompt: bool) -> str:
-    if hasattr(tokenizer, "apply_chat_template"):
-        try:
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-                enable_thinking=False,
-            )
-        except TypeError:
-            return tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=add_generation_prompt,
-            )
-    return "\n\n".join([str(m.get("content", "")) for m in messages])
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+        enable_thinking=False,
+    )
 
 
 def sample_next_token(logits: mx.array, *, temperature: float, top_p: float) -> int:
@@ -126,18 +117,14 @@ def sample_next_token(logits: mx.array, *, temperature: float, top_p: float) -> 
     return int(sorted_idx[picked_i].item())
 
 
-def _project_logits(target: nn.Module, hidden: mx.array) -> mx.array:
-    if hasattr(target, "args") and getattr(target.args, "tie_word_embeddings", False):
+def _project_logits_qwen3(target: nn.Module, hidden: mx.array) -> mx.array:
+    if target.args.tie_word_embeddings:
         return target.model.embed_tokens.as_linear(hidden)
-    if hasattr(target, "lm_head"):
-        return target.lm_head(hidden)
-    if hasattr(target, "model") and hasattr(target.model, "lm_head"):
-        return target.model.lm_head(hidden)
-    if hasattr(target, "model") and hasattr(target.model, "embed_tokens"):
-        weight = getattr(target.model.embed_tokens, "weight", None)
-        if weight is not None:
-            return hidden @ weight.transpose()
-    raise AttributeError("Unable to locate LM head for target model")
+    return target.lm_head(hidden)
+
+
+def _project_logits_minillm(target: nn.Module, hidden: mx.array) -> mx.array:
+    return hidden @ target.model.embed_tokens.weight.transpose()
 
 
 def _pick_latest_checkpoint(ckpt_root: Path) -> Optional[Path]:
@@ -271,16 +258,15 @@ def build_speculator(
     head_rank: Optional[int] = None,
 ) -> nn.Module:
     init_weight = None
-    if hasattr(target, "args") and getattr(target.args, "tie_word_embeddings", False):
+    if target_arch == "minillm":
         init_weight = target.model.embed_tokens.weight
-    elif hasattr(target, "lm_head"):
-        init_weight = target.lm_head.weight
-    elif hasattr(target, "model") and hasattr(target.model, "embed_tokens"):
-        init_weight = target.model.embed_tokens.weight
+    else:
+        if target.args.tie_word_embeddings:
+            init_weight = target.model.embed_tokens.weight
+        else:
+            init_weight = target.lm_head.weight
 
     if target_arch == "minillm":
-        if not hasattr(target, "config"):
-            raise AttributeError("Target model missing config; expected MiniLLM MLX model")
         return MiniLLMSpeculator(
             config=target.config,
             spec_len=spec_len,
@@ -288,9 +274,6 @@ def build_speculator(
             init_weight=init_weight,
             head_rank=head_rank,
         )
-
-    if not hasattr(target, "args"):
-        raise AttributeError("Target model missing args; expected mlx-lm Qwen3 model")
 
     return Qwen3Speculator(
         args=target.args,
@@ -379,7 +362,7 @@ def _load_target(
         model.eval()
 
         tokenizer = AutoTokenizer.from_pretrained(minillm_tokenizer)
-        if getattr(tokenizer, "pad_token_id", None) is None:
+        if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id or 0
         return model, tokenizer
 
@@ -429,7 +412,7 @@ def baseline_decode(
         last_hidden = hidden[:, -1:, :]
 
     for _ in range(int(max_new_tokens)):
-        logits = _project_logits(target, last_hidden)[:, -1, :]
+        logits = _project_logits_qwen3(target, last_hidden)[:, -1, :]
         mx.eval(logits)
         token = sample_next_token(logits, temperature=temperature, top_p=top_p)
         output_ids.append(int(token))
@@ -479,12 +462,12 @@ def speculative_decode(
         if use_cache:
             draft_arr = mx.array([draft_tokens], dtype=mx.int32)
             block_hidden = target.model(draft_arr, cache=cache)
-            block_logits = _project_logits(target, block_hidden)
+            block_logits = _project_logits_qwen3(target, block_hidden)
             mx.eval(block_logits)
         else:
             full = mx.array([output_ids + draft_tokens], dtype=mx.int32)
             full_hidden = target.model(full, cache=None)
-            full_logits = _project_logits(target, full_hidden)
+            full_logits = _project_logits_qwen3(target, full_hidden)
             mx.eval(full_logits)
             block_logits = full_logits[:, -len(draft_tokens) :, :]
             block_hidden = full_hidden[:, -len(draft_tokens) :, :]
@@ -580,7 +563,7 @@ def baseline_decode_minillm(
     for _ in range(int(max_new_tokens)):
         prompt = mx.array([output_ids], dtype=mx.int32)
         hidden = target.model(prompt)
-        logits = _project_logits(target, hidden)[:, -1, :]
+        logits = _project_logits_minillm(target, hidden)[:, -1, :]
         mx.eval(logits)
         token = sample_next_token(logits, temperature=temperature, top_p=top_p)
         output_ids.append(int(token))
@@ -621,7 +604,7 @@ def speculative_decode_minillm(
 
         full = mx.array([output_ids + draft_tokens], dtype=mx.int32)
         full_hidden = target.model(full)
-        full_logits = _project_logits(target, full_hidden)
+        full_logits = _project_logits_minillm(target, full_hidden)
         mx.eval(full_logits)
         block_logits = full_logits[:, -len(draft_tokens) :, :]
         block_hidden = full_hidden[:, -len(draft_tokens) :, :]

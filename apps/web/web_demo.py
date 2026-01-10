@@ -304,6 +304,10 @@ def main():
     if "messages" not in st.session_state:
         st.session_state.messages = []
         st.session_state.chat_messages = []
+    if "regenerate" not in st.session_state:
+        st.session_state.regenerate = False
+        st.session_state.last_user_message = ""
+        st.session_state.regenerate_index = 0
 
     messages = st.session_state.messages
 
@@ -322,12 +326,12 @@ def main():
 
     prompt = st.chat_input(key="input", placeholder="给 MiniLLM 发送消息")
 
-    if hasattr(st.session_state, 'regenerate') and st.session_state.regenerate:
+    if st.session_state.regenerate:
         prompt = st.session_state.last_user_message
         regenerate_index = st.session_state.regenerate_index
-        delattr(st.session_state, 'regenerate')
-        delattr(st.session_state, 'last_user_message')
-        delattr(st.session_state, 'regenerate_index')
+        st.session_state.regenerate = False
+        st.session_state.last_user_message = ""
+        st.session_state.regenerate_index = 0
 
     if prompt:
         st.markdown(
