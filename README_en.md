@@ -112,6 +112,8 @@ python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir
 
 ### EAGLE-3 speculator (Qwen3-0.6B, pure synthetic data)
 
+> Speculator defaults auto-scale to target model size; override with `--spec_len`/`--spec_layers` if needed.
+
 ```bash
 # Torch: auto-generate synthetic data + train EAGLE-3 style speculator
 python train/torch/train_eagle3_speculator.py

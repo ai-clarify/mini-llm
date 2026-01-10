@@ -162,6 +162,50 @@ def _resolve_dtype(name: str):
     raise ValueError(f"Unsupported dtype: {name}")
 
 
+def _count_params_mlx(model: nn.Module) -> Optional[int]:
+    try:
+        return int(sum(int(p.size) for p in model.parameters()))
+    except Exception:
+        return None
+
+
+def _auto_spec_config(param_count: Optional[int]) -> Tuple[int, int]:
+    if not param_count or param_count <= 0:
+        return 1, 1
+    params_b = float(param_count) / 1e9
+    if params_b <= 1.0:
+        return 1, 1
+    if params_b <= 3.0:
+        return 2, 1
+    if params_b <= 7.0:
+        return 3, 2
+    if params_b <= 13.0:
+        return 4, 2
+    return 5, 2
+
+
+def _resolve_spec_config(
+    spec_len: Optional[int], spec_layers: Optional[int], *, param_count: Optional[int]
+) -> Tuple[int, int]:
+    auto_len, auto_layers = _auto_spec_config(param_count)
+    if spec_len is None or int(spec_len) <= 0:
+        spec_len = auto_len
+    if spec_layers is None or int(spec_layers) <= 0:
+        spec_layers = auto_layers
+    return int(spec_len), int(spec_layers)
+
+
+def _count_trainable_params(params: Any) -> int:
+    flat: List[Tuple[str, Any]] = []
+    mlx_utils.tree_flatten(params, destination=flat)
+    total = 0
+    for _, value in flat:
+        size = getattr(value, "size", None)
+        if size is not None:
+            total += int(size)
+    return total
+
+
 def _ensure_synth_data(args) -> None:
     data_path = Path(args.data_path)
     data_path.parent.mkdir(parents=True, exist_ok=True)
@@ -233,8 +277,8 @@ def main() -> None:
     parser.add_argument("--max_steps", type=int, default=5000)
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=500)
-    parser.add_argument("--spec_len", type=int, default=7)
-    parser.add_argument("--spec_layers", type=int, default=2)
+    parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
+    parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--min_samples", type=int, default=20000)
@@ -274,6 +318,27 @@ def main() -> None:
         except Exception:
             pass
 
+    param_count = _count_params_mlx(target)
+    auto_spec = (
+        args.spec_len is None
+        or args.spec_layers is None
+        or int(args.spec_len) <= 0
+        or int(args.spec_layers) <= 0
+    )
+    spec_len, spec_layers = _resolve_spec_config(
+        args.spec_len, args.spec_layers, param_count=param_count
+    )
+    args.spec_len = spec_len
+    args.spec_layers = spec_layers
+    if auto_spec:
+        if param_count:
+            print(
+                f"[speculator] auto spec_len={spec_len} spec_layers={spec_layers} "
+                f"(target_params={param_count / 1e9:.2f}B)"
+            )
+        else:
+            print(f"[speculator] auto spec_len={spec_len} spec_layers={spec_layers}")
+
     speculator = build_speculator(
         target_arch=args.target_arch,
         target=target,
@@ -285,7 +350,7 @@ def main() -> None:
     speculator.apply(lambda p: p.astype(dtype))
     speculator.train()
 
-    trainable = sum(p.size for p in speculator.trainable_parameters())
+    trainable = _count_trainable_params(speculator.trainable_parameters())
     print(f"[speculator] params={trainable / 1e6:.2f}M spec_len={args.spec_len} spec_layers={args.spec_layers}")
 
     dataset = SyntheticChatDataset(Path(args.data_path), tokenizer, max_seq_len=args.max_seq_len)

@@ -26,6 +26,39 @@ def _resolve_dtype(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
+def _count_params_torch(model: nn.Module) -> Optional[int]:
+    try:
+        return int(sum(p.numel() for p in model.parameters()))
+    except Exception:
+        return None
+
+
+def _auto_spec_config(param_count: Optional[int]) -> Tuple[int, int]:
+    if not param_count or param_count <= 0:
+        return 1, 1
+    params_b = float(param_count) / 1e9
+    if params_b <= 1.0:
+        return 1, 1
+    if params_b <= 3.0:
+        return 2, 1
+    if params_b <= 7.0:
+        return 3, 2
+    if params_b <= 13.0:
+        return 4, 2
+    return 5, 2
+
+
+def _resolve_spec_config(
+    spec_len: Optional[int], spec_layers: Optional[int], *, param_count: Optional[int]
+) -> Tuple[int, int]:
+    auto_len, auto_layers = _auto_spec_config(param_count)
+    if spec_len is None or int(spec_len) <= 0:
+        spec_len = auto_len
+    if spec_layers is None or int(spec_layers) <= 0:
+        spec_layers = auto_layers
+    return int(spec_len), int(spec_layers)
+
+
 def _load_minillm_config(path: Optional[str]) -> MiniLLMConfig:
     if not path:
         return MiniLLMConfig()
@@ -455,8 +488,8 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
-    parser.add_argument("--spec_len", type=int, default=7)
-    parser.add_argument("--spec_layers", type=int, default=2)
+    parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
+    parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
     parser.add_argument("--spec_heads", type=int, default=0)
     parser.add_argument("--spec_dropout", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=1337)
@@ -490,7 +523,9 @@ def run_cli(*, optimized: bool) -> None:
     input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
 
     speculator = None
-    spec_len = args.spec_len
+    spec_len, spec_layers = _resolve_spec_config(
+        args.spec_len, args.spec_layers, param_count=_count_params_torch(target)
+    )
     if not args.no_speculator:
         speculator_dir = Path(args.speculator_dir)
         speculator_ckpt = Path(args.speculator_ckpt) if args.speculator_ckpt else None
@@ -498,8 +533,8 @@ def run_cli(*, optimized: bool) -> None:
             target=target,
             speculator_dir=speculator_dir,
             speculator_ckpt=speculator_ckpt,
-            spec_len=args.spec_len,
-            spec_layers=args.spec_layers,
+            spec_len=spec_len,
+            spec_layers=spec_layers,
             spec_heads=args.spec_heads,
             dropout=args.spec_dropout,
         )

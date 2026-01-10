@@ -108,6 +108,7 @@ OLLAMA_MODEL=qwen3:0.6b DATA_JSONL=out/distill_ollama_qwen3_0.6b/synth.jsonl OUT
 > 兼容性说明：
 > - Qwen3-0.6B：Torch/MLX 可用（MLX 依赖 `mlx-lm`）。
 > - MiniLLM：Torch 使用本仓 PyTorch checkpoint；MLX 使用 `mlx_train` 产出的 checkpoint（含 `config.json` + `model.safetensors`），MLX 推理默认不使用 cache。
+> - speculator 默认会根据目标模型大小自动设置；可用 `--spec_len`/`--spec_layers` 显式覆盖。
 
 #### Qwen3-0.6B（Torch）
 
