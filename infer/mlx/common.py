@@ -11,15 +11,33 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 try:
     import mlx.core as mx
     import mlx.nn as nn
-    from mlx_lm import load
-    from mlx_lm.models import cache as mlx_cache
-    from mlx_lm.models import qwen3 as qwen3_model
-    from mlx_lm.models.base import create_attention_mask
 except ImportError as exc:  # pragma: no cover - dependency check
-    raise ImportError(
-        "Missing MLX dependencies. Install via `python3 -m pip install mlx-lm`. "
-        "Note: mlx-lm currently pins transformers==5.0.0rc1; use a clean venv if needed."
-    ) from exc
+    raise ImportError("Missing MLX core dependencies. Install mlx first.") from exc
+
+
+def _load_qwen3_deps():
+    try:
+        from mlx_lm import load as qwen3_load
+        from mlx_lm.models import cache as qwen3_cache
+        from mlx_lm.models import qwen3 as qwen3_model
+        from mlx_lm.models.base import create_attention_mask
+    except ImportError as exc:  # pragma: no cover - dependency check
+        raise ImportError(
+            "Missing mlx-lm for Qwen3 inference/training. Install via `python3 -m pip install mlx-lm`. "
+            "Note: mlx-lm currently pins transformers==5.0.0rc1; use a clean venv if needed."
+        ) from exc
+    return qwen3_load, qwen3_cache, qwen3_model, create_attention_mask
+
+
+def _load_minillm_deps():
+    try:
+        from transformers import AutoTokenizer
+        from mlx_train.config import MiniLLMConfig
+        from mlx_train.models import MiniLLMForCausalLM
+        from mlx_train.models.minillm import MiniLLMBlock, RMSNorm
+    except Exception as exc:  # pragma: no cover - dependency check
+        raise ImportError("Missing MiniLLM MLX dependencies; ensure mlx_train and transformers are available.") from exc
+    return AutoTokenizer, MiniLLMConfig, MiniLLMForCausalLM, MiniLLMBlock, RMSNorm
 
 
 def _safe_name(repo: str) -> str:
@@ -82,6 +100,10 @@ def _project_logits(target: nn.Module, hidden: mx.array) -> mx.array:
         return target.lm_head(hidden)
     if hasattr(target, "model") and hasattr(target.model, "lm_head"):
         return target.model.lm_head(hidden)
+    if hasattr(target, "model") and hasattr(target.model, "embed_tokens"):
+        weight = getattr(target.model.embed_tokens, "weight", None)
+        if weight is not None:
+            return hidden @ weight.transpose()
     raise AttributeError("Unable to locate LM head for target model")
 
 
@@ -106,16 +128,36 @@ def _pick_latest_checkpoint(ckpt_root: Path) -> Optional[Path]:
     return best
 
 
-class Eagle3Speculator(nn.Module):
+_QWEN3_DEPS = None
+_MINILLM_DEPS = None
+
+
+def _get_qwen3_deps():
+    global _QWEN3_DEPS
+    if _QWEN3_DEPS is None:
+        _QWEN3_DEPS = _load_qwen3_deps()
+    return _QWEN3_DEPS
+
+
+def _get_minillm_deps():
+    global _MINILLM_DEPS
+    if _MINILLM_DEPS is None:
+        _MINILLM_DEPS = _load_minillm_deps()
+    return _MINILLM_DEPS
+
+
+class Qwen3Speculator(nn.Module):
     def __init__(
         self,
         *,
-        args: qwen3_model.ModelArgs,
+        args: Any,
         spec_len: int,
         spec_layers: int,
         init_weight: Optional[mx.array],
     ) -> None:
         super().__init__()
+        _, _, qwen3_model, create_attention_mask = _get_qwen3_deps()
+        self._create_attention_mask = create_attention_mask
         self.layers = [qwen3_model.TransformerBlock(args=args) for _ in range(int(spec_layers))]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.heads = [nn.Linear(args.hidden_size, args.vocab_size, bias=False) for _ in range(int(spec_len))]
@@ -129,42 +171,99 @@ class Eagle3Speculator(nn.Module):
             x = x * attention_mask[..., None]
         mask = None
         if x.shape[1] > 1:
-            mask = create_attention_mask(x, cache=None)
+            mask = self._create_attention_mask(x, cache=None)
         for layer in self.layers:
             x = layer(x, mask=mask, cache=None)
         x = self.norm(x)
         return [head(x) for head in self.heads]
 
 
+class MiniLLMSpeculator(nn.Module):
+    def __init__(
+        self,
+        *,
+        config: Any,
+        spec_len: int,
+        spec_layers: int,
+        init_weight: Optional[mx.array],
+    ) -> None:
+        super().__init__()
+        _, _, _, MiniLLMBlock, RMSNorm = _get_minillm_deps()
+        self.layers = [MiniLLMBlock(i, config) for i in range(int(spec_layers))]
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.heads = [nn.Linear(config.hidden_size, config.vocab_size, bias=False) for _ in range(int(spec_len))]
+        if init_weight is not None:
+            for head in self.heads:
+                head.weight = init_weight
+
+    def __call__(self, hidden: mx.array, attention_mask: Optional[mx.array] = None) -> List[mx.array]:
+        x = hidden
+        if attention_mask is not None:
+            x = x * attention_mask[..., None]
+        for layer in self.layers:
+            x = layer(x)
+        x = self.norm(x)
+        return [head(x) for head in self.heads]
+
+
+def build_speculator(
+    *,
+    target_arch: str,
+    target: nn.Module,
+    spec_len: int,
+    spec_layers: int,
+) -> nn.Module:
+    init_weight = None
+    if hasattr(target, "args") and getattr(target.args, "tie_word_embeddings", False):
+        init_weight = target.model.embed_tokens.weight
+    elif hasattr(target, "lm_head"):
+        init_weight = target.lm_head.weight
+    elif hasattr(target, "model") and hasattr(target.model, "embed_tokens"):
+        init_weight = target.model.embed_tokens.weight
+
+    if target_arch == "minillm":
+        if not hasattr(target, "config"):
+            raise AttributeError("Target model missing config; expected MiniLLM MLX model")
+        return MiniLLMSpeculator(
+            config=target.config,
+            spec_len=spec_len,
+            spec_layers=spec_layers,
+            init_weight=init_weight,
+        )
+
+    if not hasattr(target, "args"):
+        raise AttributeError("Target model missing args; expected mlx-lm Qwen3 model")
+
+    return Qwen3Speculator(
+        args=target.args,
+        spec_len=spec_len,
+        spec_layers=spec_layers,
+        init_weight=init_weight,
+    )
+
+
 def load_speculator(
     *,
+    target_arch: str,
     target: nn.Module,
     speculator_dir: Path,
     speculator_ckpt: Optional[Path],
     spec_len: int,
     spec_layers: int,
-) -> Tuple[Eagle3Speculator, int]:
+) -> Tuple[nn.Module, int]:
     cfg_path = speculator_dir / "speculator_config.json"
     if cfg_path.is_file():
         with cfg_path.open("r", encoding="utf-8") as f:
             cfg = json.load(f)
         spec_len = int(cfg.get("spec_len", spec_len))
         spec_layers = int(cfg.get("spec_layers", spec_layers))
+        target_arch = str(cfg.get("target_arch", target_arch))
 
-    init_weight = None
-    if hasattr(target, "args") and getattr(target.args, "tie_word_embeddings", False):
-        init_weight = target.model.embed_tokens.weight
-    elif hasattr(target, "lm_head"):
-        init_weight = target.lm_head.weight
-
-    if not hasattr(target, "args"):
-        raise AttributeError("Target model missing args; expected mlx-lm Qwen3 model")
-
-    speculator = Eagle3Speculator(
-        args=target.args,
+    speculator = build_speculator(
+        target_arch=target_arch,
+        target=target,
         spec_len=spec_len,
         spec_layers=spec_layers,
-        init_weight=init_weight,
     )
 
     if speculator_ckpt is None:
@@ -182,10 +281,37 @@ def load_speculator(
 
 def _load_target(
     *,
+    target_arch: str,
     model_dir: Optional[str],
     hf_repo: str,
     revision: Optional[str],
+    minillm_ckpt_dir: Optional[str],
+    minillm_tokenizer: str,
 ) -> Tuple[nn.Module, Any]:
+    if target_arch == "minillm":
+        if not minillm_ckpt_dir:
+            raise ValueError("--minillm_ckpt_dir is required when target_arch=minillm")
+        AutoTokenizer, MiniLLMConfig, MiniLLMForCausalLM, _, _ = _get_minillm_deps()
+        ckpt_path = Path(minillm_ckpt_dir)
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"MiniLLM checkpoint dir not found: {ckpt_path}")
+        cfg_path = ckpt_path / "config.json"
+        if not cfg_path.is_file():
+            raise FileNotFoundError(f"Missing MiniLLM config.json in {ckpt_path}")
+        cfg = MiniLLMConfig.from_dict(json.loads(cfg_path.read_text(encoding="utf-8")))
+        model = MiniLLMForCausalLM(cfg)
+        weights_path = ckpt_path / "model.safetensors"
+        if not weights_path.is_file():
+            raise FileNotFoundError(f"Missing MiniLLM weights: {weights_path}")
+        model.load_weights(str(weights_path))
+        model.eval()
+
+        tokenizer = AutoTokenizer.from_pretrained(minillm_tokenizer)
+        if getattr(tokenizer, "pad_token_id", None) is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id or 0
+        return model, tokenizer
+
+    qwen3_load, _, _, _ = _get_qwen3_deps()
     path: str
     if model_dir:
         model_path = Path(model_dir)
@@ -195,7 +321,7 @@ def _load_target(
     else:
         model_path = _default_model_dir(hf_repo)
         path = str(model_path) if model_path.exists() else hf_repo
-    model, tokenizer = load(path, revision=revision)
+    model, tokenizer = qwen3_load(path, revision=revision)
     model.eval()
     return model, tokenizer
 
@@ -211,6 +337,7 @@ def baseline_decode(
     cache: Optional[List[Any]] = None,
     last_hidden: Optional[mx.array] = None,
 ) -> List[int]:
+    _, mlx_cache, _, _ = _get_qwen3_deps()
     output_ids = list(input_ids)
     if cache is None or last_hidden is None:
         cache = mlx_cache.make_prompt_cache(target.model)
@@ -237,7 +364,7 @@ def baseline_decode(
 def speculative_decode(
     *,
     target: nn.Module,
-    speculator: Eagle3Speculator,
+    speculator: nn.Module,
     input_ids: List[int],
     max_new_tokens: int,
     spec_len: int,
@@ -248,6 +375,7 @@ def speculative_decode(
     optimized: bool,
     max_consecutive_misses: int = 2,
 ) -> List[int]:
+    _, mlx_cache, _, _ = _get_qwen3_deps()
     output_ids = list(input_ids)
     produced = 0
     consecutive_misses = 0
@@ -357,11 +485,127 @@ def speculative_decode(
     return output_ids
 
 
+def baseline_decode_minillm(
+    *,
+    target: nn.Module,
+    input_ids: List[int],
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+) -> List[int]:
+    output_ids = list(input_ids)
+    for _ in range(int(max_new_tokens)):
+        prompt = mx.array([output_ids], dtype=mx.int32)
+        hidden = target.model(prompt)
+        logits = _project_logits(target, hidden)[:, -1, :]
+        mx.eval(logits)
+        token = sample_next_token(logits, temperature=temperature, top_p=top_p)
+        output_ids.append(int(token))
+        if eos_token_id is not None and int(token) == int(eos_token_id):
+            break
+    return output_ids
+
+
+def speculative_decode_minillm(
+    *,
+    target: nn.Module,
+    speculator: nn.Module,
+    input_ids: List[int],
+    max_new_tokens: int,
+    spec_len: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+    optimized: bool,
+    max_consecutive_misses: int = 2,
+) -> List[int]:
+    output_ids = list(input_ids)
+    produced = 0
+    consecutive_misses = 0
+
+    while produced < int(max_new_tokens):
+        prompt = mx.array([output_ids], dtype=mx.int32)
+        hidden = target.model(prompt)
+        mx.eval(hidden)
+        last_hidden = hidden[:, -1:, :]
+
+        logits_list = speculator(last_hidden)
+        mx.eval(*logits_list)
+        draft_tokens = [
+            sample_next_token(logits_list[i][0, -1, :], temperature=temperature, top_p=top_p)
+            for i in range(int(spec_len))
+        ]
+
+        full = mx.array([output_ids + draft_tokens], dtype=mx.int32)
+        full_hidden = target.model(full)
+        full_logits = _project_logits(target, full_hidden)
+        mx.eval(full_logits)
+        block_logits = full_logits[:, -len(draft_tokens) :, :]
+        block_hidden = full_hidden[:, -len(draft_tokens) :, :]
+
+        posterior_tokens = [
+            sample_next_token(block_logits[0, i, :], temperature=temperature, top_p=top_p)
+            for i in range(len(draft_tokens))
+        ]
+
+        accept_len = 0
+        for i in range(len(draft_tokens)):
+            if draft_tokens[i] == posterior_tokens[i]:
+                accept_len += 1
+            else:
+                break
+
+        if accept_len == 0:
+            consecutive_misses += 1
+        else:
+            consecutive_misses = 0
+
+        new_tokens = list(draft_tokens[:accept_len])
+        if accept_len < len(draft_tokens):
+            new_tokens.append(posterior_tokens[accept_len])
+
+        remaining = int(max_new_tokens) - produced
+        if len(new_tokens) > remaining:
+            new_tokens = new_tokens[:remaining]
+
+        if not new_tokens:
+            break
+
+        output_ids.extend(int(t) for t in new_tokens)
+        produced += len(new_tokens)
+
+        if eos_token_id is not None and int(eos_token_id) in new_tokens:
+            eos_idx = new_tokens.index(int(eos_token_id))
+            tail = len(new_tokens) - eos_idx - 1
+            if tail > 0:
+                output_ids = output_ids[:-tail]
+            break
+
+        if optimized and consecutive_misses >= max_consecutive_misses:
+            break
+
+    if optimized and produced < int(max_new_tokens):
+        output_ids = baseline_decode_minillm(
+            target=target,
+            input_ids=output_ids,
+            max_new_tokens=int(max_new_tokens) - produced,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+        )
+
+    return output_ids
+
+
 def build_arg_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
+    parser.add_argument("--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3")
     parser.add_argument("--hf_repo", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--model_dir", type=str, default=None)
     parser.add_argument("--revision", type=str, default=None)
+    parser.add_argument("--minillm_ckpt_dir", type=str, default=None)
+    parser.add_argument("--minillm_tokenizer", type=str, default="./model")
     parser.add_argument("--speculator_dir", type=str, default="out/eagle3_speculator_mlx/qwen3_0.6b")
     parser.add_argument("--speculator_ckpt", type=str, default=None)
     parser.add_argument("--prompt", type=str, default="Hello")
@@ -389,9 +633,12 @@ def run_cli(*, optimized: bool) -> None:
     mx.random.seed(int(args.seed))
 
     target, tokenizer = _load_target(
+        target_arch=args.target_arch,
         model_dir=args.model_dir,
         hf_repo=args.hf_repo,
         revision=args.revision,
+        minillm_ckpt_dir=args.minillm_ckpt_dir,
+        minillm_tokenizer=args.minillm_tokenizer,
     )
 
     messages: List[Dict[str, str]] = []
@@ -410,6 +657,7 @@ def run_cli(*, optimized: bool) -> None:
         speculator_dir = Path(args.speculator_dir)
         speculator_ckpt = Path(args.speculator_ckpt) if args.speculator_ckpt else None
         speculator, spec_len = load_speculator(
+            target_arch=args.target_arch,
             target=target,
             speculator_dir=speculator_dir,
             speculator_ckpt=speculator_ckpt,
@@ -418,28 +666,51 @@ def run_cli(*, optimized: bool) -> None:
         )
 
     start = time.time()
-    if speculator is None:
-        output_ids = baseline_decode(
-            target=target,
-            input_ids=input_ids,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+    if args.target_arch == "minillm":
+        if speculator is None:
+            output_ids = baseline_decode_minillm(
+                target=target,
+                input_ids=input_ids,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+        else:
+            output_ids = speculative_decode_minillm(
+                target=target,
+                speculator=speculator,
+                input_ids=input_ids,
+                max_new_tokens=args.max_new_tokens,
+                spec_len=spec_len,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                eos_token_id=tokenizer.eos_token_id,
+                optimized=optimized,
+            )
     else:
-        output_ids = speculative_decode(
-            target=target,
-            speculator=speculator,
-            input_ids=input_ids,
-            max_new_tokens=args.max_new_tokens,
-            spec_len=spec_len,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            eos_token_id=tokenizer.eos_token_id,
-            use_cache=not args.no_cache,
-            optimized=optimized,
-        )
+        if speculator is None:
+            output_ids = baseline_decode(
+                target=target,
+                input_ids=input_ids,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+        else:
+            output_ids = speculative_decode(
+                target=target,
+                speculator=speculator,
+                input_ids=input_ids,
+                max_new_tokens=args.max_new_tokens,
+                spec_len=spec_len,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                eos_token_id=tokenizer.eos_token_id,
+                use_cache=not args.no_cache,
+                optimized=optimized,
+            )
     elapsed = time.time() - start
     out_text = tokenizer.decode(output_ids, skip_special_tokens=True)
     print(out_text)

@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from infer.mlx.common import Eagle3Speculator, _default_model_dir
+from infer.mlx.common import _load_target, build_speculator
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -214,11 +214,14 @@ def save_optimizer_state(optimizer: optim.Optimizer, path: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train an EAGLE-3 style speculator for Qwen3-0.6B (MLX backend, pure synthetic data)."
+        description="Train an EAGLE-3 style speculator for Qwen3-0.6B or MiniLLM (MLX backend, pure synthetic data)."
     )
+    parser.add_argument("--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3")
     parser.add_argument("--hf_repo", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--model_dir", type=str, default=None)
     parser.add_argument("--revision", type=str, default=None)
+    parser.add_argument("--minillm_ckpt_dir", type=str, default=None)
+    parser.add_argument("--minillm_tokenizer", type=str, default="./model")
     parser.add_argument("--data_path", type=str, default="out/distill_ollama_qwen3_0.6b/synth.jsonl")
     parser.add_argument("--out_dir", type=str, default="out/eagle3_speculator_mlx/qwen3_0.6b")
     parser.add_argument("--max_seq_len", type=int, default=512)
@@ -255,21 +258,14 @@ def main() -> None:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        from mlx_lm import load
-    except ImportError as exc:
-        raise ImportError("Missing mlx-lm. Install via `python3 -m pip install mlx-lm`.") from exc
-
-    if args.model_dir:
-        model_path = Path(args.model_dir)
-        if not model_path.exists():
-            raise FileNotFoundError(f"Model dir not found: {model_path}")
-        model_source = str(model_path)
-    else:
-        default_dir = _default_model_dir(args.hf_repo)
-        model_source = str(default_dir) if default_dir.exists() else args.hf_repo
-
-    target, tokenizer = load(model_source, revision=args.revision)
+    target, tokenizer = _load_target(
+        target_arch=args.target_arch,
+        model_dir=args.model_dir,
+        hf_repo=args.hf_repo,
+        revision=args.revision,
+        minillm_ckpt_dir=args.minillm_ckpt_dir,
+        minillm_tokenizer=args.minillm_tokenizer,
+    )
     target.eval()
 
     if getattr(tokenizer, "pad_token_id", None) is None:
@@ -278,20 +274,11 @@ def main() -> None:
         except Exception:
             pass
 
-    init_weight = None
-    if hasattr(target, "args") and getattr(target.args, "tie_word_embeddings", False):
-        init_weight = mx.array(target.model.embed_tokens.weight)
-    elif hasattr(target, "lm_head"):
-        init_weight = mx.array(target.lm_head.weight)
-
-    if not hasattr(target, "args"):
-        raise AttributeError("Target model missing args; expected mlx-lm Qwen3 model")
-
-    speculator = Eagle3Speculator(
-        args=target.args,
+    speculator = build_speculator(
+        target_arch=args.target_arch,
+        target=target,
         spec_len=args.spec_len,
         spec_layers=args.spec_layers,
-        init_weight=init_weight,
     )
 
     dtype = _resolve_dtype(args.dtype)
@@ -309,7 +296,10 @@ def main() -> None:
     optimizer.init(speculator.trainable_parameters())
 
     def loss_wrapped(input_ids: mx.array, attention_mask: mx.array, loss_mask: mx.array) -> mx.array:
-        hidden = target.model(input_ids, cache=None)
+        if args.target_arch == "minillm":
+            hidden = target.model(input_ids, attention_mask=attention_mask)
+        else:
+            hidden = target.model(input_ids, cache=None)
         hidden = mx.stop_gradient(hidden)
         if hidden.dtype != dtype:
             hidden = hidden.astype(dtype)
@@ -319,8 +309,11 @@ def main() -> None:
     value_and_grad = nn.value_and_grad(speculator, loss_wrapped)
 
     config = {
+        "target_arch": args.target_arch,
         "hf_repo": args.hf_repo,
-        "model_source": model_source,
+        "model_dir": args.model_dir,
+        "minillm_ckpt_dir": args.minillm_ckpt_dir,
+        "minillm_tokenizer": args.minillm_tokenizer,
         "data_path": args.data_path,
         "max_seq_len": args.max_seq_len,
         "spec_len": args.spec_len,

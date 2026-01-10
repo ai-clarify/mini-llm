@@ -70,3 +70,5 @@ dataset/gsm8k/
 # macOS resource fork files
 ._*
 **/.___pycache__
+dataset/minimind/.msc
+dataset/minimind/.mv

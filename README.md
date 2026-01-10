@@ -103,10 +103,13 @@ OLLAMA_MODEL=qwen3:0.6b DATA_JSONL=out/distill_ollama_qwen3_0.6b/synth.jsonl OUT
   bash scripts/run_mlx_distill_ollama.sh
 ```
 
-### EAGLE-3 speculator（Qwen3-0.6B，纯合成数据）
+### EAGLE-3 speculator（Qwen3-0.6B / MiniLLM，纯合成数据）
 
-> 兼容性说明：当前仅验证 Qwen3-0.6B。MiniLLM 尚未接入 speculator 训练/推理；
-> 如需尝试，需要提供 HF 兼容权重并自行适配脚本（MLX 侧仍依赖 mlx-lm 的 Qwen3 架构）。
+> 兼容性说明：
+> - Qwen3-0.6B：Torch/MLX 可用（MLX 依赖 `mlx-lm`）。
+> - MiniLLM：Torch 使用本仓 PyTorch checkpoint；MLX 使用 `mlx_train` 产出的 checkpoint（含 `config.json` + `model.safetensors`），MLX 推理默认不使用 cache。
+
+#### Qwen3-0.6B（Torch）
 
 ```bash
 # Torch：自动生成合成数据 + 训练 EAGLE-3 style speculator
@@ -128,6 +131,8 @@ python infer/torch/spec_decode_optimized.py --prompt "Hi"
 python infer/torch/bench.py --max_samples 16
 ```
 
+#### Qwen3-0.6B（MLX）
+
 ```bash
 # MLX：先转换 HF 模型（或直接传 --hf_repo 让 mlx-lm 下载）
 python -m mlx_train.hf_convert --hf_repo Qwen/Qwen3-0.6B
@@ -146,6 +151,52 @@ python infer/mlx/spec_decode.py --model_dir out/mlx_hf/qwen_qwen3_0_6b --prompt 
 ```bash
 # MLX：推理（优化版，连续两次命中失败则切回基线）
 python infer/mlx/spec_decode_optimized.py --model_dir out/mlx_hf/qwen_qwen3_0_6b --prompt "Hi"
+```
+
+#### MiniLLM（Torch）
+
+```bash
+# Torch：训练（指定 MiniLLM checkpoint + tokenizer）
+python train/torch/train_eagle3_speculator.py \
+  --target_arch minillm \
+  --minillm_ckpt out/pretrain_512.pth \
+  --minillm_tokenizer ./model
+```
+
+```bash
+# Torch：推理（speculative decoding）
+python infer/torch/spec_decode.py \
+  --target_arch minillm \
+  --minillm_ckpt out/pretrain_512.pth \
+  --minillm_tokenizer ./model \
+  --prompt "Hi"
+```
+
+```bash
+# Torch：基准对比
+python infer/torch/bench.py \
+  --target_arch minillm \
+  --minillm_ckpt out/pretrain_512.pth \
+  --minillm_tokenizer ./model
+```
+
+#### MiniLLM（MLX）
+
+```bash
+# MLX：训练（使用 mlx_train 产出的 checkpoint 目录）
+python train/mlx/train_eagle3_speculator.py \
+  --target_arch minillm \
+  --minillm_ckpt_dir out/mlx/sft/checkpoints/step_00000050 \
+  --minillm_tokenizer ./model
+```
+
+```bash
+# MLX：推理（speculative decoding）
+python infer/mlx/spec_decode.py \
+  --target_arch minillm \
+  --minillm_ckpt_dir out/mlx/sft/checkpoints/step_00000050 \
+  --minillm_tokenizer ./model \
+  --prompt "Hi"
 ```
 
 ```bash

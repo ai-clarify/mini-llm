@@ -14,6 +14,8 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
+
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
@@ -196,6 +198,44 @@ def _resolve_dtype(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
+def _load_minillm_config(path: Optional[str]) -> MiniLLMConfig:
+    if not path:
+        return MiniLLMConfig()
+    cfg_path = Path(path)
+    with cfg_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"MiniLLM config must be a JSON object: {cfg_path}")
+    return MiniLLMConfig(**data)
+
+
+def _extract_hidden_state(output: Any) -> torch.Tensor:
+    if isinstance(output, (tuple, list)) and output:
+        return output[0]
+    if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+        return output.last_hidden_state
+    if hasattr(output, "hidden_states") and output.hidden_states:
+        return output.hidden_states[-1]
+    raise AttributeError("Unable to extract hidden states from target output")
+
+
+def _forward_hidden(
+    target: nn.Module, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor]
+) -> torch.Tensor:
+    base = getattr(target, "model", None) or getattr(target, "base_model", None) or target
+    try:
+        out = base(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+    except TypeError:
+        out = base(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    return _extract_hidden_state(out)
+
+
 def _ensure_synth_data(args) -> None:
     data_path = Path(args.data_path)
     data_path.parent.mkdir(parents=True, exist_ok=True)
@@ -237,9 +277,13 @@ def _infinite_loader(loader: DataLoader):
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train an EAGLE-3 style speculator for Qwen3-0.6B using pure synthetic data."
+        description="Train an EAGLE-3 style speculator for Qwen3-0.6B or MiniLLM using pure synthetic data."
     )
+    parser.add_argument("--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3")
     parser.add_argument("--target_model", type=str, default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--minillm_ckpt", type=str, default=None)
+    parser.add_argument("--minillm_config", type=str, default=None)
+    parser.add_argument("--minillm_tokenizer", type=str, default="./model")
     parser.add_argument("--data_path", type=str, default="out/distill_ollama_qwen3_0.6b/synth.jsonl")
     parser.add_argument("--out_dir", type=str, default="out/eagle3_speculator/qwen3_0.6b")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
@@ -283,14 +327,27 @@ def main() -> None:
     dtype = _resolve_dtype(args.dtype)
     device = torch.device(args.device)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id or 0
-    tokenizer.padding_side = "right"
-
-    target = AutoModelForCausalLM.from_pretrained(
-        args.target_model, trust_remote_code=True, torch_dtype=dtype
-    ).to(device)
+    if args.target_arch == "minillm":
+        tokenizer = AutoTokenizer.from_pretrained(args.minillm_tokenizer)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id or 0
+        tokenizer.padding_side = "right"
+        cfg = _load_minillm_config(args.minillm_config)
+        target = MiniLLMForCausalLM(cfg)
+        if args.minillm_ckpt:
+            state = torch.load(args.minillm_ckpt, map_location=device)
+            target.load_state_dict(state, strict=False)
+        else:
+            print("[warn] MiniLLM checkpoint not provided; using random weights")
+        target = target.to(device=device, dtype=dtype)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id or 0
+        tokenizer.padding_side = "right"
+        target = AutoModelForCausalLM.from_pretrained(
+            args.target_model, trust_remote_code=True, torch_dtype=dtype
+        ).to(device)
     target.eval()
     for p in target.parameters():
         p.requires_grad = False
@@ -299,7 +356,11 @@ def main() -> None:
     vocab_size = int(getattr(target.config, "vocab_size", len(tokenizer)))
     spec_heads = int(args.spec_heads)
     if spec_heads <= 0:
-        spec_heads = max(1, hidden_size // 64)
+        cfg_heads = int(getattr(target.config, "num_attention_heads", 0) or 0)
+        if cfg_heads > 0:
+            spec_heads = cfg_heads
+        else:
+            spec_heads = max(1, hidden_size // 64)
         while spec_heads > 1 and hidden_size % spec_heads != 0:
             spec_heads -= 1
 
@@ -331,7 +392,11 @@ def main() -> None:
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp and amp_dtype == torch.float16)
 
     config = {
+        "target_arch": args.target_arch,
         "target_model": args.target_model,
+        "minillm_ckpt": args.minillm_ckpt,
+        "minillm_config": args.minillm_config,
+        "minillm_tokenizer": args.minillm_tokenizer,
         "data_path": args.data_path,
         "max_seq_len": args.max_seq_len,
         "spec_len": args.spec_len,
@@ -351,10 +416,6 @@ def main() -> None:
         raise ValueError("--accum_steps must be >= 1")
 
     optimizer.zero_grad(set_to_none=True)
-    target_base = getattr(target, "model", None) or getattr(target, "base_model", None)
-    if target_base is None:
-        raise AttributeError("target model has no .model/.base_model attribute for hidden states")
-
     for step in range(1, int(args.max_steps) + 1):
         input_ids, attention_mask, loss_mask = next(data_iter)
         input_ids = input_ids.to(device)
@@ -362,13 +423,7 @@ def main() -> None:
         loss_mask = loss_mask.to(device)
 
         with torch.no_grad():
-            target_out = target_base(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                use_cache=False,
-                return_dict=True,
-            )
-            hidden = target_out.last_hidden_state
+            hidden = _forward_hidden(target, input_ids, attention_mask)
 
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             logits_list = speculator(hidden, attention_mask)

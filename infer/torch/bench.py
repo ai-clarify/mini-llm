@@ -10,6 +10,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
+
 
 DEFAULT_PROMPTS = [
     "Explain the difference between overfitting and underfitting in one paragraph.",
@@ -30,6 +32,55 @@ def _resolve_dtype(name: str) -> torch.dtype:
     if name == "float32":
         return torch.float32
     raise ValueError(f"Unsupported dtype: {name}")
+
+
+def _load_minillm_config(path: Optional[str]) -> MiniLLMConfig:
+    if not path:
+        return MiniLLMConfig()
+    cfg_path = Path(path)
+    with cfg_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"MiniLLM config must be a JSON object: {cfg_path}")
+    return MiniLLMConfig(**data)
+
+
+def _extract_hidden_state(output: Any) -> torch.Tensor:
+    if isinstance(output, (tuple, list)) and output:
+        return output[0]
+    if hasattr(output, "last_hidden_state") and output.last_hidden_state is not None:
+        return output.last_hidden_state
+    if hasattr(output, "hidden_states") and output.hidden_states:
+        return output.hidden_states[-1]
+    raise AttributeError("Unable to extract hidden states from target output")
+
+
+def _load_target_and_tokenizer(args, device: torch.device, dtype: torch.dtype):
+    if args.target_arch == "minillm":
+        tokenizer = AutoTokenizer.from_pretrained(args.minillm_tokenizer)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id or 0
+        tokenizer.padding_side = "right"
+
+        cfg = _load_minillm_config(args.minillm_config)
+        target = MiniLLMForCausalLM(cfg)
+        if args.minillm_ckpt:
+            state = torch.load(args.minillm_ckpt, map_location=device)
+            target.load_state_dict(state, strict=False)
+        else:
+            print("[warn] MiniLLM checkpoint not provided; using random weights")
+        target = target.to(device=device, dtype=dtype)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id or 0
+        tokenizer.padding_side = "right"
+
+        target = AutoModelForCausalLM.from_pretrained(
+            args.target_model, trust_remote_code=True, torch_dtype=dtype
+        ).to(device)
+    target.eval()
+    return target, tokenizer
 
 
 def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_generation_prompt: bool) -> str:
@@ -233,7 +284,11 @@ def load_speculator(
     hidden_size = int(getattr(target.config, "hidden_size"))
     vocab_size = int(getattr(target.config, "vocab_size"))
     if spec_heads <= 0:
-        spec_heads = max(1, hidden_size // 64)
+        cfg_heads = int(getattr(target.config, "num_attention_heads", 0) or 0)
+        if cfg_heads > 0:
+            spec_heads = cfg_heads
+        else:
+            spec_heads = max(1, hidden_size // 64)
         while spec_heads > 1 and hidden_size % spec_heads != 0:
             spec_heads -= 1
 
@@ -351,7 +406,7 @@ def speculative_generate(
         return_dict=True,
     )
     past = out.past_key_values if use_cache else None
-    last_hidden = out.hidden_states[-1][:, -1:, :]
+    last_hidden = _extract_hidden_state(out)[:, -1:, :]
     time_to_first_token = time.perf_counter() - prefill_start
 
     output_ids = input_ids[0].tolist()
@@ -379,7 +434,7 @@ def speculative_generate(
                 return_dict=True,
             )
             block_logits = block_out.logits
-            block_hidden = block_out.hidden_states[-1]
+            block_hidden = _extract_hidden_state(block_out)
         else:
             draft_tensor = torch.tensor([draft_tokens], dtype=torch.long, device=input_ids.device)
             block_out = target(
@@ -389,7 +444,7 @@ def speculative_generate(
                 return_dict=True,
             )
             block_logits = block_out.logits[:, -block_len:, :]
-            block_hidden = block_out.hidden_states[-1][:, -block_len:, :]
+            block_hidden = _extract_hidden_state(block_out)[:, -block_len:, :]
             past_snapshot = None
 
         posterior_tokens = [
@@ -432,7 +487,7 @@ def speculative_generate(
                         return_dict=True,
                     )
                     past = out.past_key_values if use_cache else None
-                    last_hidden = out.hidden_states[-1][:, -1:, :]
+                    last_hidden = _extract_hidden_state(out)[:, -1:, :]
                 else:
                     past = past_snapshot
                     accept_tensor = torch.tensor([new_tokens], dtype=torch.long, device=input_ids.device)
@@ -444,7 +499,7 @@ def speculative_generate(
                         return_dict=True,
                     )
                     past = accept_out.past_key_values
-                    last_hidden = accept_out.hidden_states[-1][:, -1:, :]
+                    last_hidden = _extract_hidden_state(accept_out)[:, -1:, :]
         else:
             out = target(
                 input_ids=input_ids.new_tensor([output_ids]),
@@ -452,7 +507,7 @@ def speculative_generate(
                 output_hidden_states=True,
                 return_dict=True,
             )
-            last_hidden = out.hidden_states[-1][:, -1:, :]
+            last_hidden = _extract_hidden_state(out)[:, -1:, :]
 
     total_decode_time = time.perf_counter() - decode_start
     num_output_tokens = max(len(output_ids) - num_input_tokens, 0)
@@ -470,7 +525,11 @@ def speculative_generate(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Benchmark EAGLE-3 speculator vs baseline.")
+    parser.add_argument("--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3")
     parser.add_argument("--target_model", type=str, default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--minillm_ckpt", type=str, default=None)
+    parser.add_argument("--minillm_config", type=str, default=None)
+    parser.add_argument("--minillm_tokenizer", type=str, default="./model")
     parser.add_argument("--speculator_dir", type=str, default="out/eagle3_speculator/qwen3_0.6b")
     parser.add_argument("--speculator_ckpt", type=str, default=None)
     parser.add_argument("--prompts_jsonl", type=str, default=None)
@@ -497,14 +556,7 @@ def main() -> None:
     device = torch.device(args.device)
     dtype = _resolve_dtype(args.dtype)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id or 0
-
-    target = AutoModelForCausalLM.from_pretrained(
-        args.target_model, trust_remote_code=True, torch_dtype=dtype
-    ).to(device)
-    target.eval()
+    target, tokenizer = _load_target_and_tokenizer(args, device, dtype)
 
     speculator = None
     spec_len = args.spec_len
