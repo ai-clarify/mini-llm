@@ -177,6 +177,10 @@ def ensure_ms_dataset_file(
 ) -> str:
     try:
         from modelscope.hub.snapshot_download import snapshot_download
+        try:
+            from modelscope.hub.snapshot_download import dataset_snapshot_download
+        except Exception:
+            dataset_snapshot_download = None
     except Exception as e:  # pragma: no cover
         raise DataDownloadError(
             "Missing `modelscope` for dataset download. Install via `pip install modelscope` "
@@ -194,7 +198,17 @@ def ensure_ms_dataset_file(
         except OSError:
             pass
 
-    sig = inspect.signature(snapshot_download)
+    snapshot_fn = snapshot_download
+    if "repo_type" not in inspect.signature(snapshot_download).parameters:
+        if dataset_snapshot_download is not None:
+            snapshot_fn = dataset_snapshot_download
+        else:  # pragma: no cover - legacy fallback
+            raise DataDownloadError(
+                "Your modelscope version does not support dataset downloads. "
+                "Upgrade modelscope or set MINIMIND_DATA_SOURCE=hf."
+            )
+
+    sig = inspect.signature(snapshot_fn)
     params = sig.parameters
     kwargs = {}
     if "local_dir" in params:
@@ -219,7 +233,7 @@ def ensure_ms_dataset_file(
     elif "allow_pattern" in params:
         kwargs["allow_pattern"] = [filename]
 
-    snapshot_download(repo_id, **kwargs)
+    snapshot_fn(repo_id, **kwargs)
 
     candidate = local_path
     if not candidate.exists():
