@@ -156,6 +156,11 @@ python infer/mlx/spec_decode_optimized.py --model_dir out/mlx_hf/qwen_qwen3_0_6b
 ```
 
 ```bash
+# Benchmark: currently Torch-only
+python infer/torch/bench.py --max_samples 16
+```
+
+```bash
 # Legacy wrappers (still available)
 python scripts/train_eagle3_speculator.py
 python scripts/infer_eagle3_speculator.py --prompt "Hi"
