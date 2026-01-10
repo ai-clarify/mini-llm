@@ -248,6 +248,10 @@ def _resolve_spec_config(
     return int(spec_len), int(spec_layers)
 
 
+def _default_head_rank(hidden_size: int) -> int:
+    return max(32, min(256, int(hidden_size) // 8))
+
+
 def _save_checkpoint(
     *, step: int, speculator: nn.Module, optimizer: torch.optim.Optimizer, out_dir: Path
 ) -> None:
@@ -365,7 +369,7 @@ def main() -> None:
         "--head_rank",
         type=int,
         default=None,
-        help="Low-rank speculator head size (reduces params; full head if unset).",
+        help="Low-rank speculator head size (auto if unset; set 0 to disable).",
     )
     parser.add_argument(
         "--early_stop_loss",
@@ -471,7 +475,12 @@ def main() -> None:
     if hasattr(target, "lm_head") and isinstance(target.lm_head, nn.Linear):
         init_weight = target.lm_head.weight.detach().clone()
 
-    head_rank = args.head_rank if args.head_rank is not None and int(args.head_rank) > 0 else None
+    if args.head_rank is None:
+        head_rank = _default_head_rank(hidden_size)
+    elif int(args.head_rank) <= 0:
+        head_rank = None
+    else:
+        head_rank = int(args.head_rank)
     speculator = Eagle3Speculator(
         hidden_size=hidden_size,
         vocab_size=vocab_size,

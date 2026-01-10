@@ -335,7 +335,16 @@ def load_speculator(
             raise FileNotFoundError(f"No checkpoints under {speculator_dir}/checkpoints")
         speculator_ckpt = latest / "speculator.safetensors"
     if not speculator_ckpt.is_file():
-        raise FileNotFoundError(f"Speculator checkpoint not found: {speculator_ckpt}")
+        candidates = [
+            p
+            for p in speculator_ckpt.parent.iterdir()
+            if p.is_file() and p.name.endswith(".safetensors")
+        ]
+        if len(candidates) == 1:
+            speculator_ckpt = candidates[0]
+            print(f"[warn] using fallback checkpoint: {speculator_ckpt}", flush=True)
+        else:
+            raise FileNotFoundError(f"Speculator checkpoint not found: {speculator_ckpt}")
 
     speculator.load_weights(str(speculator_ckpt))
     speculator.eval()
@@ -692,7 +701,7 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
         "--head_rank",
         type=int,
         default=None,
-        help="Low-rank speculator head size (reduces params; full head if unset).",
+        help="Low-rank speculator head size (overrides config if set; full head if unset).",
     )
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--no_speculator", action="store_true")

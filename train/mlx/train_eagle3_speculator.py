@@ -195,6 +195,10 @@ def _resolve_spec_config(
     return int(spec_len), int(spec_layers)
 
 
+def _default_head_rank(hidden_size: int) -> int:
+    return max(32, min(256, int(hidden_size) // 8))
+
+
 def _count_trainable_params(params: Any) -> int:
     flat: List[Tuple[str, Any]] = []
     mlx_utils.tree_flatten(params, destination=flat)
@@ -302,7 +306,7 @@ def main() -> None:
         "--head_rank",
         type=int,
         default=None,
-        help="Low-rank speculator head size (reduces params; full head if unset).",
+        help="Low-rank speculator head size (auto if unset; set 0 to disable).",
     )
     parser.add_argument(
         "--early_stop_loss",
@@ -357,6 +361,11 @@ def main() -> None:
         except Exception:
             pass
 
+    if args.target_arch == "minillm":
+        hidden_size = int(getattr(target.config, "hidden_size", 0) or 0)
+    else:
+        hidden_size = int(getattr(target.args, "hidden_size", 0) or 0)
+
     param_count = _count_params_mlx(target)
     auto_spec = (
         args.spec_len is None
@@ -378,7 +387,12 @@ def main() -> None:
         else:
             print(f"[speculator] auto spec_len={spec_len} spec_layers={spec_layers}")
 
-    head_rank = args.head_rank if args.head_rank is not None and int(args.head_rank) > 0 else None
+    if args.head_rank is None:
+        head_rank = _default_head_rank(hidden_size) if hidden_size > 0 else None
+    elif int(args.head_rank) <= 0:
+        head_rank = None
+    else:
+        head_rank = int(args.head_rank)
     speculator = build_speculator(
         target_arch=args.target_arch,
         target=target,

@@ -601,7 +601,7 @@ def main() -> None:
         "--head_rank",
         type=int,
         default=None,
-        help="Low-rank speculator head size (reduces params; full head if unset).",
+        help="Low-rank speculator head size (overrides config if set; full head if unset).",
     )
     parser.add_argument("--spec_dropout", type=float, default=0.0)
     parser.add_argument("--no_speculator", action="store_true")
