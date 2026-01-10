@@ -156,8 +156,8 @@ python infer/mlx/spec_decode_optimized.py --model_dir out/mlx_hf/qwen_qwen3_0_6b
 ```
 
 ```bash
-# Benchmark: currently Torch-only
-python infer/torch/bench.py --max_samples 16
+# MLX: benchmark (baseline vs speculator)
+python infer/mlx/bench.py --model_dir out/mlx_hf/qwen_qwen3_0_6b --max_samples 16
 ```
 
 ```bash
