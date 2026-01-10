@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import sys
 import json
 import math
 import time
@@ -9,6 +10,10 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
 
