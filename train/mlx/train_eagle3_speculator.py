@@ -256,6 +256,27 @@ def save_optimizer_state(optimizer: optim.Optimizer, path: str) -> None:
     mx.savez(path, **flat)
 
 
+def _save_checkpoint(*, step: int, speculator: nn.Module, optimizer: optim.Optimizer, out_dir: Path) -> None:
+    ckpt_dir = out_dir / "checkpoints" / f"step_{step:08d}"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    model_path = ckpt_dir / "speculator.safetensors"
+    tmp_model = Path(os.fspath(model_path) + ".tmp.safetensors")
+    speculator.save_weights(os.fspath(tmp_model))
+    os.replace(tmp_model, model_path)
+
+    opt_path = ckpt_dir / "optimizer.npz"
+    tmp_opt = Path(os.fspath(opt_path) + ".tmp.npz")
+    save_optimizer_state(optimizer, os.fspath(tmp_opt))
+    os.replace(tmp_opt, opt_path)
+
+    state_path = ckpt_dir / "train_state.json"
+    state_path.write_text(
+        json.dumps({"step": step, "timestamp": time.time()}, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[ckpt] saved {ckpt_dir}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train an EAGLE-3 style speculator for Qwen3-0.6B or MiniLLM (MLX backend, pure synthetic data)."
@@ -277,6 +298,18 @@ def main() -> None:
     parser.add_argument("--max_steps", type=int, default=5000)
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=500)
+    parser.add_argument(
+        "--early_stop_loss",
+        type=float,
+        default=None,
+        help="Stop early when loss <= this value (disabled if unset).",
+    )
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=0,
+        help="Consecutive steps meeting early_stop_loss before stopping (0 = immediate).",
+    )
     parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
     parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
     parser.add_argument("--dtype", type=str, default="bfloat16")
@@ -388,6 +421,8 @@ def main() -> None:
         "batch_size": args.batch_size,
         "accum_steps": args.accum_steps,
         "dtype": args.dtype,
+        "early_stop_loss": args.early_stop_loss,
+        "early_stop_patience": args.early_stop_patience,
     }
     (out_dir / "speculator_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -397,6 +432,11 @@ def main() -> None:
         raise ValueError("--accum_steps must be >= 1")
 
     grad_template = mlx_utils.tree_map(lambda p: mx.zeros_like(p), speculator.trainable_parameters())
+    early_stop_loss = args.early_stop_loss
+    early_stop_patience = int(args.early_stop_patience or 0)
+    if early_stop_loss is not None and early_stop_patience <= 0:
+        early_stop_patience = 1
+    early_stop_hits = 0
 
     for step in range(1, int(args.max_steps) + 1):
         loss_sum = mx.array(0.0, dtype=mx.float32)
@@ -421,32 +461,35 @@ def main() -> None:
         optimizer.update(speculator, grad_accum)
         mx.eval(loss_sum, grad_norm)
 
+        loss_val = float((loss_sum / float(accum_steps)).item())
+        stop_training = False
+        if early_stop_loss is not None:
+            if loss_val <= float(early_stop_loss):
+                early_stop_hits += 1
+                if early_stop_hits >= early_stop_patience:
+                    print(
+                        f"[train] early stop at step={step} loss={loss_val:.4f} "
+                        f"target={float(early_stop_loss):.4f}"
+                    )
+                    stop_training = True
+            else:
+                early_stop_hits = 0
+
         if step % args.log_interval == 0:
             elapsed = time.time() - start_time
             tok_s = tokens_seen / max(elapsed, 1e-6)
-            loss_val = float((loss_sum / float(accum_steps)).item())
             print(f"[train] step={step} loss={loss_val:.4f} tok/s={tok_s:.2f}")
             start_time = time.time()
 
+        saved = False
         if step % args.save_interval == 0 or step == int(args.max_steps):
-            ckpt_dir = out_dir / "checkpoints" / f"step_{step:08d}"
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-            model_path = ckpt_dir / "speculator.safetensors"
-            tmp_model = Path(os.fspath(model_path) + ".tmp.safetensors")
-            speculator.save_weights(os.fspath(tmp_model))
-            os.replace(tmp_model, model_path)
+            _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+            saved = True
 
-            opt_path = ckpt_dir / "optimizer.npz"
-            tmp_opt = Path(os.fspath(opt_path) + ".tmp.npz")
-            save_optimizer_state(optimizer, os.fspath(tmp_opt))
-            os.replace(tmp_opt, opt_path)
-
-            state_path = ckpt_dir / "train_state.json"
-            state_path.write_text(
-                json.dumps({"step": step, "timestamp": time.time()}, indent=2),
-                encoding="utf-8",
-            )
-            print(f"[ckpt] saved {ckpt_dir}")
+        if stop_training:
+            if not saved:
+                _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+            break
 
 
 if __name__ == "__main__":

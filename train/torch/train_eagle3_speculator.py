@@ -231,6 +231,20 @@ def _resolve_spec_config(
     return int(spec_len), int(spec_layers)
 
 
+def _save_checkpoint(
+    *, step: int, speculator: nn.Module, optimizer: torch.optim.Optimizer, out_dir: Path
+) -> None:
+    ckpt_dir = out_dir / "checkpoints" / f"step_{step:08d}"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(speculator.state_dict(), ckpt_dir / "speculator.pt")
+    torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
+    (ckpt_dir / "train_state.json").write_text(
+        json.dumps({"step": step, "timestamp": time.time()}, indent=2),
+        encoding="utf-8",
+    )
+    print(f"[ckpt] saved {ckpt_dir}")
+
+
 def _load_minillm_config(path: Optional[str]) -> MiniLLMConfig:
     if not path:
         return MiniLLMConfig()
@@ -330,6 +344,18 @@ def main() -> None:
     parser.add_argument("--max_steps", type=int, default=5000)
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=500)
+    parser.add_argument(
+        "--early_stop_loss",
+        type=float,
+        default=None,
+        help="Stop early when loss <= this value (disabled if unset).",
+    )
+    parser.add_argument(
+        "--early_stop_patience",
+        type=int,
+        default=0,
+        help="Consecutive steps meeting early_stop_loss before stopping (0 = immediate).",
+    )
     parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
     parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
     parser.add_argument("--spec_heads", type=int, default=0)
@@ -461,6 +487,8 @@ def main() -> None:
         "batch_size": args.batch_size,
         "accum_steps": args.accum_steps,
         "dtype": args.dtype,
+        "early_stop_loss": args.early_stop_loss,
+        "early_stop_patience": args.early_stop_patience,
     }
     (out_dir / "speculator_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -470,6 +498,11 @@ def main() -> None:
         raise ValueError("--accum_steps must be >= 1")
 
     optimizer.zero_grad(set_to_none=True)
+    early_stop_loss = args.early_stop_loss
+    early_stop_patience = int(args.early_stop_patience or 0)
+    if early_stop_loss is not None and early_stop_patience <= 0:
+        early_stop_patience = 1
+    early_stop_hits = 0
     for step in range(1, int(args.max_steps) + 1):
         input_ids, attention_mask, loss_mask = next(data_iter)
         input_ids = input_ids.to(device)
@@ -491,6 +524,20 @@ def main() -> None:
         else:
             loss.backward()
 
+        loss_val = float(loss.item() * accum_steps)
+        stop_training = False
+        if early_stop_loss is not None:
+            if loss_val <= float(early_stop_loss):
+                early_stop_hits += 1
+                if early_stop_hits >= early_stop_patience:
+                    print(
+                        f"[train] early stop at step={step} loss={loss_val:.4f} "
+                        f"target={float(early_stop_loss):.4f}"
+                    )
+                    stop_training = True
+            else:
+                early_stop_hits = 0
+
         if step % accum_steps == 0:
             if scaler.is_enabled():
                 scaler.unscale_(optimizer)
@@ -506,19 +553,18 @@ def main() -> None:
         if step % args.log_interval == 0:
             elapsed = time.time() - start_time
             tok_s = tokens.item() / max(elapsed, 1e-6)
-            print(f"[train] step={step} loss={loss.item() * accum_steps:.4f} tok/s={tok_s:.2f}")
+            print(f"[train] step={step} loss={loss_val:.4f} tok/s={tok_s:.2f}")
             start_time = time.time()
 
+        saved = False
         if step % args.save_interval == 0 or step == int(args.max_steps):
-            ckpt_dir = out_dir / "checkpoints" / f"step_{step:08d}"
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(speculator.state_dict(), ckpt_dir / "speculator.pt")
-            torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
-            (ckpt_dir / "train_state.json").write_text(
-                json.dumps({"step": step, "timestamp": time.time()}, indent=2),
-                encoding="utf-8",
-            )
-            print(f"[ckpt] saved {ckpt_dir}")
+            _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+            saved = True
+
+        if stop_training:
+            if not saved:
+                _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+            break
 
 
 if __name__ == "__main__":
