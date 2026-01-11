@@ -28,6 +28,17 @@ DEFAULT_PROMPTS = [
 ]
 
 
+def _render_progress(current: int, total: int, *, label: str = "bench") -> None:
+    width = 28
+    filled = int(width * current / total)
+    bar = "#" * filled + "-" * (width - filled)
+    percent = current / total * 100.0
+    sys.stdout.write(f"\r[{label}] {current}/{total} {percent:5.1f}% |{bar}|")
+    sys.stdout.flush()
+    if current >= total:
+        sys.stdout.write("\n")
+
+
 def _resolve_dtype(name: str) -> torch.dtype:
     name = str(name).lower()
     if name == "float16":
@@ -714,6 +725,11 @@ def main() -> None:
     if args.max_samples is not None:
         prompt_messages = prompt_messages[: int(args.max_samples)]
 
+    total_samples = int(args.rounds) * len(prompt_messages)
+    if total_samples <= 0:
+        raise ValueError("No prompts to benchmark; check --max_samples or prompts file.")
+    completed = 0
+
     responses = []
     for round_idx in range(int(args.rounds)):
         seed_round(round_idx)
@@ -746,6 +762,8 @@ def main() -> None:
                 )
 
             responses.append({1: baseline, spec_len: spec})
+            completed += 1
+            _render_progress(completed, total_samples)
 
     prompt_lens = [r[1].num_input_tokens for r in responses]
     out_lens_base = [r[1].num_output_tokens for r in responses]

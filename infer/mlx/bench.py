@@ -14,18 +14,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from infer.mlx.common import (
+    SpecStats,
     _apply_chat_template,
     _count_params_mlx,
     _load_target,
     _resolve_spec_config,
-    SpecStats,
     baseline_decode,
     baseline_decode_minillm,
     load_speculator,
     speculative_decode_minillm_with_stats,
     speculative_decode_with_stats,
 )
-
 
 DEFAULT_PROMPTS = [
     "Explain the difference between overfitting and underfitting in one paragraph.",
@@ -60,13 +59,28 @@ class SpecBenchResult:
         return self.num_output_tokens / max(self.elapsed_s, 1e-6)
 
 
-def _add_system(messages: List[Dict[str, Any]], system: Optional[str]) -> List[Dict[str, Any]]:
+def _render_progress(current: int, total: int, *, label: str = "bench") -> None:
+    width = 28
+    filled = int(width * current / total)
+    bar = "#" * filled + "-" * (width - filled)
+    percent = current / total * 100.0
+    sys.stdout.write(f"\r[{label}] {current}/{total} {percent:5.1f}% |{bar}|")
+    sys.stdout.flush()
+    if current >= total:
+        sys.stdout.write("\n")
+
+
+def _add_system(
+    messages: List[Dict[str, Any]], system: Optional[str]
+) -> List[Dict[str, Any]]:
     if system and (not messages or messages[0]["role"] != "system"):
         return [{"role": "system", "content": system}] + messages
     return messages
 
 
-def _iter_prompts_from_record(record: Dict[str, Any], system: Optional[str]) -> Iterable[List[Dict[str, Any]]]:
+def _iter_prompts_from_record(
+    record: Dict[str, Any], system: Optional[str]
+) -> Iterable[List[Dict[str, Any]]]:
     if "conversations" in record:
         conversations = record["conversations"]
         if not isinstance(conversations, list):
@@ -86,10 +100,14 @@ def _iter_prompts_from_record(record: Dict[str, Any], system: Optional[str]) -> 
         for turn in turns:
             yield _add_system([{"role": "user", "content": str(turn)}], system)
         return
-    raise ValueError("Prompt record must contain 'conversations', 'messages', or 'turns'")
+    raise ValueError(
+        "Prompt record must contain 'conversations', 'messages', or 'turns'"
+    )
 
 
-def _load_prompt_messages(prompts_jsonl: Optional[str], system: Optional[str]) -> List[List[Dict[str, Any]]]:
+def _load_prompt_messages(
+    prompts_jsonl: Optional[str], system: Optional[str]
+) -> List[List[Dict[str, Any]]]:
     if not prompts_jsonl:
         return [[{"role": "user", "content": p}] for p in DEFAULT_PROMPTS]
     path = Path(prompts_jsonl)
@@ -214,23 +232,39 @@ def _run_spec_minillm(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark EAGLE-3 speculator vs baseline (MLX backend).")
-    parser.add_argument("--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3")
+    parser = argparse.ArgumentParser(
+        description="Benchmark EAGLE-3 speculator vs baseline (MLX backend)."
+    )
+    parser.add_argument(
+        "--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3"
+    )
     parser.add_argument("--hf_repo", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--model_dir", type=str, default=None)
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--minillm_ckpt_dir", type=str, default=None)
     parser.add_argument("--minillm_tokenizer", type=str, default="./model")
-    parser.add_argument("--speculator_dir", type=str, default="out/eagle3_speculator_mlx/qwen3_0.6b")
+    parser.add_argument(
+        "--speculator_dir", type=str, default="out/eagle3_speculator_mlx/qwen3_0.6b"
+    )
     parser.add_argument("--speculator_ckpt", type=str, default=None)
     parser.add_argument("--prompts_jsonl", type=str, default=None)
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=32)
-    parser.add_argument("--max_new_tokens", type=int, default=256)
-    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--max_new_tokens", type=int, default=1024)
+    parser.add_argument("--temperature", type=float, default=1)
     parser.add_argument("--top_p", type=float, default=1.0)
-    parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
-    parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
+    parser.add_argument(
+        "--spec_len",
+        type=int,
+        default=None,
+        help="Draft length for speculator (auto if unset).",
+    )
+    parser.add_argument(
+        "--spec_layers",
+        type=int,
+        default=None,
+        help="Transformer layers in speculator (auto if unset).",
+    )
     parser.add_argument(
         "--head_rank",
         type=int,
@@ -256,7 +290,11 @@ def main() -> None:
     spec_len, spec_layers = _resolve_spec_config(
         args.spec_len, args.spec_layers, param_count=_count_params_mlx(target)
     )
-    head_rank = args.head_rank if args.head_rank is not None and int(args.head_rank) > 0 else None
+    head_rank = (
+        args.head_rank
+        if args.head_rank is not None and int(args.head_rank) > 0
+        else None
+    )
     if not args.no_speculator:
         speculator_dir = Path(args.speculator_dir)
         speculator_ckpt = Path(args.speculator_ckpt) if args.speculator_ckpt else None
@@ -279,11 +317,20 @@ def main() -> None:
         if args.no_chat_template:
             prompt_text = messages[-1]["content"]
         else:
-            prompt_text = _apply_chat_template(tokenizer, messages, add_generation_prompt=True)
+            prompt_text = _apply_chat_template(
+                tokenizer, messages, add_generation_prompt=True
+            )
         prompt_inputs.append(tokenizer.encode(prompt_text, add_special_tokens=False))
 
     baseline_results: List[BenchResult] = []
     spec_results: List[SpecBenchResult] = []
+
+    total_samples = int(args.rounds) * len(prompt_inputs)
+    if total_samples <= 0:
+        raise ValueError(
+            "No prompts to benchmark; check --max_samples or prompts file."
+        )
+    completed = 0
 
     for round_idx in range(int(args.rounds)):
         mx.random.seed(int(args.seed) + int(round_idx))
@@ -332,6 +379,8 @@ def main() -> None:
                         eos_token_id=tokenizer.eos_token_id,
                     )
                 spec_results.append(spec)
+            completed += 1
+            _render_progress(completed, total_samples)
 
     def summarize(rows: List[BenchResult]) -> Dict[str, float]:
         total_out = sum(r.num_output_tokens for r in rows)
