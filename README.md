@@ -107,6 +107,7 @@ OLLAMA_MODEL=qwen3:0.6b DATA_JSONL=out/distill_ollama_qwen3_0.6b/synth.jsonl OUT
 
 > - speculator 默认会根据目标模型大小自动设置；可用 `--spec_len`/`--spec_layers` 显式覆盖。
 > - `--head_rank` 默认自动设置（hidden_size/8，范围 32-256）；可显式指定或设为 0 关闭低秩头。
+> - MLX 训练若 `out_dir` 下存在 checkpoint 会自动继续；如需重新开始请加 `--no_resume`。
 
 #### Qwen3-0.6B（Torch）
 

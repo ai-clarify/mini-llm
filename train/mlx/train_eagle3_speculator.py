@@ -249,6 +249,11 @@ def save_optimizer_state(optimizer: optim.Optimizer, path: str) -> None:
     mx.savez(path, **flat)
 
 
+def load_optimizer_state(optimizer: optim.Optimizer, path: str) -> None:
+    flat = dict(mx.load(path))
+    optimizer.state = mlx_utils.tree_unflatten(flat)
+
+
 def _save_checkpoint(*, step: int, speculator: nn.Module, optimizer: optim.Optimizer, out_dir: Path) -> None:
     ckpt_dir = out_dir / "checkpoints" / f"step_{step:08d}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -268,6 +273,44 @@ def _save_checkpoint(*, step: int, speculator: nn.Module, optimizer: optim.Optim
         encoding="utf-8",
     )
     print(f"[ckpt] saved {ckpt_dir}")
+
+
+def _find_latest_checkpoint(out_dir: Path) -> Optional[Tuple[int, Path]]:
+    ckpt_root = out_dir / "checkpoints"
+    if not ckpt_root.is_dir():
+        return None
+    best_step = -1
+    best_dir: Optional[Path] = None
+    for child in ckpt_root.iterdir():
+        if not child.is_dir() or not child.name.startswith("step_"):
+            continue
+        try:
+            step = int(child.name.split("_", 1)[1])
+        except ValueError:
+            continue
+        if not (child / "speculator.safetensors").is_file():
+            continue
+        if step > best_step:
+            best_step = step
+            best_dir = child
+    if best_dir is None:
+        return None
+    return best_step, best_dir
+
+
+def _load_train_state_step(ckpt_dir: Path, *, fallback: int) -> int:
+    state_path = ckpt_dir / "train_state.json"
+    if not state_path.is_file():
+        return fallback
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    return int(state.get("step", fallback))
+
+
+def _load_speculator_config(out_dir: Path) -> Optional[Dict[str, Any]]:
+    cfg_path = out_dir / "speculator_config.json"
+    if not cfg_path.is_file():
+        return None
+    return json.loads(cfg_path.read_text(encoding="utf-8"))
 
 
 def main() -> None:
@@ -323,16 +366,35 @@ def main() -> None:
     parser.add_argument("--gen_temperature", type=float, default=0.2)
     parser.add_argument("--gen_top_p", type=float, default=0.95)
     parser.add_argument("--no_auto_generate", action="store_true")
+    parser.add_argument("--no_resume", action="store_true")
     args = parser.parse_args()
 
     mx.random.seed(int(args.seed))
     rng = random.Random(int(args.seed))
 
-    if not args.no_auto_generate:
-        _ensure_synth_data(args)
-
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    resume_dir: Optional[Path] = None
+    resume_step = 0
+    resume_cfg: Optional[Dict[str, Any]] = None
+    if not args.no_resume:
+        resume_info = _find_latest_checkpoint(out_dir)
+        if resume_info is not None:
+            resume_step, resume_dir = resume_info
+            resume_step = _load_train_state_step(resume_dir, fallback=resume_step)
+            resume_cfg = _load_speculator_config(out_dir)
+
+    if resume_cfg is not None:
+        if resume_cfg.get("spec_len") is not None:
+            args.spec_len = int(resume_cfg["spec_len"])
+        if resume_cfg.get("spec_layers") is not None:
+            args.spec_layers = int(resume_cfg["spec_layers"])
+        if "head_rank" in resume_cfg:
+            args.head_rank = resume_cfg["head_rank"]
+
+    if not args.no_auto_generate:
+        _ensure_synth_data(args)
 
     target, tokenizer = _load_target(
         target_arch=args.target_arch,
@@ -387,6 +449,10 @@ def main() -> None:
         head_rank=head_rank,
     )
 
+    if resume_dir is not None:
+        speculator.load_weights(os.fspath(resume_dir / "speculator.safetensors"))
+        print(f"[resume] step={resume_step} from {resume_dir}")
+
     dtype = _resolve_dtype(args.dtype)
     speculator.apply(lambda p: p.astype(dtype))
     speculator.train()
@@ -404,6 +470,10 @@ def main() -> None:
 
     optimizer = optim.AdamW(learning_rate=float(args.learning_rate), weight_decay=float(args.weight_decay))
     optimizer.init(speculator.trainable_parameters())
+    if resume_dir is not None:
+        opt_path = resume_dir / "optimizer.npz"
+        if opt_path.is_file():
+            load_optimizer_state(optimizer, os.fspath(opt_path))
 
     def loss_wrapped(input_ids: mx.array, attention_mask: mx.array, loss_mask: mx.array) -> mx.array:
         if args.target_arch == "minillm":
@@ -451,9 +521,12 @@ def main() -> None:
         early_stop_patience = 1
     early_stop_hits = 0
 
-    last_step = 0
+    last_step = resume_step
+    if resume_step >= int(args.max_steps):
+        print(f"[resume] step={resume_step} >= max_steps={int(args.max_steps)}; nothing to do.")
+        return
     try:
-        for step in range(1, int(args.max_steps) + 1):
+        for step in range(resume_step + 1, int(args.max_steps) + 1):
             loss_sum = mx.array(0.0, dtype=mx.float32)
             grad_accum = mlx_utils.tree_map(lambda p: p, grad_template)
             tokens_seen = 0.0

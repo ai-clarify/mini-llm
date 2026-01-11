@@ -114,6 +114,7 @@ python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir
 
 > Speculator defaults auto-scale to target model size; override with `--spec_len`/`--spec_layers` if needed.
 > `--head_rank` defaults to hidden_size/8 (clamped to 32-256); override or set 0 to disable the low-rank head.
+> MLX training auto-resumes from the latest checkpoint under `out_dir`; add `--no_resume` to start fresh.
 
 ```bash
 # Torch: auto-generate synthetic data + train EAGLE-3 style speculator
