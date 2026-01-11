@@ -50,12 +50,12 @@ def _count_params_torch(model: torch.nn.Module) -> Optional[int]:
 
 def _auto_spec_config(param_count: Optional[int]) -> Tuple[int, int]:
     if not param_count or param_count <= 0:
-        return 1, 1
+        return 2, 2
     params_b = float(param_count) / 1e9
     if params_b <= 1.0:
-        return 1, 1
+        return 2, 2
     if params_b <= 3.0:
-        return 2, 1
+        return 2, 2
     if params_b <= 7.0:
         return 3, 2
     if params_b <= 13.0:

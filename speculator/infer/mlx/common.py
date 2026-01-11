@@ -71,12 +71,12 @@ def _count_params_mlx(model: nn.Module) -> Optional[int]:
 
 def _auto_spec_config(param_count: Optional[int]) -> Tuple[int, int]:
     if not param_count or param_count <= 0:
-        return 1, 1
+        return 2, 2
     params_b = float(param_count) / 1e9
     if params_b <= 1.0:
-        return 1, 1
+        return 2, 2
     if params_b <= 3.0:
-        return 2, 1
+        return 2, 2
     if params_b <= 7.0:
         return 3, 2
     if params_b <= 13.0:
@@ -105,6 +105,7 @@ def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_gener
 
 
 def sample_next_token(logits: mx.array, *, temperature: float, top_p: float) -> int:
+    logits = logits.reshape(-1)
     if temperature <= 0:
         return int(mx.argmax(logits).item())
     logits = logits / float(temperature)
