@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 

@@ -14,11 +14,11 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 import mlx.utils as mlx_utils
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from infer.mlx.common import _load_target, build_speculator
+from speculator.infer.mlx.common import _load_target, build_speculator
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 

@@ -12,6 +12,7 @@ both PyTorch and MLX (Apple Silicon), plus data preparation utilities and eval.
 - `model/`: core model definitions and configs.
 - `trainer/`: PyTorch training, SFT, DPO, distillation entrypoints.
 - `mlx_train/`: MLX training, inference, demo, data utilities.
+- `speculator/`: EAGLE-3 speculator training/inference (torch/mlx).
 - `tokenizer/`: RustBPE tokenizer and related tooling.
 - `scripts/`: orchestration scripts and utilities.
 - `configs/`: dashboard/job configs.

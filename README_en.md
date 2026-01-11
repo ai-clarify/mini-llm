@@ -118,16 +118,16 @@ python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir
 
 ```bash
 # Torch: auto-generate synthetic data + train EAGLE-3 style speculator
-python train/torch/train_eagle3_speculator.py
+python speculator/train/torch/train_eagle3_speculator.py
 # Torch: benchmark (baseline vs speculator)
-python infer/torch/bench.py --max_samples 16
+python speculator/infer/torch/bench.py --max_samples 16
 ```
 
 ```bash
 # MLX: auto-generate synthetic data + train speculator
-python train/mlx/train_eagle3_speculator.py --hf_repo Qwen/Qwen3-0.6B
+python speculator/train/mlx/train_eagle3_speculator.py --hf_repo Qwen/Qwen3-0.6B
 # MLX: benchmark (baseline vs speculator)
-python infer/mlx/bench.py --hf_repo Qwen/Qwen3-0.6B --max_samples 16
+python speculator/infer/mlx/bench.py --hf_repo Qwen/Qwen3-0.6B --max_samples 16
 ```
 
 > MLX inference/training requires `mlx-lm` (currently pinned to transformers==5.0.0rc1). Use a clean venv if needed.
@@ -150,14 +150,13 @@ python infer/mlx/bench.py --hf_repo Qwen/Qwen3-0.6B --max_samples 16
 ├── data/                # Data cache
 ├── dataset/             # Public dataset examples
 ├── docs/                # Documentation
-├── infer/               # Speculator inference entrypoints (torch/mlx)
+├── speculator/          # Speculator training/inference entrypoints (torch/mlx)
 ├── mlx_train/           # MLX training and inference
 ├── model/               # MiniLLM Dense/MoE implementations
 ├── pipelines/           # One-click pipeline scripts (main logic)
 ├── scripts/             # Scripts and utilities
 ├── tokenizer/           # RustBPE tokenizer assets
 ├── trainer/             # Training/alignment/distillation scripts
-├── train/               # Speculator training entrypoints (torch/mlx)
 ├── tools/               # Data/eval/convert/tokenizer utilities
 └── utils/               # Shared utilities and evaluation helpers
 ```

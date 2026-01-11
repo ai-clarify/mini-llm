@@ -14,6 +14,10 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+ROOT = Path(__file__).resolve().parents[3]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -535,12 +539,11 @@ def main() -> None:
             input_ids = input_ids.to(device)
             attention_mask = attention_mask.to(device)
             loss_mask = loss_mask.to(device)
-
-        with torch.no_grad():
-            if args.target_arch == "minillm":
-                hidden = _forward_hidden_minillm(target, input_ids, attention_mask)
-            else:
-                hidden = _forward_hidden_qwen3(target, input_ids, attention_mask)
+            with torch.no_grad():
+                if args.target_arch == "minillm":
+                    hidden = _forward_hidden_minillm(target, input_ids, attention_mask)
+                else:
+                    hidden = _forward_hidden_qwen3(target, input_ids, attention_mask)
 
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
                 logits_list = speculator(hidden, attention_mask)

@@ -9,11 +9,11 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import mlx.core as mx
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from infer.mlx.common import (
+from speculator.infer.mlx.common import (
     SpecStats,
     _apply_chat_template,
     _count_params_mlx,
