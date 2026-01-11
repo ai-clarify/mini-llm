@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 import argparse
-import sys
 import json
 import math
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -16,16 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
-
-
-DEFAULT_PROMPTS = [
-    "Explain the difference between overfitting and underfitting in one paragraph.",
-    "Solve: (18 * 7) - (56 / 4) + 9. Show quick steps.",
-    "Write a short email politely declining a meeting invite.",
-    "List three pros and cons of renewable energy.",
-    "What is a hash table? Give a concise definition and one use case.",
-    "Summarize the plot of 'Cinderella' in two sentences.",
-]
+from speculator.infer.prompt_utils import load_prompt_messages
 
 
 def _render_progress(current: int, total: int, *, label: str = "bench") -> None:
@@ -133,48 +124,6 @@ def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_gener
         add_generation_prompt=add_generation_prompt,
         enable_thinking=False,
     )
-
-
-def _add_system(messages: List[Dict[str, Any]], system: Optional[str]) -> List[Dict[str, Any]]:
-    if system and (not messages or messages[0].get("role") != "system"):
-        return [{"role": "system", "content": system}] + messages
-    return messages
-
-
-def _iter_prompts_from_record(record: Dict[str, Any], system: Optional[str]) -> Iterable[List[Dict[str, Any]]]:
-    if isinstance(record.get("conversations"), list):
-        yield _add_system(list(record["conversations"]), system)
-        return
-    if isinstance(record.get("messages"), list):
-        yield _add_system(list(record["messages"]), system)
-        return
-    if isinstance(record.get("turns"), list):
-        for turn in record["turns"]:
-            yield _add_system([{"role": "user", "content": str(turn)}], system)
-        return
-    if isinstance(record.get("prompt"), str):
-        yield _add_system([{"role": "user", "content": record["prompt"]}], system)
-        return
-    if isinstance(record.get("text"), str):
-        yield _add_system([{"role": "user", "content": record["text"]}], system)
-        return
-
-
-def _load_prompt_messages(path: Optional[str], system: Optional[str]) -> List[List[Dict[str, Any]]]:
-    prompts: List[List[Dict[str, Any]]] = []
-    if path:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                for msg in _iter_prompts_from_record(record, system):
-                    prompts.append(msg)
-    else:
-        for prompt in DEFAULT_PROMPTS:
-            prompts.append(_add_system([{"role": "user", "content": prompt}], system))
-    return prompts
 
 
 def _stats(values: List[float]) -> Optional[Dict[str, float]]:
@@ -721,9 +670,12 @@ def main() -> None:
         )
         speculator = speculator.to(device)
 
-    prompt_messages = _load_prompt_messages(args.prompts_jsonl, args.system)
-    if args.max_samples is not None:
-        prompt_messages = prompt_messages[: int(args.max_samples)]
+    prompt_messages = load_prompt_messages(
+        args.prompts_jsonl,
+        args.system,
+        max_samples=args.max_samples,
+        seed=args.seed,
+    )
 
     total_samples = int(args.rounds) * len(prompt_messages)
     if total_samples <= 0:

@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 import argparse
-import json
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Dict, List, Optional
 
 import mlx.core as mx
 
@@ -25,15 +24,7 @@ from speculator.infer.mlx.common import (
     speculative_decode_minillm_with_stats,
     speculative_decode_with_stats,
 )
-
-DEFAULT_PROMPTS = [
-    "Explain the difference between overfitting and underfitting in one paragraph.",
-    "Solve: (18 * 7) - (56 / 4) + 9. Show quick steps.",
-    "Write a short email politely declining a meeting invite.",
-    "List three pros and cons of renewable energy.",
-    "What is a hash table? Give a concise definition and one use case.",
-    "Summarize the plot of 'Cinderella' in two sentences.",
-]
+from speculator.infer.prompt_utils import load_prompt_messages
 
 
 @dataclass(frozen=True)
@@ -68,60 +59,6 @@ def _render_progress(current: int, total: int, *, label: str = "bench") -> None:
     sys.stdout.flush()
     if current >= total:
         sys.stdout.write("\n")
-
-
-def _add_system(
-    messages: List[Dict[str, Any]], system: Optional[str]
-) -> List[Dict[str, Any]]:
-    if system and (not messages or messages[0]["role"] != "system"):
-        return [{"role": "system", "content": system}] + messages
-    return messages
-
-
-def _iter_prompts_from_record(
-    record: Dict[str, Any], system: Optional[str]
-) -> Iterable[List[Dict[str, Any]]]:
-    if "conversations" in record:
-        conversations = record["conversations"]
-        if not isinstance(conversations, list):
-            raise ValueError("Expected 'conversations' to be a list")
-        yield _add_system(list(conversations), system)
-        return
-    if "messages" in record:
-        messages = record["messages"]
-        if not isinstance(messages, list):
-            raise ValueError("Expected 'messages' to be a list")
-        yield _add_system(list(messages), system)
-        return
-    if "turns" in record:
-        turns = record["turns"]
-        if not isinstance(turns, list):
-            raise ValueError("Expected 'turns' to be a list")
-        for turn in turns:
-            yield _add_system([{"role": "user", "content": str(turn)}], system)
-        return
-    raise ValueError(
-        "Prompt record must contain 'conversations', 'messages', or 'turns'"
-    )
-
-
-def _load_prompt_messages(
-    prompts_jsonl: Optional[str], system: Optional[str]
-) -> List[List[Dict[str, Any]]]:
-    if not prompts_jsonl:
-        return [[{"role": "user", "content": p}] for p in DEFAULT_PROMPTS]
-    path = Path(prompts_jsonl)
-    if not path.is_file():
-        raise FileNotFoundError(f"Prompts JSONL not found: {path}")
-    messages: List[List[Dict[str, Any]]] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            record = json.loads(line)
-            messages.extend(list(_iter_prompts_from_record(record, system)))
-    return messages
 
 
 def _run_baseline_qwen3(
@@ -251,7 +188,7 @@ def main() -> None:
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=32)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
-    parser.add_argument("--temperature", type=float, default=1)
+    parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument(
         "--spec_len",
@@ -308,9 +245,12 @@ def main() -> None:
             head_rank=head_rank,
         )
 
-    prompt_messages = _load_prompt_messages(args.prompts_jsonl, args.system)
-    if args.max_samples is not None:
-        prompt_messages = prompt_messages[: int(args.max_samples)]
+    prompt_messages = load_prompt_messages(
+        args.prompts_jsonl,
+        args.system,
+        max_samples=args.max_samples,
+        seed=args.seed,
+    )
 
     prompt_inputs: List[List[int]] = []
     for messages in prompt_messages:
