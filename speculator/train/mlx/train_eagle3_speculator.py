@@ -279,7 +279,7 @@ def _spec_loss_autoregressive(
         for j, spec_logits in enumerate(spec_logits_steps):
             tgt_logits = target_logits[:, j, :]
             target_probs = mx.softmax(tgt_logits, axis=-1)
-            spec_log_probs = mx.log_softmax(spec_logits, axis=-1)
+            spec_log_probs = nn.log_softmax(spec_logits, axis=-1)
             loss = -mx.sum(target_probs * spec_log_probs, axis=-1)[0]
             weight = float(loss_decay) ** int(j)
             total_loss = total_loss + (loss * weight)
