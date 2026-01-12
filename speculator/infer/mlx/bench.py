@@ -350,6 +350,12 @@ def main() -> None:
             "zero_rate": zero_rate,
         }
 
+    def summarize_timing(rows: List[SpecBenchResult]) -> Dict[str, float]:
+        """Aggregate speculator/target time. Time O(n) best/avg/worst, space O(1)."""
+        total_spec = sum(r.stats.spec_time_s for r in rows)
+        total_target = sum(r.stats.target_time_s for r in rows)
+        return {"spec_time_s": float(total_spec), "target_time_s": float(total_target)}
+
     base_stats = summarize(baseline_results)
     print(
         f"[bench] rounds={int(args.rounds)} samples={len(baseline_results)} prompts={len(prompt_inputs)} "
@@ -364,6 +370,7 @@ def main() -> None:
         spec_stats = summarize(spec_results)
         speedup = base_stats["total_time_s"] / max(spec_stats["total_time_s"], 1e-6)
         accept_stats = summarize_acceptance(spec_results)
+        timing_stats = summarize_timing(spec_results)
         print(
             f"[bench] spec_len={spec_len} output_tokens={spec_stats['output_tokens']:.0f} "
             f"time_s={spec_stats['total_time_s']:.2f} tok/s={spec_stats['tok_per_s']:.2f} "
@@ -373,6 +380,11 @@ def main() -> None:
             f"[bench] acceptance mean={accept_stats['mean_accept']:.2f} "
             f"rate={accept_stats['accept_rate'] * 100:.2f}% "
             f"zero_accept={accept_stats['zero_rate'] * 100:.2f}%"
+        )
+        other_time = spec_stats["total_time_s"] - timing_stats["spec_time_s"] - timing_stats["target_time_s"]
+        print(
+            f"[bench] time_s draft={timing_stats['spec_time_s']:.2f} "
+            f"target={timing_stats['target_time_s']:.2f} other={other_time:.2f}"
         )
 
 
