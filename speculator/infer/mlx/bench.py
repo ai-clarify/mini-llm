@@ -369,7 +369,16 @@ def main() -> None:
         """Aggregate speculator/target time. Time O(n) best/avg/worst, space O(1)."""
         total_spec = sum(r.stats.spec_time_s for r in rows)
         total_target = sum(r.stats.target_time_s for r in rows)
-        return {"spec_time_s": float(total_spec), "target_time_s": float(total_target)}
+        total_prefill = sum(r.stats.target_prefill_time_s for r in rows)
+        total_verify = sum(r.stats.target_verify_time_s for r in rows)
+        total_generate = sum(r.stats.target_generate_time_s for r in rows)
+        return {
+            "spec_time_s": float(total_spec),
+            "target_time_s": float(total_target),
+            "target_prefill_time_s": float(total_prefill),
+            "target_verify_time_s": float(total_verify),
+            "target_generate_time_s": float(total_generate),
+        }
 
     base_stats = summarize(baseline_results)
     print(
@@ -405,6 +414,11 @@ def main() -> None:
             f"[bench] time_s baseline={base_stats['total_time_s']:.2f} "
             f"draft={timing_stats['spec_time_s']:.2f} "
             f"target={timing_stats['target_time_s']:.2f} other={other_time:.2f}"
+        )
+        print(
+            f"[bench] target_time_s prefill={timing_stats['target_prefill_time_s']:.2f} "
+            f"verify={timing_stats['target_verify_time_s']:.2f} "
+            f"generate={timing_stats['target_generate_time_s']:.2f}"
         )
         print(
             f"[bench] tokens baseline_out={base_stats['output_tokens']:.0f} "

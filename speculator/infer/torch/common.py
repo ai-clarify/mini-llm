@@ -69,6 +69,9 @@ class SpecStats:
     steps: int
     spec_time_s: float
     target_time_s: float
+    target_prefill_time_s: float
+    target_verify_time_s: float
+    target_generate_time_s: float
     target_generated: int
 
 
@@ -562,6 +565,9 @@ def _speculative_decode_qwen3(
     steps = 0
     spec_time_s = 0.0
     target_time_s = 0.0
+    target_prefill_time_s = 0.0
+    target_verify_time_s = 0.0
+    target_generate_time_s = 0.0
     target_generated = 0
 
     t0 = time.perf_counter()
@@ -571,7 +577,9 @@ def _speculative_decode_qwen3(
         output_hidden_states=True,
         return_dict=True,
     )
-    target_time_s += time.perf_counter() - t0
+    prefill_s = time.perf_counter() - t0
+    target_time_s += prefill_s
+    target_prefill_time_s += prefill_s
     past = out.past_key_values if use_cache else None
     layer_hiddens = _extract_hidden_layers(out, speculator.feature_layers)
     last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
@@ -606,7 +614,9 @@ def _speculative_decode_qwen3(
                 output_hidden_states=True,
                 return_dict=True,
             )
-            target_time_s += time.perf_counter() - t0
+            verify_s = time.perf_counter() - t0
+            target_time_s += verify_s
+            target_verify_time_s += verify_s
             block_logits = block_out.logits
             block_layer_hiddens = _extract_hidden_layers(block_out, speculator.feature_layers)
         else:
@@ -617,7 +627,9 @@ def _speculative_decode_qwen3(
                 output_hidden_states=True,
                 return_dict=True,
             )
-            target_time_s += time.perf_counter() - t0
+            verify_s = time.perf_counter() - t0
+            target_time_s += verify_s
+            target_verify_time_s += verify_s
             block_logits = block_out.logits[:, -len(draft_tokens) :, :]
             block_layer_hiddens = [
                 h[:, -len(draft_tokens) :, :] for h in _extract_hidden_layers(block_out, speculator.feature_layers)
@@ -699,7 +711,9 @@ def _speculative_decode_qwen3(
                         output_hidden_states=True,
                         return_dict=True,
                     )
-                    target_time_s += time.perf_counter() - t0
+                    gen_s = time.perf_counter() - t0
+                    target_time_s += gen_s
+                    target_generate_time_s += gen_s
                     past = bonus_out.past_key_values
                     last_layer_hiddens = [
                         h[:, -1:, :] for h in _extract_hidden_layers(bonus_out, speculator.feature_layers)
@@ -714,7 +728,9 @@ def _speculative_decode_qwen3(
                         output_hidden_states=True,
                         return_dict=True,
                     )
-                    target_time_s += time.perf_counter() - t0
+                    prefill_s = time.perf_counter() - t0
+                    target_time_s += prefill_s
+                    target_prefill_time_s += prefill_s
                     past = out.past_key_values if use_cache else None
                     last_layer_hiddens = [
                         h[:, -1:, :] for h in _extract_hidden_layers(out, speculator.feature_layers)
@@ -731,7 +747,9 @@ def _speculative_decode_qwen3(
                         output_hidden_states=True,
                         return_dict=True,
                     )
-                    target_time_s += time.perf_counter() - t0
+                    gen_s = time.perf_counter() - t0
+                    target_time_s += gen_s
+                    target_generate_time_s += gen_s
                     past = accept_out.past_key_values
                     last_layer_hiddens = [
                         h[:, -1:, :] for h in _extract_hidden_layers(accept_out, speculator.feature_layers)
@@ -745,7 +763,9 @@ def _speculative_decode_qwen3(
                 output_hidden_states=True,
                 return_dict=True,
             )
-            target_time_s += time.perf_counter() - t0
+            prefill_s = time.perf_counter() - t0
+            target_time_s += prefill_s
+            target_prefill_time_s += prefill_s
             last_layer_hiddens = [
                 h[:, -1:, :] for h in _extract_hidden_layers(out, speculator.feature_layers)
             ]
@@ -766,7 +786,9 @@ def _speculative_decode_qwen3(
             eos_token_id=eos_token_id,
             use_cache=use_cache,
         )
-        target_time_s += time.perf_counter() - t0
+        gen_s = time.perf_counter() - t0
+        target_time_s += gen_s
+        target_generate_time_s += gen_s
         if collect_stats:
             target_generated += int(fallback_ids.shape[1]) - before_len
         output_ids = fallback_ids
@@ -781,6 +803,9 @@ def _speculative_decode_qwen3(
             steps=int(steps),
             spec_time_s=float(spec_time_s),
             target_time_s=float(target_time_s),
+            target_prefill_time_s=float(target_prefill_time_s),
+            target_verify_time_s=float(target_verify_time_s),
+            target_generate_time_s=float(target_generate_time_s),
             target_generated=int(target_generated),
         )
     return output_ids, stats
@@ -812,6 +837,9 @@ def _speculative_decode_minillm(
     steps = 0
     spec_time_s = 0.0
     target_time_s = 0.0
+    target_prefill_time_s = 0.0
+    target_verify_time_s = 0.0
+    target_generate_time_s = 0.0
     target_generated = 0
 
     while produced < int(max_new_tokens):
@@ -822,7 +850,9 @@ def _speculative_decode_minillm(
             attention_mask=None,
             layer_ids=speculator.feature_layers,
         )
-        target_time_s += time.perf_counter() - t0
+        prefill_s = time.perf_counter() - t0
+        target_time_s += prefill_s
+        target_prefill_time_s += prefill_s
         last_hidden = hidden[:, -1:, :]
         last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
 
@@ -852,7 +882,9 @@ def _speculative_decode_minillm(
             attention_mask=None,
             layer_ids=speculator.feature_layers,
         )
-        target_time_s += time.perf_counter() - t0
+        verify_s = time.perf_counter() - t0
+        target_time_s += verify_s
+        target_verify_time_s += verify_s
         block_hidden = full_hidden[:, -len(draft_tokens) :, :]
         prev_hidden = torch.cat([last_hidden, block_hidden], dim=1)[:, :-1, :]
         block_logits = _project_logits_minillm(target, prev_hidden)
@@ -921,7 +953,9 @@ def _speculative_decode_minillm(
             eos_token_id=eos_token_id,
             use_cache=False,
         )
-        target_time_s += time.perf_counter() - t0
+        gen_s = time.perf_counter() - t0
+        target_time_s += gen_s
+        target_generate_time_s += gen_s
         if collect_stats:
             target_generated += int(output_ids.shape[1]) - before_len
 
@@ -935,6 +969,9 @@ def _speculative_decode_minillm(
             steps=int(steps),
             spec_time_s=float(spec_time_s),
             target_time_s=float(target_time_s),
+            target_prefill_time_s=float(target_prefill_time_s),
+            target_verify_time_s=float(target_verify_time_s),
+            target_generate_time_s=float(target_generate_time_s),
             target_generated=int(target_generated),
         )
     return output_ids, stats

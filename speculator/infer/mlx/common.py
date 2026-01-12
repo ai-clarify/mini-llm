@@ -25,6 +25,9 @@ class SpecStats:
     steps: int
     spec_time_s: float
     target_time_s: float
+    target_prefill_time_s: float
+    target_verify_time_s: float
+    target_generate_time_s: float
     target_generated: int
 
 
@@ -691,6 +694,9 @@ def _speculative_decode_qwen3(
     steps = 0
     spec_time_s = 0.0
     target_time_s = 0.0
+    target_prefill_time_s = 0.0
+    target_verify_time_s = 0.0
+    target_generate_time_s = 0.0
     target_generated = 0
 
     cache = mlx_cache.make_prompt_cache(target.model) if use_cache else None
@@ -703,7 +709,9 @@ def _speculative_decode_qwen3(
         layer_ids=speculator.feature_layers,
     )
     mx.eval(hidden)
-    target_time_s += time.perf_counter() - t0
+    prefill_s = time.perf_counter() - t0
+    target_time_s += prefill_s
+    target_prefill_time_s += prefill_s
     last_hidden = hidden[:, -1:, :]
     last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
 
@@ -738,7 +746,9 @@ def _speculative_decode_qwen3(
             prev_hidden = mx.concatenate([last_hidden, block_hidden], axis=1)[:, :-1, :]
             block_logits = _project_logits_qwen3(target, prev_hidden)
             mx.eval(block_logits)
-            target_time_s += time.perf_counter() - t0
+            verify_s = time.perf_counter() - t0
+            target_time_s += verify_s
+            target_verify_time_s += verify_s
         else:
             full = mx.array([output_ids + draft_tokens], dtype=mx.int32)
             t0 = time.perf_counter()
@@ -753,7 +763,9 @@ def _speculative_decode_qwen3(
             prev_hidden = mx.concatenate([last_hidden, block_hidden], axis=1)[:, :-1, :]
             block_logits = _project_logits_qwen3(target, prev_hidden)
             mx.eval(block_logits)
-            target_time_s += time.perf_counter() - t0
+            verify_s = time.perf_counter() - t0
+            target_time_s += verify_s
+            target_verify_time_s += verify_s
 
         accept_len, new_tokens, rejected = _accept_reject_block(
             draft_tokens=draft_tokens,
@@ -768,7 +780,9 @@ def _speculative_decode_qwen3(
             t0 = time.perf_counter()
             bonus_logits = _project_logits_qwen3(target, block_hidden[:, -1:, :])[:, -1, :]
             mx.eval(bonus_logits)
-            target_time_s += time.perf_counter() - t0
+            gen_s = time.perf_counter() - t0
+            target_time_s += gen_s
+            target_generate_time_s += gen_s
             bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
             new_tokens.append(int(bonus_token))
             bonus_added = True
@@ -817,7 +831,9 @@ def _speculative_decode_qwen3(
                         layer_ids=speculator.feature_layers,
                     )
                     mx.eval(hidden)
-                    target_time_s += time.perf_counter() - t0
+                    gen_s = time.perf_counter() - t0
+                    target_time_s += gen_s
+                    target_generate_time_s += gen_s
                     last_hidden = hidden[:, -1:, :]
                     last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
                 else:
@@ -835,7 +851,9 @@ def _speculative_decode_qwen3(
                         layer_ids=speculator.feature_layers,
                     )
                     mx.eval(hidden)
-                    target_time_s += time.perf_counter() - t0
+                    prefill_s = time.perf_counter() - t0
+                    target_time_s += prefill_s
+                    target_prefill_time_s += prefill_s
                     last_hidden = hidden[:, -1:, :]
                     last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
                 else:
@@ -849,7 +867,9 @@ def _speculative_decode_qwen3(
                         layer_ids=speculator.feature_layers,
                     )
                     mx.eval(hidden)
-                    target_time_s += time.perf_counter() - t0
+                    gen_s = time.perf_counter() - t0
+                    target_time_s += gen_s
+                    target_generate_time_s += gen_s
                     last_hidden = hidden[:, -1:, :]
                     last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
         else:
@@ -862,7 +882,9 @@ def _speculative_decode_qwen3(
                 layer_ids=speculator.feature_layers,
             )
             mx.eval(hidden)
-            target_time_s += time.perf_counter() - t0
+            prefill_s = time.perf_counter() - t0
+            target_time_s += prefill_s
+            target_prefill_time_s += prefill_s
             last_hidden = hidden[:, -1:, :]
             last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
 
@@ -882,7 +904,9 @@ def _speculative_decode_qwen3(
             cache=cache if use_cache else None,
             last_hidden=last_hidden,
         )
-        target_time_s += time.perf_counter() - t0
+        gen_s = time.perf_counter() - t0
+        target_time_s += gen_s
+        target_generate_time_s += gen_s
         if collect_stats:
             target_generated += len(output_ids) - before_len
 
@@ -896,6 +920,9 @@ def _speculative_decode_qwen3(
             steps=int(steps),
             spec_time_s=float(spec_time_s),
             target_time_s=float(target_time_s),
+            target_prefill_time_s=float(target_prefill_time_s),
+            target_verify_time_s=float(target_verify_time_s),
+            target_generate_time_s=float(target_generate_time_s),
             target_generated=int(target_generated),
         )
     return output_ids, stats
@@ -1009,6 +1036,9 @@ def _speculative_decode_minillm(
     steps = 0
     spec_time_s = 0.0
     target_time_s = 0.0
+    target_prefill_time_s = 0.0
+    target_verify_time_s = 0.0
+    target_generate_time_s = 0.0
     target_generated = 0
 
     while produced < int(max_new_tokens):
@@ -1021,7 +1051,9 @@ def _speculative_decode_minillm(
             layer_ids=speculator.feature_layers,
         )
         mx.eval(hidden)
-        target_time_s += time.perf_counter() - t0
+        prefill_s = time.perf_counter() - t0
+        target_time_s += prefill_s
+        target_prefill_time_s += prefill_s
         last_hidden = hidden[:, -1:, :]
         last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
 
@@ -1055,7 +1087,9 @@ def _speculative_decode_minillm(
         prev_hidden = mx.concatenate([last_hidden, block_hidden], axis=1)[:, :-1, :]
         block_logits = _project_logits_minillm(target, prev_hidden)
         mx.eval(block_logits)
-        target_time_s += time.perf_counter() - t0
+        verify_s = time.perf_counter() - t0
+        target_time_s += verify_s
+        target_verify_time_s += verify_s
 
         accept_len, new_tokens, rejected = _accept_reject_block(
             draft_tokens=draft_tokens,
@@ -1070,7 +1104,9 @@ def _speculative_decode_minillm(
             t0 = time.perf_counter()
             bonus_logits = _project_logits_minillm(target, block_hidden[:, -1:, :])[:, -1, :]
             mx.eval(bonus_logits)
-            target_time_s += time.perf_counter() - t0
+            gen_s = time.perf_counter() - t0
+            target_time_s += gen_s
+            target_generate_time_s += gen_s
             bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
             new_tokens.append(int(bonus_token))
             bonus_added = True
@@ -1121,7 +1157,9 @@ def _speculative_decode_minillm(
             top_p=top_p,
             eos_token_id=eos_token_id,
         )
-        target_time_s += time.perf_counter() - t0
+        gen_s = time.perf_counter() - t0
+        target_time_s += gen_s
+        target_generate_time_s += gen_s
         if collect_stats:
             target_generated += len(output_ids) - before_len
 
@@ -1135,6 +1173,9 @@ def _speculative_decode_minillm(
             steps=int(steps),
             spec_time_s=float(spec_time_s),
             target_time_s=float(target_time_s),
+            target_prefill_time_s=float(target_prefill_time_s),
+            target_verify_time_s=float(target_verify_time_s),
+            target_generate_time_s=float(target_generate_time_s),
             target_generated=int(target_generated),
         )
     return output_ids, stats
