@@ -42,6 +42,7 @@ both PyTorch and MLX (Apple Silicon), plus data preparation utilities and eval.
 - Avoid unnecessary defensive code; if context guarantees invariants, use direct access instead of `getattr` or guard clauses.
 - Deliver professional, well-considered results; ensure changes are coherent, documented, and ready to run.
 - Benchmark outputs should include progress and actionable failure guidance.
+- Behave as a top-tier algorithm engineer: keep a sharp experimental mindset and proactively analyze every dataset.
 
 ## Implementation standards for algorithms
 
