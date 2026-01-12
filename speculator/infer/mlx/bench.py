@@ -188,7 +188,7 @@ def main() -> None:
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=32)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
-    parser.add_argument("--temperature", type=float, default=0.1)
+    parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument(
         "--spec_len",

@@ -220,19 +220,31 @@ def _spec_loss_autoregressive(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     device = input_ids.device
+    positions = _select_positions(
+        loss_mask,
+        attention_mask,
+        spec_len=spec_len,
+        rng=rng,
+    )
+    max_pos = max((pos for pos in positions if pos >= 0), default=-1)
+    if max_pos < 0:
+        return torch.tensor(0.0, device=device)
+    trim_len = int(max_pos) + 1
+    trim_ids = input_ids[:, :trim_len]
+    trim_attn = attention_mask[:, :trim_len]
     with torch.no_grad():
         if target_arch == "minillm":
             _, layer_hiddens = _minillm_forward_hidden_states(
                 target,
-                input_ids,
-                attention_mask=attention_mask,
+                trim_ids,
+                attention_mask=trim_attn,
                 layer_ids=speculator.feature_layers,
             )
         else:
             _, layer_hiddens = _qwen3_forward_hidden_states(
                 target,
-                input_ids,
-                attention_mask=attention_mask,
+                trim_ids,
+                attention_mask=trim_attn,
                 layer_ids=speculator.feature_layers,
             )
     if layer_hiddens and layer_hiddens[0].dtype != dtype:
@@ -240,12 +252,6 @@ def _spec_loss_autoregressive(
 
     total_loss = torch.tensor(0.0, device=device)
     total_weight = torch.tensor(0.0, device=device)
-    positions = _select_positions(
-        loss_mask,
-        attention_mask,
-        spec_len=spec_len,
-        rng=rng,
-    )
     for b, pos in enumerate(positions):
         if pos < 0:
             continue
