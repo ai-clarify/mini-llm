@@ -340,11 +340,12 @@ def main() -> None:
         }
 
     def summarize_acceptance(rows: List[SpecBenchResult]) -> Dict[str, float]:
-        total_accept = sum(r.stats.total_accept for r in rows)
-        total_draft = sum(r.stats.total_draft for r in rows)
+        total_accept = sum(r.stats.accepted_output for r in rows)
+        total_target = sum(r.stats.target_generated for r in rows)
         total_steps = sum(r.stats.steps for r in rows)
         zero_accept = sum(r.stats.zero_accept for r in rows)
-        accept_rate = float(total_accept / total_draft) if total_draft else 0.0
+        denom = float(total_accept + total_target)
+        accept_rate = float(total_accept / denom) if denom > 0 else 0.0
         mean_accept = float(total_accept / total_steps) if total_steps else 0.0
         zero_rate = float(zero_accept / total_steps) if total_steps else 0.0
         return {
