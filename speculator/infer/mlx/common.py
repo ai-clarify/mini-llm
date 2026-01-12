@@ -888,7 +888,7 @@ def _speculative_decode_qwen3(
             last_hidden = hidden[:, -1:, :]
             last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
 
-        if optimized and consecutive_misses >= max_consecutive_misses:
+        if optimized and consecutive_misses >= max_consecutive_misses and remaining > 2 * int(spec_len):
             break
 
     if optimized and produced < int(max_new_tokens):
@@ -1143,7 +1143,7 @@ def _speculative_decode_minillm(
         if eos_hit:
             break
 
-        if optimized and consecutive_misses >= max_consecutive_misses:
+        if optimized and consecutive_misses >= max_consecutive_misses and remaining > 2 * int(spec_len):
             break
 
     if optimized and produced < int(max_new_tokens):

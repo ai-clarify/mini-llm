@@ -771,7 +771,7 @@ def _speculative_decode_qwen3(
             ]
             last_logits = out.logits[:, -1, :]
 
-        if optimized and consecutive_misses >= max_consecutive_misses:
+        if optimized and consecutive_misses >= max_consecutive_misses and remaining > 2 * int(spec_len):
             break
 
     if optimized and produced < int(max_new_tokens):
@@ -938,7 +938,7 @@ def _speculative_decode_minillm(
         if eos_hit:
             break
 
-        if optimized and consecutive_misses >= max_consecutive_misses:
+        if optimized and consecutive_misses >= max_consecutive_misses and remaining > 2 * int(spec_len):
             break
 
     if optimized and produced < int(max_new_tokens):
