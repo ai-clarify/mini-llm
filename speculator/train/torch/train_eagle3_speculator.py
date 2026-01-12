@@ -46,7 +46,9 @@ def _count_jsonl_lines(path: Path, *, max_lines: Optional[int] = None) -> int:
     return n
 
 
-def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_generation_prompt: bool) -> str:
+def _apply_chat_template(
+    tokenizer, messages: List[Dict[str, Any]], *, add_generation_prompt: bool
+) -> str:
     return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -55,7 +57,9 @@ def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_gener
     )
 
 
-def _split_prompt(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _split_prompt(
+    messages: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     last_assistant = None
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "assistant":
@@ -77,7 +81,9 @@ class SyntheticChatDataset(Dataset):
                 self.records.append(json.loads(line))
         self.tokenizer = tokenizer
         self.max_seq_len = int(max_seq_len)
-        self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        self.pad_id = (
+            tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        )
 
     def __len__(self) -> int:
         return len(self.records)
@@ -89,8 +95,12 @@ class SyntheticChatDataset(Dataset):
             raise ValueError("Missing conversations/messages in JSONL record")
 
         prompt_msgs, _ = _split_prompt(conversations)
-        full_text = _apply_chat_template(self.tokenizer, conversations, add_generation_prompt=False)
-        prompt_text = _apply_chat_template(self.tokenizer, prompt_msgs, add_generation_prompt=True)
+        full_text = _apply_chat_template(
+            self.tokenizer, conversations, add_generation_prompt=False
+        )
+        prompt_text = _apply_chat_template(
+            self.tokenizer, prompt_msgs, add_generation_prompt=True
+        )
 
         full_ids = self.tokenizer(full_text, add_special_tokens=False).input_ids
         prompt_ids = self.tokenizer(prompt_text, add_special_tokens=False).input_ids
@@ -165,7 +175,9 @@ def _self_feed_prob(
     return max(0.0, min(1.0, base * float(offset)))
 
 
-def _embed_tokens(target: AutoModelForCausalLM, token_ids: List[int]) -> Optional[torch.Tensor]:
+def _embed_tokens(
+    target: AutoModelForCausalLM, token_ids: List[int]
+) -> Optional[torch.Tensor]:
     if not token_ids:
         return None
     device = next(target.parameters()).device
@@ -245,7 +257,9 @@ def _spec_loss_autoregressive(
         spec_logits_steps: List[torch.Tensor] = []
         for j in range(int(spec_len)):
             token_embeds = _embed_tokens(target, feed_tokens)
-            logits = speculator.decode(fused_context=fused_context, token_embeds=token_embeds)
+            logits = speculator.decode(
+                fused_context=fused_context, token_embeds=token_embeds
+            )
             spec_logits_steps.append(logits)
             pred_token = sample_next_token(
                 logits[0],
@@ -421,14 +435,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train an EAGLE-3 style speculator for Qwen3-0.6B or MiniLLM using pure synthetic data."
     )
-    parser.add_argument("--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3")
+    parser.add_argument(
+        "--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3"
+    )
     parser.add_argument("--target_model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--minillm_ckpt", type=str, default=None)
     parser.add_argument("--minillm_config", type=str, default=None)
     parser.add_argument("--minillm_tokenizer", type=str, default="./model")
-    parser.add_argument("--data_path", type=str, default="out/distill_ollama_qwen3_0.6b/synth.jsonl")
-    parser.add_argument("--out_dir", type=str, default="out/eagle3_speculator/qwen3_0.6b")
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--data_path", type=str, default="out/distill_ollama_qwen3_0.6b/synth.jsonl"
+    )
+    parser.add_argument(
+        "--out_dir", type=str, default="out/eagle3_speculator/qwen3_0.6b"
+    )
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=2)
@@ -436,7 +458,7 @@ def main() -> None:
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--max_steps", type=int, default=5000)
+    parser.add_argument("--max_steps", type=int, default=5500)
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=500)
     parser.add_argument(
@@ -457,8 +479,18 @@ def main() -> None:
         default=0,
         help="Consecutive steps meeting early_stop_loss before stopping (0 = immediate).",
     )
-    parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
-    parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
+    parser.add_argument(
+        "--spec_len",
+        type=int,
+        default=None,
+        help="Draft length for speculator (auto if unset).",
+    )
+    parser.add_argument(
+        "--spec_layers",
+        type=int,
+        default=None,
+        help="Transformer layers in speculator (auto if unset).",
+    )
     parser.add_argument("--spec_heads", type=int, default=0)
     parser.add_argument("--spec_dropout", type=float, default=0.0)
     parser.add_argument(
@@ -542,7 +574,9 @@ def main() -> None:
             print("[warn] MiniLLM checkpoint not provided; using random weights")
         target = target.to(device=device, dtype=dtype)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.target_model, trust_remote_code=True
+        )
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id or 0
         tokenizer.padding_side = "right"
@@ -597,8 +631,12 @@ def main() -> None:
 
     parsed_layers: Optional[List[int]] = None
     if args.feature_layers:
-        parsed_layers = [int(x) for x in str(args.feature_layers).split(",") if x.strip()]
-    feature_layers = _resolve_feature_layers(parsed_layers, num_layers=int(target.config.num_hidden_layers))
+        parsed_layers = [
+            int(x) for x in str(args.feature_layers).split(",") if x.strip()
+        ]
+    feature_layers = _resolve_feature_layers(
+        parsed_layers, num_layers=int(target.config.num_hidden_layers)
+    )
 
     speculator = Eagle3Speculator(
         hidden_size=hidden_size,
@@ -612,7 +650,9 @@ def main() -> None:
     ).to(device)
 
     if resume_dir is not None:
-        speculator.load_state_dict(torch.load(resume_dir / "speculator.pt", map_location=device))
+        speculator.load_state_dict(
+            torch.load(resume_dir / "speculator.pt", map_location=device)
+        )
         print(f"[resume] step={resume_step} from {resume_dir}")
 
     trainable = sum(p.numel() for p in speculator.parameters() if p.requires_grad)
@@ -623,11 +663,17 @@ def main() -> None:
         f"spec_layers={args.spec_layers} feature_layers=[{layer_note}]{head_note}"
     )
 
-    dataset = SyntheticChatDataset(Path(args.data_path), tokenizer, max_seq_len=args.max_seq_len)
-    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=False)
+    dataset = SyntheticChatDataset(
+        Path(args.data_path), tokenizer, max_seq_len=args.max_seq_len
+    )
+    loader = DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=True, drop_last=False
+    )
     data_iter = _infinite_loader(loader)
 
-    optimizer = torch.optim.AdamW(speculator.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW(
+        speculator.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay
+    )
     if resume_dir is not None:
         opt_path = resume_dir / "optimizer.pt"
         if opt_path.is_file():
@@ -662,7 +708,9 @@ def main() -> None:
         "self_feed_temperature": args.self_feed_temperature,
         "loss_decay": args.loss_decay,
     }
-    (out_dir / "speculator_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    (out_dir / "speculator_config.json").write_text(
+        json.dumps(config, indent=2), encoding="utf-8"
+    )
 
     start_time = time.time()
     accum_steps = int(args.accum_steps)
@@ -678,7 +726,9 @@ def main() -> None:
 
     last_step = resume_step
     if resume_step >= int(args.max_steps):
-        print(f"[resume] step={resume_step} >= max_steps={int(args.max_steps)}; nothing to do.")
+        print(
+            f"[resume] step={resume_step} >= max_steps={int(args.max_steps)}; nothing to do."
+        )
         return
     try:
         for step in range(resume_step + 1, int(args.max_steps) + 1):
@@ -689,11 +739,17 @@ def main() -> None:
                 input_ids = input_ids.to(device)
                 attention_mask = attention_mask.to(device)
                 loss_mask = loss_mask.to(device)
-                tokens_seen += _count_tokens(batch_size=input_ids.shape[0], spec_len=args.spec_len)
-                step_seed = int(args.seed) + (int(step) * int(accum_steps)) + int(accum_idx)
+                tokens_seen += _count_tokens(
+                    batch_size=input_ids.shape[0], spec_len=args.spec_len
+                )
+                step_seed = (
+                    int(args.seed) + (int(step) * int(accum_steps)) + int(accum_idx)
+                )
                 step_rng = random.Random(step_seed)
 
-                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                with torch.autocast(
+                    device_type=device.type, dtype=amp_dtype, enabled=use_amp
+                ):
                     loss = _spec_loss_autoregressive(
                         speculator=speculator,
                         target=target,
@@ -752,18 +808,33 @@ def main() -> None:
 
             saved = False
             if step % args.save_interval == 0 or step == int(args.max_steps):
-                _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+                _save_checkpoint(
+                    step=step,
+                    speculator=speculator,
+                    optimizer=optimizer,
+                    out_dir=out_dir,
+                )
                 saved = True
 
             last_step = step
             if stop_training:
                 if not saved:
-                    _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+                    _save_checkpoint(
+                        step=step,
+                        speculator=speculator,
+                        optimizer=optimizer,
+                        out_dir=out_dir,
+                    )
                 break
     except KeyboardInterrupt:
         if last_step > 0:
             print(f"[train] interrupted at step={last_step}, saving checkpoint")
-            _save_checkpoint(step=last_step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+            _save_checkpoint(
+                step=last_step,
+                speculator=speculator,
+                optimizer=optimizer,
+                out_dir=out_dir,
+            )
         else:
             print("[train] interrupted before first step; no checkpoint saved")
 
