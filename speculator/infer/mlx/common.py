@@ -20,11 +20,12 @@ except ImportError as exc:  # pragma: no cover - dependency check
 class SpecStats:
     total_accept: int
     total_draft: int
+    accepted_output: int
     zero_accept: int
     steps: int
     spec_time_s: float
     target_time_s: float
-    target_tokens: int
+    target_generated: int
 
 
 def _load_qwen3_deps():
@@ -685,11 +686,12 @@ def _speculative_decode_qwen3(
     consecutive_misses = 0
     total_accept = 0
     total_draft = 0
+    accepted_output = 0
     zero_accept = 0
     steps = 0
     spec_time_s = 0.0
     target_time_s = 0.0
-    target_tokens = 0
+    target_generated = 0
 
     cache = mlx_cache.make_prompt_cache(target.model) if use_cache else None
     prompt = mx.array([output_ids], dtype=mx.int32)
@@ -737,7 +739,6 @@ def _speculative_decode_qwen3(
             block_logits = _project_logits_qwen3(target, prev_hidden)
             mx.eval(block_logits)
             target_time_s += time.perf_counter() - t0
-            target_tokens += int(block_len)
         else:
             full = mx.array([output_ids + draft_tokens], dtype=mx.int32)
             t0 = time.perf_counter()
@@ -753,7 +754,6 @@ def _speculative_decode_qwen3(
             block_logits = _project_logits_qwen3(target, prev_hidden)
             mx.eval(block_logits)
             target_time_s += time.perf_counter() - t0
-            target_tokens += int(block_len)
 
         accept_len, new_tokens, rejected = _accept_reject_block(
             draft_tokens=draft_tokens,
@@ -769,7 +769,6 @@ def _speculative_decode_qwen3(
             bonus_logits = _project_logits_qwen3(target, block_hidden[:, -1:, :])[:, -1, :]
             mx.eval(bonus_logits)
             target_time_s += time.perf_counter() - t0
-            target_tokens += 1
             bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
             new_tokens.append(int(bonus_token))
             bonus_added = True
@@ -781,6 +780,20 @@ def _speculative_decode_qwen3(
             if accept_len == 0:
                 zero_accept += 1
 
+        token_sources = [True] * int(accept_len)
+        if rejected or bonus_added:
+            token_sources.append(False)
+        eos_hit = False
+        if eos_token_id is not None and int(eos_token_id) in new_tokens:
+            eos_idx = new_tokens.index(int(eos_token_id))
+            new_tokens = new_tokens[: eos_idx + 1]
+            token_sources = token_sources[: eos_idx + 1]
+            eos_hit = True
+        if collect_stats:
+            accepted_step = sum(1 for src in token_sources if src)
+            accepted_output += int(accepted_step)
+            target_generated += int(len(token_sources) - accepted_step)
+
         if accept_len == 0:
             consecutive_misses += 1
         else:
@@ -789,11 +802,7 @@ def _speculative_decode_qwen3(
         output_ids.extend(int(t) for t in new_tokens)
         produced += len(new_tokens)
 
-        if eos_token_id is not None and int(eos_token_id) in new_tokens:
-            eos_idx = new_tokens.index(int(eos_token_id))
-            tail = len(new_tokens) - eos_idx - 1
-            if tail > 0:
-                output_ids = output_ids[:-tail]
+        if eos_hit:
             break
 
         if use_cache:
@@ -874,18 +883,20 @@ def _speculative_decode_qwen3(
             last_hidden=last_hidden,
         )
         target_time_s += time.perf_counter() - t0
-        target_tokens += len(output_ids) - before_len
+        if collect_stats:
+            target_generated += len(output_ids) - before_len
 
     stats = None
     if collect_stats:
         stats = SpecStats(
             total_accept=int(total_accept),
             total_draft=int(total_draft),
+            accepted_output=int(accepted_output),
             zero_accept=int(zero_accept),
             steps=int(steps),
             spec_time_s=float(spec_time_s),
             target_time_s=float(target_time_s),
-            target_tokens=int(target_tokens),
+            target_generated=int(target_generated),
         )
     return output_ids, stats
 
@@ -993,11 +1004,12 @@ def _speculative_decode_minillm(
     consecutive_misses = 0
     total_accept = 0
     total_draft = 0
+    accepted_output = 0
     zero_accept = 0
     steps = 0
     spec_time_s = 0.0
     target_time_s = 0.0
-    target_tokens = 0
+    target_generated = 0
 
     while produced < int(max_new_tokens):
         prompt = mx.array([output_ids], dtype=mx.int32)
@@ -1044,7 +1056,6 @@ def _speculative_decode_minillm(
         block_logits = _project_logits_minillm(target, prev_hidden)
         mx.eval(block_logits)
         target_time_s += time.perf_counter() - t0
-        target_tokens += int(block_len)
 
         accept_len, new_tokens, rejected = _accept_reject_block(
             draft_tokens=draft_tokens,
@@ -1054,14 +1065,15 @@ def _speculative_decode_minillm(
             top_p=top_p,
         )
 
+        bonus_added = False
         if not rejected and accept_len == len(draft_tokens) and remaining > len(draft_tokens):
             t0 = time.perf_counter()
             bonus_logits = _project_logits_minillm(target, block_hidden[:, -1:, :])[:, -1, :]
             mx.eval(bonus_logits)
             target_time_s += time.perf_counter() - t0
-            target_tokens += 1
             bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
             new_tokens.append(int(bonus_token))
+            bonus_added = True
 
         if collect_stats:
             total_accept += int(accept_len)
@@ -1069,6 +1081,20 @@ def _speculative_decode_minillm(
             steps += 1
             if accept_len == 0:
                 zero_accept += 1
+
+        token_sources = [True] * int(accept_len)
+        if rejected or bonus_added:
+            token_sources.append(False)
+        eos_hit = False
+        if eos_token_id is not None and int(eos_token_id) in new_tokens:
+            eos_idx = new_tokens.index(int(eos_token_id))
+            new_tokens = new_tokens[: eos_idx + 1]
+            token_sources = token_sources[: eos_idx + 1]
+            eos_hit = True
+        if collect_stats:
+            accepted_step = sum(1 for src in token_sources if src)
+            accepted_output += int(accepted_step)
+            target_generated += int(len(token_sources) - accepted_step)
 
         if accept_len == 0:
             consecutive_misses += 1
@@ -1078,11 +1104,7 @@ def _speculative_decode_minillm(
         output_ids.extend(int(t) for t in new_tokens)
         produced += len(new_tokens)
 
-        if eos_token_id is not None and int(eos_token_id) in new_tokens:
-            eos_idx = new_tokens.index(int(eos_token_id))
-            tail = len(new_tokens) - eos_idx - 1
-            if tail > 0:
-                output_ids = output_ids[:-tail]
+        if eos_hit:
             break
 
         if optimized and consecutive_misses >= max_consecutive_misses:
@@ -1100,18 +1122,20 @@ def _speculative_decode_minillm(
             eos_token_id=eos_token_id,
         )
         target_time_s += time.perf_counter() - t0
-        target_tokens += len(output_ids) - before_len
+        if collect_stats:
+            target_generated += len(output_ids) - before_len
 
     stats = None
     if collect_stats:
         stats = SpecStats(
             total_accept=int(total_accept),
             total_draft=int(total_draft),
+            accepted_output=int(accepted_output),
             zero_accept=int(zero_accept),
             steps=int(steps),
             spec_time_s=float(spec_time_s),
             target_time_s=float(target_time_s),
-            target_tokens=int(target_tokens),
+            target_generated=int(target_generated),
         )
     return output_ids, stats
 

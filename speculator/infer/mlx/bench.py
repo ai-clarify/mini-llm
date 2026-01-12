@@ -354,10 +354,15 @@ def main() -> None:
         }
 
     def summarize_tokens(rows: List[SpecBenchResult]) -> Dict[str, float]:
-        """Aggregate draft/target token counts. Time O(n) best/avg/worst, space O(1)."""
+        """Aggregate token sources. Time O(n) best/avg/worst, space O(1)."""
         total_draft = sum(r.stats.total_draft for r in rows)
-        total_target = sum(r.stats.target_tokens for r in rows)
-        return {"draft_tokens": float(total_draft), "target_tokens": float(total_target)}
+        total_accept = sum(r.stats.accepted_output for r in rows)
+        total_target = sum(r.stats.target_generated for r in rows)
+        return {
+            "draft_tokens": float(total_draft),
+            "accepted_tokens": float(total_accept),
+            "target_generated": float(total_target),
+        }
 
     def summarize_timing(rows: List[SpecBenchResult]) -> Dict[str, float]:
         """Aggregate speculator/target time. Time O(n) best/avg/worst, space O(1)."""
@@ -381,7 +386,8 @@ def main() -> None:
         accept_stats = summarize_acceptance(spec_results)
         token_stats = summarize_tokens(spec_results)
         timing_stats = summarize_timing(spec_results)
-        target_per_out = token_stats["target_tokens"] / max(spec_stats["output_tokens"], 1e-6)
+        target_per_out = token_stats["target_generated"] / max(spec_stats["output_tokens"], 1e-6)
+        accept_per_out = token_stats["accepted_tokens"] / max(spec_stats["output_tokens"], 1e-6)
         draft_per_out = token_stats["draft_tokens"] / max(spec_stats["output_tokens"], 1e-6)
         print(
             f"[bench] spec_len={spec_len} output_tokens={spec_stats['output_tokens']:.0f} "
@@ -401,8 +407,10 @@ def main() -> None:
         )
         print(
             f"[bench] tokens baseline_out={base_stats['output_tokens']:.0f} "
+            f"accepted={token_stats['accepted_tokens']:.0f} "
+            f"target_generated={token_stats['target_generated']:.0f} "
             f"draft_proposed={token_stats['draft_tokens']:.0f} "
-            f"target_eval={token_stats['target_tokens']:.0f} "
+            f"accepted/out={accept_per_out:.2f} "
             f"target/out={target_per_out:.2f} draft/out={draft_per_out:.2f}"
         )
 

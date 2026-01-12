@@ -64,11 +64,12 @@ def _resolve_spec_config(
 class SpecStats:
     total_accept: int
     total_draft: int
+    accepted_output: int
     zero_accept: int
     steps: int
     spec_time_s: float
     target_time_s: float
-    target_tokens: int
+    target_generated: int
 
 
 def _select_feature_layers(num_layers: int, *, count: int = 4) -> List[int]:
@@ -556,11 +557,12 @@ def _speculative_decode_qwen3(
     consecutive_misses = 0
     total_accept = 0
     total_draft = 0
+    accepted_output = 0
     zero_accept = 0
     steps = 0
     spec_time_s = 0.0
     target_time_s = 0.0
-    target_tokens = 0
+    target_generated = 0
 
     t0 = time.perf_counter()
     out = target(
@@ -621,7 +623,6 @@ def _speculative_decode_qwen3(
                 h[:, -len(draft_tokens) :, :] for h in _extract_hidden_layers(block_out, speculator.feature_layers)
             ]
             past_snapshot = None
-        target_tokens += int(block_len)
         shifted_logits = torch.cat([last_logits.unsqueeze(1), block_logits[:, :-1, :]], dim=1)
         accept_len, new_tokens, rejected = _accept_reject_block(
             draft_tokens=draft_tokens,
@@ -637,7 +638,6 @@ def _speculative_decode_qwen3(
             bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
             new_tokens.append(int(bonus_token))
             bonus_added = True
-            target_tokens += 1
 
         if collect_stats:
             total_accept += int(accept_len)
@@ -651,9 +651,25 @@ def _speculative_decode_qwen3(
         else:
             consecutive_misses = 0
 
+        token_sources = [True] * int(accept_len)
+        if rejected or bonus_added:
+            token_sources.append(False)
+
         remaining = int(max_new_tokens) - produced
         if len(new_tokens) > remaining:
             new_tokens = new_tokens[:remaining]
+            token_sources = token_sources[:remaining]
+
+        eos_hit = False
+        if eos_token_id is not None and eos_token_id in new_tokens:
+            eos_idx = new_tokens.index(eos_token_id)
+            new_tokens = new_tokens[: eos_idx + 1]
+            token_sources = token_sources[: eos_idx + 1]
+            eos_hit = True
+        if collect_stats:
+            accepted_step = sum(1 for src in token_sources if src)
+            accepted_output += int(accepted_step)
+            target_generated += int(len(token_sources) - accepted_step)
 
         if not new_tokens:
             break
@@ -663,11 +679,7 @@ def _speculative_decode_qwen3(
         )
         produced += len(new_tokens)
 
-        if eos_token_id is not None and eos_token_id in new_tokens:
-            eos_idx = new_tokens.index(eos_token_id)
-            tail = len(new_tokens) - eos_idx - 1
-            if tail > 0:
-                output_ids = output_ids[:, :-tail]
+        if eos_hit:
             break
 
         if use_cache:
@@ -755,7 +767,8 @@ def _speculative_decode_qwen3(
             use_cache=use_cache,
         )
         target_time_s += time.perf_counter() - t0
-        target_tokens += int(fallback_ids.shape[1]) - before_len
+        if collect_stats:
+            target_generated += int(fallback_ids.shape[1]) - before_len
         output_ids = fallback_ids
 
     stats = None
@@ -763,11 +776,12 @@ def _speculative_decode_qwen3(
         stats = SpecStats(
             total_accept=int(total_accept),
             total_draft=int(total_draft),
+            accepted_output=int(accepted_output),
             zero_accept=int(zero_accept),
             steps=int(steps),
             spec_time_s=float(spec_time_s),
             target_time_s=float(target_time_s),
-            target_tokens=int(target_tokens),
+            target_generated=int(target_generated),
         )
     return output_ids, stats
 
@@ -793,11 +807,12 @@ def _speculative_decode_minillm(
     consecutive_misses = 0
     total_accept = 0
     total_draft = 0
+    accepted_output = 0
     zero_accept = 0
     steps = 0
     spec_time_s = 0.0
     target_time_s = 0.0
-    target_tokens = 0
+    target_generated = 0
 
     while produced < int(max_new_tokens):
         t0 = time.perf_counter()
@@ -841,7 +856,6 @@ def _speculative_decode_minillm(
         block_hidden = full_hidden[:, -len(draft_tokens) :, :]
         prev_hidden = torch.cat([last_hidden, block_hidden], dim=1)[:, :-1, :]
         block_logits = _project_logits_minillm(target, prev_hidden)
-        target_tokens += int(block_len)
 
         accept_len, new_tokens, rejected = _accept_reject_block(
             draft_tokens=draft_tokens,
@@ -851,11 +865,12 @@ def _speculative_decode_minillm(
             top_p=top_p,
         )
 
+        bonus_added = False
         if not rejected and accept_len == len(draft_tokens) and remaining > len(draft_tokens):
             bonus_logits = _project_logits_minillm(target, block_hidden[:, -1:, :])[:, -1, :]
             bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
             new_tokens.append(int(bonus_token))
-            target_tokens += 1
+            bonus_added = True
 
         if collect_stats:
             total_accept += int(accept_len)
@@ -869,16 +884,26 @@ def _speculative_decode_minillm(
         else:
             consecutive_misses = 0
 
+        token_sources = [True] * int(accept_len)
+        if rejected or bonus_added:
+            token_sources.append(False)
+        eos_hit = False
+        if eos_token_id is not None and eos_token_id in new_tokens:
+            eos_idx = new_tokens.index(eos_token_id)
+            new_tokens = new_tokens[: eos_idx + 1]
+            token_sources = token_sources[: eos_idx + 1]
+            eos_hit = True
+        if collect_stats:
+            accepted_step = sum(1 for src in token_sources if src)
+            accepted_output += int(accepted_step)
+            target_generated += int(len(token_sources) - accepted_step)
+
         output_ids = torch.cat(
             [output_ids, torch.tensor([new_tokens], dtype=torch.long, device=device)], dim=1
         )
         produced += len(new_tokens)
 
-        if eos_token_id is not None and eos_token_id in new_tokens:
-            eos_idx = new_tokens.index(eos_token_id)
-            tail = len(new_tokens) - eos_idx - 1
-            if tail > 0:
-                output_ids = output_ids[:, :-tail]
+        if eos_hit:
             break
 
         if optimized and consecutive_misses >= max_consecutive_misses:
@@ -897,18 +922,20 @@ def _speculative_decode_minillm(
             use_cache=False,
         )
         target_time_s += time.perf_counter() - t0
-        target_tokens += int(output_ids.shape[1]) - before_len
+        if collect_stats:
+            target_generated += int(output_ids.shape[1]) - before_len
 
     stats = None
     if collect_stats:
         stats = SpecStats(
             total_accept=int(total_accept),
             total_draft=int(total_draft),
+            accepted_output=int(accepted_output),
             zero_accept=int(zero_accept),
             steps=int(steps),
             spec_time_s=float(spec_time_s),
             target_time_s=float(target_time_s),
-            target_tokens=int(target_tokens),
+            target_generated=int(target_generated),
         )
     return output_ids, stats
 
