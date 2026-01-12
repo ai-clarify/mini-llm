@@ -18,6 +18,7 @@ DEFAULT_PROMPTS = [
 ]
 
 DEFAULT_PROMPT_DATASETS = [
+    REPO_ROOT / "out/distill_ollama_qwen3_0.6b/synth.jsonl",
     REPO_ROOT / "dataset/minimind/sft_mini_512.jsonl",
     REPO_ROOT / "dataset/minimind/sft_512.jsonl",
     REPO_ROOT / "dataset/identity_cn_sample.jsonl",
@@ -69,6 +70,34 @@ def pick_default_prompts_jsonl() -> Optional[Path]:
     for path in DEFAULT_PROMPT_DATASETS:
         if path.is_file():
             return path
+    return None
+
+
+def _read_speculator_data_path(speculator_dir: Optional[Path]) -> Optional[Path]:
+    if speculator_dir is None:
+        return None
+    cfg_path = speculator_dir / "speculator_config.json"
+    if not cfg_path.is_file():
+        return None
+    data = json.loads(cfg_path.read_text(encoding="utf-8"))
+    data_path = data.get("data_path")
+    if not data_path:
+        return None
+    path = Path(data_path)
+    if path.is_file():
+        return path
+    return None
+
+
+def resolve_prompts_jsonl(
+    prompts_jsonl: Optional[str], *, speculator_dir: Optional[Path]
+) -> Optional[str]:
+    """Resolve a prompt JSONL path. Time O(1) best/avg/worst, space O(1)."""
+    if prompts_jsonl:
+        return prompts_jsonl
+    spec_path = _read_speculator_data_path(speculator_dir)
+    if spec_path is not None:
+        return str(spec_path)
     return None
 
 

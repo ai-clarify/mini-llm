@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
-from speculator.infer.prompt_utils import load_prompt_messages
+from speculator.infer.prompt_utils import load_prompt_messages, resolve_prompts_jsonl
 
 
 def _render_progress(current: int, total: int, *, label: str = "bench") -> None:
@@ -670,8 +670,11 @@ def main() -> None:
         )
         speculator = speculator.to(device)
 
+    prompts_jsonl = resolve_prompts_jsonl(
+        args.prompts_jsonl, speculator_dir=Path(args.speculator_dir)
+    )
     prompt_messages = load_prompt_messages(
-        args.prompts_jsonl,
+        prompts_jsonl,
         args.system,
         max_samples=args.max_samples,
         seed=args.seed,

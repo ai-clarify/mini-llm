@@ -24,7 +24,7 @@ from speculator.infer.mlx.common import (
     speculative_decode_minillm_with_stats,
     speculative_decode_with_stats,
 )
-from speculator.infer.prompt_utils import load_prompt_messages
+from speculator.infer.prompt_utils import load_prompt_messages, resolve_prompts_jsonl
 
 
 @dataclass(frozen=True)
@@ -245,8 +245,11 @@ def main() -> None:
             head_rank=head_rank,
         )
 
+    prompts_jsonl = resolve_prompts_jsonl(
+        args.prompts_jsonl, speculator_dir=Path(args.speculator_dir)
+    )
     prompt_messages = load_prompt_messages(
-        args.prompts_jsonl,
+        prompts_jsonl,
         args.system,
         max_samples=args.max_samples,
         seed=args.seed,
