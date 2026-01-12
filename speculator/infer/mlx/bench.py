@@ -350,6 +350,12 @@ def main() -> None:
             "zero_rate": zero_rate,
         }
 
+    def summarize_tokens(rows: List[SpecBenchResult]) -> Dict[str, float]:
+        """Aggregate draft/target token counts. Time O(n) best/avg/worst, space O(1)."""
+        total_draft = sum(r.stats.total_draft for r in rows)
+        total_target = sum(r.stats.target_tokens for r in rows)
+        return {"draft_tokens": float(total_draft), "target_tokens": float(total_target)}
+
     def summarize_timing(rows: List[SpecBenchResult]) -> Dict[str, float]:
         """Aggregate speculator/target time. Time O(n) best/avg/worst, space O(1)."""
         total_spec = sum(r.stats.spec_time_s for r in rows)
@@ -370,6 +376,7 @@ def main() -> None:
         spec_stats = summarize(spec_results)
         speedup = base_stats["total_time_s"] / max(spec_stats["total_time_s"], 1e-6)
         accept_stats = summarize_acceptance(spec_results)
+        token_stats = summarize_tokens(spec_results)
         timing_stats = summarize_timing(spec_results)
         print(
             f"[bench] spec_len={spec_len} output_tokens={spec_stats['output_tokens']:.0f} "
@@ -383,8 +390,14 @@ def main() -> None:
         )
         other_time = spec_stats["total_time_s"] - timing_stats["spec_time_s"] - timing_stats["target_time_s"]
         print(
-            f"[bench] time_s draft={timing_stats['spec_time_s']:.2f} "
+            f"[bench] time_s baseline={base_stats['total_time_s']:.2f} "
+            f"draft={timing_stats['spec_time_s']:.2f} "
             f"target={timing_stats['target_time_s']:.2f} other={other_time:.2f}"
+        )
+        print(
+            f"[bench] tokens baseline={base_stats['output_tokens']:.0f} "
+            f"draft={token_stats['draft_tokens']:.0f} "
+            f"target={token_stats['target_tokens']:.0f}"
         )
 
 

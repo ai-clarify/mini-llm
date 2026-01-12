@@ -24,6 +24,7 @@ class SpecStats:
     steps: int
     spec_time_s: float
     target_time_s: float
+    target_tokens: int
 
 
 def _load_qwen3_deps():
@@ -526,6 +527,7 @@ def _speculative_decode_qwen3(
     steps = 0
     spec_time_s = 0.0
     target_time_s = 0.0
+    target_tokens = 0
 
     cache = mlx_cache.make_prompt_cache(target.model) if use_cache else None
     prompt = mx.array([output_ids], dtype=mx.int32)
@@ -555,6 +557,7 @@ def _speculative_decode_qwen3(
             block_logits = _project_logits_qwen3(target, prev_hidden)
             mx.eval(block_logits)
             target_time_s += time.perf_counter() - t0
+            target_tokens += int(block_len)
         else:
             full = mx.array([output_ids + draft_tokens], dtype=mx.int32)
             t0 = time.perf_counter()
@@ -564,6 +567,7 @@ def _speculative_decode_qwen3(
             block_logits = _project_logits_qwen3(target, prev_hidden)
             mx.eval(block_logits)
             target_time_s += time.perf_counter() - t0
+            target_tokens += int(block_len)
 
         accept_len, new_tokens, rejected = _accept_reject_block(
             draft_tokens=draft_tokens,
@@ -579,6 +583,7 @@ def _speculative_decode_qwen3(
             bonus_logits = _project_logits_qwen3(target, block_hidden[:, -1:, :])[:, -1, :]
             mx.eval(bonus_logits)
             target_time_s += time.perf_counter() - t0
+            target_tokens += 1
             bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
             new_tokens.append(int(bonus_token))
             bonus_added = True
@@ -646,6 +651,7 @@ def _speculative_decode_qwen3(
 
     if optimized and produced < int(max_new_tokens):
         t0 = time.perf_counter()
+        before_len = len(output_ids)
         output_ids = baseline_decode(
             target=target,
             input_ids=output_ids,
@@ -657,6 +663,7 @@ def _speculative_decode_qwen3(
             last_hidden=last_hidden,
         )
         target_time_s += time.perf_counter() - t0
+        target_tokens += len(output_ids) - before_len
 
     stats = None
     if collect_stats:
@@ -667,6 +674,7 @@ def _speculative_decode_qwen3(
             steps=int(steps),
             spec_time_s=float(spec_time_s),
             target_time_s=float(target_time_s),
+            target_tokens=int(target_tokens),
         )
     return output_ids, stats
 
@@ -778,6 +786,7 @@ def _speculative_decode_minillm(
     steps = 0
     spec_time_s = 0.0
     target_time_s = 0.0
+    target_tokens = 0
 
     while produced < int(max_new_tokens):
         prompt = mx.array([output_ids], dtype=mx.int32)
@@ -806,6 +815,7 @@ def _speculative_decode_minillm(
         block_logits = _project_logits_minillm(target, prev_hidden)
         mx.eval(block_logits)
         target_time_s += time.perf_counter() - t0
+        target_tokens += int(block_len)
 
         accept_len, new_tokens, rejected = _accept_reject_block(
             draft_tokens=draft_tokens,
@@ -820,6 +830,7 @@ def _speculative_decode_minillm(
             bonus_logits = _project_logits_minillm(target, block_hidden[:, -1:, :])[:, -1, :]
             mx.eval(bonus_logits)
             target_time_s += time.perf_counter() - t0
+            target_tokens += 1
             bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
             new_tokens.append(int(bonus_token))
 
@@ -850,6 +861,7 @@ def _speculative_decode_minillm(
 
     if optimized and produced < int(max_new_tokens):
         t0 = time.perf_counter()
+        before_len = len(output_ids)
         output_ids = baseline_decode_minillm(
             target=target,
             input_ids=output_ids,
@@ -859,6 +871,7 @@ def _speculative_decode_minillm(
             eos_token_id=eos_token_id,
         )
         target_time_s += time.perf_counter() - t0
+        target_tokens += len(output_ids) - before_len
 
     stats = None
     if collect_stats:
@@ -869,6 +882,7 @@ def _speculative_decode_minillm(
             steps=int(steps),
             spec_time_s=float(spec_time_s),
             target_time_s=float(target_time_s),
+            target_tokens=int(target_tokens),
         )
     return output_ids, stats
 
