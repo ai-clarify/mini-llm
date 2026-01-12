@@ -1,22 +1,52 @@
 #!/usr/bin/env python3
 import argparse
-import json
-import math
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
 from speculator.infer.prompt_utils import load_prompt_messages, resolve_prompts_jsonl
+from speculator.infer.torch.common import (
+    SpecStats,
+    _apply_chat_template,
+    _count_params_torch,
+    _load_target_and_tokenizer,
+    _resolve_dtype,
+    _resolve_spec_config,
+    baseline_decode,
+    load_speculator,
+    speculative_decode_with_stats,
+)
+
+
+@dataclass(frozen=True)
+class BenchResult:
+    num_input_tokens: int
+    num_output_tokens: int
+    elapsed_s: float
+
+    @property
+    def tok_per_s(self) -> float:
+        return self.num_output_tokens / max(self.elapsed_s, 1e-6)
+
+
+@dataclass(frozen=True)
+class SpecBenchResult:
+    num_input_tokens: int
+    num_output_tokens: int
+    elapsed_s: float
+    stats: SpecStats
+
+    @property
+    def tok_per_s(self) -> float:
+        return self.num_output_tokens / max(self.elapsed_s, 1e-6)
 
 
 def _render_progress(current: int, total: int, *, label: str = "bench") -> None:
@@ -30,388 +60,44 @@ def _render_progress(current: int, total: int, *, label: str = "bench") -> None:
         sys.stdout.write("\n")
 
 
-def _resolve_dtype(name: str) -> torch.dtype:
-    name = str(name).lower()
-    if name == "float16":
-        return torch.float16
-    if name == "bfloat16":
-        return torch.bfloat16
-    if name == "float32":
-        return torch.float32
-    raise ValueError(f"Unsupported dtype: {name}")
+def _sync_device(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize()
 
 
-def _count_params_torch(model: torch.nn.Module) -> Optional[int]:
-    try:
-        return int(sum(p.numel() for p in model.parameters()))
-    except Exception:
-        return None
-
-
-def _auto_spec_config(param_count: Optional[int]) -> Tuple[int, int]:
-    if not param_count or param_count <= 0:
-        return 2, 2
-    params_b = float(param_count) / 1e9
-    if params_b <= 1.0:
-        return 2, 2
-    if params_b <= 3.0:
-        return 2, 2
-    if params_b <= 7.0:
-        return 3, 2
-    if params_b <= 13.0:
-        return 4, 2
-    return 5, 2
-
-
-def _resolve_spec_config(
-    spec_len: Optional[int], spec_layers: Optional[int], *, param_count: Optional[int]
-) -> Tuple[int, int]:
-    auto_len, auto_layers = _auto_spec_config(param_count)
-    if spec_len is None or int(spec_len) <= 0:
-        spec_len = auto_len
-    if spec_layers is None or int(spec_layers) <= 0:
-        spec_layers = auto_layers
-    return int(spec_len), int(spec_layers)
-
-
-def _load_minillm_config(path: Optional[str]) -> MiniLLMConfig:
-    if not path:
-        return MiniLLMConfig()
-    cfg_path = Path(path)
-    with cfg_path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-    if not isinstance(data, dict):
-        raise ValueError(f"MiniLLM config must be a JSON object: {cfg_path}")
-    return MiniLLMConfig(**data)
-
-
-def _extract_hidden_state(output: Any) -> torch.Tensor:
-    return output.last_hidden_state
-
-
-def _load_target_and_tokenizer(args, device: torch.device, dtype: torch.dtype):
-    if args.target_arch == "minillm":
-        tokenizer = AutoTokenizer.from_pretrained(args.minillm_tokenizer)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id or 0
-        tokenizer.padding_side = "right"
-
-        cfg = _load_minillm_config(args.minillm_config)
-        target = MiniLLMForCausalLM(cfg)
-        if args.minillm_ckpt:
-            state = torch.load(args.minillm_ckpt, map_location=device)
-            target.load_state_dict(state, strict=False)
-        else:
-            print("[warn] MiniLLM checkpoint not provided; using random weights")
-        target = target.to(device=device, dtype=dtype)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id or 0
-        tokenizer.padding_side = "right"
-
-        target = AutoModelForCausalLM.from_pretrained(
-            args.target_model, trust_remote_code=True, torch_dtype=dtype
-        ).to(device)
-    target.eval()
-    return target, tokenizer
-
-
-def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_generation_prompt: bool) -> str:
-    return tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=add_generation_prompt,
-        enable_thinking=False,
-    )
-
-
-def _stats(values: List[float]) -> Optional[Dict[str, float]]:
-    if not values:
-        return None
-    vals = sorted(float(v) for v in values)
-    n = len(vals)
-
-    def pct(p: float) -> float:
-        if n == 1:
-            return vals[0]
-        k = (n - 1) * p
-        f = math.floor(k)
-        c = math.ceil(k)
-        if f == c:
-            return vals[int(k)]
-        d0 = vals[f] * (c - k)
-        d1 = vals[c] * (k - f)
-        return d0 + d1
-
-    return {
-        "mean": sum(vals) / n,
-        "p50": pct(0.5),
-        "p90": pct(0.9),
-        "min": vals[0],
-        "max": vals[-1],
-    }
-
-
-def _fmt(stats: Optional[Dict[str, float]], *, scale: float = 1.0, unit: str = "") -> str:
-    if not stats:
-        return "n/a"
-    return (
-        f"mean={stats['mean'] * scale:.2f}{unit} "
-        f"p50={stats['p50'] * scale:.2f}{unit} "
-        f"p90={stats['p90'] * scale:.2f}{unit} "
-        f"min={stats['min'] * scale:.2f}{unit} "
-        f"max={stats['max'] * scale:.2f}{unit}"
-    )
-
-
-def _clone_past_key_values(past):
-    if past is None:
-        return None
-    return tuple((k.clone(), v.clone()) for (k, v) in past)
-
-
-def sample_next_token(logits: torch.Tensor, *, temperature: float, top_p: float) -> int:
-    if temperature <= 0:
-        return int(torch.argmax(logits, dim=-1).item())
-    logits = logits / float(temperature)
-    if top_p >= 1.0:
-        probs = torch.softmax(logits, dim=-1)
-        return int(torch.multinomial(probs, num_samples=1).item())
-    sorted_logits, sorted_idx = torch.sort(logits, descending=True)
-    probs = torch.softmax(sorted_logits, dim=-1)
-    cumprobs = torch.cumsum(probs, dim=-1)
-    mask = cumprobs > float(top_p)
-    if mask[..., 0].item():
-        mask[..., 0] = False
-    sorted_logits = torch.where(mask, torch.tensor(-1e9, device=logits.device), sorted_logits)
-    probs = torch.softmax(sorted_logits, dim=-1)
-    picked = torch.multinomial(probs, num_samples=1)
-    return int(sorted_idx.gather(-1, picked).item())
-
-
-def _token_prob_from_logits(
-    logits: torch.Tensor,
-    token: int,
+def _run_baseline(
     *,
-    temperature: float,
-    top_p: float,
-) -> float:
-    """Token probability under (temp, top_p). Time O(V) best/avg/worst, space O(V)."""
-    token_id = int(token)
-    logits = logits.reshape(-1)
-    if temperature <= 0:
-        return 1.0 if int(torch.argmax(logits, dim=-1).item()) == token_id else 0.0
-    scaled = logits / float(temperature)
-    if top_p >= 1.0:
-        probs = torch.softmax(scaled, dim=-1)
-        return float(probs[token_id].item())
-    sorted_logits, sorted_idx = torch.sort(scaled, descending=True)
-    probs = torch.softmax(sorted_logits, dim=-1)
-    cumprobs = torch.cumsum(probs, dim=-1)
-    mask = cumprobs > float(top_p)
-    if mask[..., 0].item():
-        mask[..., 0] = False
-    filtered_logits = torch.where(
-        mask, torch.tensor(-1e9, device=logits.device), sorted_logits
-    )
-    filtered_probs = torch.softmax(filtered_logits, dim=-1)
-    token_mask = sorted_idx == token_id
-    prob = (filtered_probs * token_mask).sum()
-    return float(prob.item())
-
-
-class LowRankHead(torch.nn.Module):
-    def __init__(self, *, hidden_size: int, vocab_size: int, rank: int) -> None:
-        super().__init__()
-        self.proj = torch.nn.Linear(hidden_size, int(rank), bias=False)
-        self.out = torch.nn.Linear(int(rank), vocab_size, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.out(self.proj(x))
-
-
-class Eagle3Speculator(torch.nn.Module):
-    def __init__(
-        self,
-        *,
-        hidden_size: int,
-        vocab_size: int,
-        spec_len: int,
-        spec_layers: int,
-        spec_heads: int,
-        dropout: float,
-        init_weight: Optional[torch.Tensor],
-        head_rank: Optional[int] = None,
-    ) -> None:
-        super().__init__()
-        self.layers = torch.nn.ModuleList(
-            [
-                torch.nn.TransformerEncoderLayer(
-                    d_model=hidden_size,
-                    nhead=spec_heads,
-                    dim_feedforward=hidden_size * 4,
-                    dropout=dropout,
-                    activation="gelu",
-                    batch_first=True,
-                    norm_first=True,
-                )
-                for _ in range(int(spec_layers))
-            ]
-        )
-        self.norm = torch.nn.LayerNorm(hidden_size)
-        rank = int(head_rank) if head_rank is not None and int(head_rank) > 0 else 0
-        if rank > 0:
-            self.heads = torch.nn.ModuleList(
-                [LowRankHead(hidden_size=hidden_size, vocab_size=vocab_size, rank=rank) for _ in range(int(spec_len))]
-            )
-        else:
-            self.heads = torch.nn.ModuleList(
-                [torch.nn.Linear(hidden_size, vocab_size, bias=False) for _ in range(int(spec_len))]
-            )
-            if init_weight is not None:
-                for head in self.heads:
-                    head.weight.data.copy_(init_weight)
-
-    def forward(self, hidden: torch.Tensor) -> List[torch.Tensor]:
-        x = hidden
-        seq_len = x.shape[1]
-        causal_mask = None
-        if seq_len > 1:
-            # Prevent peeking at future positions during multi-token drafting.
-            causal_mask = torch.triu(torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool), diagonal=1)
-        for layer in self.layers:
-            x = layer(x, src_mask=causal_mask)
-        x = self.norm(x)
-        return [head(x) for head in self.heads]
-
-
-def load_speculator(
-    *,
-    target: AutoModelForCausalLM,
-    speculator_dir: str,
-    speculator_ckpt: Optional[str],
-    spec_len: int,
-    spec_layers: int,
-    spec_heads: int,
-    head_rank: Optional[int],
-    dropout: float,
-) -> Tuple[Eagle3Speculator, int]:
-    cfg_path = Path(speculator_dir) / "speculator_config.json"
-    if cfg_path.is_file():
-        with cfg_path.open("r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        spec_len = int(cfg.get("spec_len", spec_len))
-        spec_layers = int(cfg.get("spec_layers", spec_layers))
-        spec_heads = int(cfg.get("spec_heads", spec_heads))
-        if "head_rank" in cfg:
-            head_rank = cfg.get("head_rank", head_rank)
-
-    hidden_size = int(target.config.hidden_size)
-    vocab_size = int(target.config.vocab_size)
-    if spec_heads <= 0:
-        cfg_heads = int(target.config.num_attention_heads)
-        if cfg_heads > 0:
-            spec_heads = cfg_heads
-        else:
-            spec_heads = max(1, hidden_size // 64)
-        while spec_heads > 1 and hidden_size % spec_heads != 0:
-            spec_heads -= 1
-
-    init_weight = target.lm_head.weight.detach().clone()
-
-    speculator = Eagle3Speculator(
-        hidden_size=hidden_size,
-        vocab_size=vocab_size,
-        spec_len=spec_len,
-        spec_layers=spec_layers,
-        spec_heads=spec_heads,
-        dropout=dropout,
-        init_weight=init_weight,
-        head_rank=head_rank,
-    )
-
-    ckpt = None
-    if speculator_ckpt:
-        ckpt = Path(speculator_ckpt)
-    else:
-        root = Path(speculator_dir) / "checkpoints"
-        if root.is_dir():
-            latest = None
-            best = -1
-            for child in root.iterdir():
-                if not child.is_dir():
-                    continue
-                if child.name.startswith("step_"):
-                    try:
-                        step = int(child.name.split("_", 1)[1])
-                    except (ValueError, IndexError):
-                        continue
-                    if step > best:
-                        best = step
-                        latest = child
-            if latest is not None:
-                ckpt = latest / "speculator.pt"
-    if ckpt is None or not ckpt.is_file():
-        raise FileNotFoundError(f"Speculator checkpoint not found under {speculator_dir}")
-
-    state = torch.load(ckpt, map_location="cpu")
-    speculator.load_state_dict(state, strict=True)
-    speculator.eval()
-    return speculator, spec_len
-
-
-@torch.inference_mode()
-def baseline_generate(
-    *,
-    target: AutoModelForCausalLM,
+    target,
     input_ids: torch.Tensor,
     max_new_tokens: int,
     temperature: float,
     top_p: float,
     eos_token_id: Optional[int],
-) -> SimpleNamespace:
-    num_input_tokens = int(input_ids.shape[1])
-    max_length = num_input_tokens + int(max_new_tokens)
-
-    prefill_start = time.perf_counter()
-    out = target(input_ids=input_ids, use_cache=True, return_dict=True)
-    last_logits = out.logits[:, -1, :]
-    past = out.past_key_values
-    time_to_first_token = time.perf_counter() - prefill_start
-
-    output_ids = input_ids[0].tolist()
-
-    decode_start = time.perf_counter()
-    while len(output_ids) < max_length:
-        token = sample_next_token(last_logits, temperature=temperature, top_p=top_p)
-        output_ids.append(int(token))
-        if eos_token_id is not None and token == int(eos_token_id):
-            break
-        step_ids = torch.tensor([[int(token)]], device=input_ids.device, dtype=torch.long)
-        out = target(input_ids=step_ids, past_key_values=past, use_cache=True, return_dict=True)
-        past = out.past_key_values
-        last_logits = out.logits[:, -1, :]
-
-    total_decode_time = time.perf_counter() - decode_start
-    num_output_tokens = max(len(output_ids) - num_input_tokens, 0)
-    time_per_output_token = total_decode_time / max(num_output_tokens, 1)
-
-    return SimpleNamespace(
-        output_ids=output_ids,
-        num_input_tokens=num_input_tokens,
-        num_output_tokens=num_output_tokens,
-        time_to_first_token=time_to_first_token,
-        time_per_output_token=time_per_output_token,
-        acceptance_lengths=[],
+    use_cache: bool,
+    device: torch.device,
+) -> BenchResult:
+    _sync_device(device)
+    start = time.perf_counter()
+    output_ids = baseline_decode(
+        target=target,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        eos_token_id=eos_token_id,
+        use_cache=use_cache,
     )
+    _sync_device(device)
+    elapsed = time.perf_counter() - start
+    num_input = int(input_ids.shape[1])
+    num_output = max(int(output_ids.shape[1]) - num_input, 0)
+    return BenchResult(num_input, num_output, elapsed)
 
 
-@torch.inference_mode()
-def speculative_generate(
+def _run_spec(
     *,
-    target: AutoModelForCausalLM,
-    speculator: Eagle3Speculator,
+    target,
+    speculator,
     input_ids: torch.Tensor,
     max_new_tokens: int,
     spec_len: int,
@@ -419,233 +105,79 @@ def speculative_generate(
     top_p: float,
     eos_token_id: Optional[int],
     use_cache: bool,
-) -> SimpleNamespace:
-    num_input_tokens = int(input_ids.shape[1])
-    max_length = num_input_tokens + int(max_new_tokens)
-    optimized = True
-    max_consecutive_misses = 2
-    consecutive_misses = 0
-    eos_reached = False
-
-    prefill_start = time.perf_counter()
-    out = target(
+    device: torch.device,
+) -> SpecBenchResult:
+    _sync_device(device)
+    start = time.perf_counter()
+    output_ids, stats = speculative_decode_with_stats(
+        target=target,
+        speculator=speculator,
         input_ids=input_ids,
-        use_cache=bool(use_cache),
-        output_hidden_states=True,
-        return_dict=True,
+        max_new_tokens=max_new_tokens,
+        spec_len=spec_len,
+        temperature=temperature,
+        top_p=top_p,
+        eos_token_id=eos_token_id,
+        use_cache=use_cache,
+        optimized=True,
     )
-    past = out.past_key_values if use_cache else None
-    last_hidden = _extract_hidden_state(out)[:, -1:, :]
-    last_logits = out.logits[:, -1, :]
-    time_to_first_token = time.perf_counter() - prefill_start
-
-    output_ids = input_ids[0].tolist()
-    acceptance_lengths: List[int] = []
-
-    decode_start = time.perf_counter()
-    while len(output_ids) < max_length:
-        remaining = max_length - len(output_ids)
-        block_len = min(int(spec_len), int(remaining))
-
-        logits_list = speculator(last_hidden)
-        draft_tokens = [
-            sample_next_token(logits_list[i][:, -1, :], temperature=temperature, top_p=top_p)
-            for i in range(block_len)
-        ]
-
-        if use_cache:
-            past_snapshot = _clone_past_key_values(past)
-            draft_tensor = torch.tensor([draft_tokens], dtype=torch.long, device=input_ids.device)
-            block_out = target(
-                input_ids=draft_tensor,
-                past_key_values=past,
-                use_cache=True,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            block_logits = block_out.logits
-            block_hidden = _extract_hidden_state(block_out)
-        else:
-            draft_tensor = torch.tensor([draft_tokens], dtype=torch.long, device=input_ids.device)
-            block_out = target(
-                input_ids=torch.cat([input_ids.new_tensor([output_ids]), draft_tensor], dim=1),
-                use_cache=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            block_logits = block_out.logits[:, -block_len:, :]
-            block_hidden = _extract_hidden_state(block_out)[:, -block_len:, :]
-            past_snapshot = None
-        shifted_logits = torch.cat([last_logits.unsqueeze(1), block_logits[:, :-1, :]], dim=1)
-
-        accept_len = 0
-        new_tokens: List[int] = []
-        rejected = False
-        for i in range(block_len):
-            draft_token = int(draft_tokens[i])
-            draft_logits = logits_list[i][:, -1, :]
-            target_logits = shifted_logits[:, i, :]
-            q_prob = _token_prob_from_logits(
-                draft_logits, draft_token, temperature=temperature, top_p=top_p
-            )
-            p_prob = _token_prob_from_logits(
-                target_logits, draft_token, temperature=temperature, top_p=top_p
-            )
-            accept_prob = 0.0 if q_prob <= 0.0 else min(1.0, p_prob / q_prob)
-            u = float(torch.rand(1, device=input_ids.device).item())
-            if u < accept_prob:
-                new_tokens.append(draft_token)
-                accept_len += 1
-                continue
-            token = sample_next_token(target_logits, temperature=temperature, top_p=top_p)
-            new_tokens.append(int(token))
-            rejected = True
-            break
-
-        bonus_added = False
-        if not rejected and accept_len == block_len and remaining > block_len:
-            bonus_logits = block_logits[:, -1, :]
-            bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
-            new_tokens.append(int(bonus_token))
-            bonus_added = True
-        acceptance_lengths.append(int(accept_len))
-        if accept_len == 0:
-            consecutive_misses += 1
-        else:
-            consecutive_misses = 0
-
-        if not new_tokens:
-            break
-
-        output_ids.extend(new_tokens)
-        if eos_token_id is not None and eos_token_id in new_tokens:
-            eos_idx = new_tokens.index(int(eos_token_id))
-            tail = len(new_tokens) - eos_idx - 1
-            if tail > 0:
-                output_ids = output_ids[:-tail]
-            eos_reached = True
-            break
-
-        if use_cache:
-            if accept_len == block_len:
-                past = block_out.past_key_values
-                last_hidden = block_hidden[:, -1:, :]
-                last_logits = block_out.logits[:, -1, :]
-                if bonus_added:
-                    bonus_tensor = torch.tensor(
-                        [[new_tokens[-1]]], dtype=torch.long, device=input_ids.device
-                    )
-                    bonus_out = target(
-                        input_ids=bonus_tensor,
-                        past_key_values=past,
-                        use_cache=True,
-                        output_hidden_states=True,
-                        return_dict=True,
-                    )
-                    past = bonus_out.past_key_values
-                    last_hidden = _extract_hidden_state(bonus_out)[:, -1:, :]
-                    last_logits = bonus_out.logits[:, -1, :]
-            else:
-                if past_snapshot is None:
-                    out = target(
-                        input_ids=input_ids.new_tensor([output_ids]),
-                        use_cache=bool(use_cache),
-                        output_hidden_states=True,
-                        return_dict=True,
-                    )
-                    past = out.past_key_values if use_cache else None
-                    last_hidden = _extract_hidden_state(out)[:, -1:, :]
-                    last_logits = out.logits[:, -1, :]
-                else:
-                    past = past_snapshot
-                    accept_tensor = torch.tensor([new_tokens], dtype=torch.long, device=input_ids.device)
-                    accept_out = target(
-                        input_ids=accept_tensor,
-                        past_key_values=past,
-                        use_cache=True,
-                        output_hidden_states=True,
-                        return_dict=True,
-                    )
-                    past = accept_out.past_key_values
-                    last_hidden = _extract_hidden_state(accept_out)[:, -1:, :]
-                    last_logits = accept_out.logits[:, -1, :]
-        else:
-            out = target(
-                input_ids=input_ids.new_tensor([output_ids]),
-                use_cache=False,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            last_hidden = _extract_hidden_state(out)[:, -1:, :]
-            last_logits = out.logits[:, -1, :]
-
-        if optimized and consecutive_misses >= max_consecutive_misses:
-            break
-
-    if optimized and not eos_reached and len(output_ids) < max_length:
-        remaining = max_length - len(output_ids)
-        if remaining > 0:
-            fallback = baseline_generate(
-                target=target,
-                input_ids=input_ids.new_tensor([output_ids]),
-                max_new_tokens=remaining,
-                temperature=temperature,
-                top_p=top_p,
-                eos_token_id=eos_token_id,
-            )
-            output_ids = fallback.output_ids
-
-    total_decode_time = time.perf_counter() - decode_start
-    num_output_tokens = max(len(output_ids) - num_input_tokens, 0)
-    time_per_output_token = total_decode_time / max(num_output_tokens, 1)
-
-    return SimpleNamespace(
-        output_ids=output_ids,
-        num_input_tokens=num_input_tokens,
-        num_output_tokens=num_output_tokens,
-        time_to_first_token=time_to_first_token,
-        time_per_output_token=time_per_output_token,
-        acceptance_lengths=acceptance_lengths,
-    )
+    _sync_device(device)
+    elapsed = time.perf_counter() - start
+    num_input = int(input_ids.shape[1])
+    num_output = max(int(output_ids.shape[1]) - num_input, 0)
+    return SpecBenchResult(num_input, num_output, elapsed, stats)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark EAGLE-3 speculator vs baseline.")
-    parser.add_argument("--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3")
+    parser = argparse.ArgumentParser(
+        description="Benchmark EAGLE-3 speculator vs baseline (Torch backend)."
+    )
+    parser.add_argument(
+        "--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3"
+    )
     parser.add_argument("--target_model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--minillm_ckpt", type=str, default=None)
     parser.add_argument("--minillm_config", type=str, default=None)
     parser.add_argument("--minillm_tokenizer", type=str, default="./model")
-    parser.add_argument("--speculator_dir", type=str, default="out/eagle3_speculator/qwen3_0.6b")
+    parser.add_argument(
+        "--speculator_dir", type=str, default="out/eagle3_speculator/qwen3_0.6b"
+    )
     parser.add_argument("--speculator_ckpt", type=str, default=None)
     parser.add_argument("--prompts_jsonl", type=str, default=None)
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=32)
-    parser.add_argument("--max_new_tokens", type=int, default=256)
+    parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_p", type=float, default=1.0)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--dtype", type=str, default="bfloat16")
-    parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
-    parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
-    parser.add_argument("--spec_heads", type=int, default=0)
+    parser.add_argument(
+        "--spec_len",
+        type=int,
+        default=None,
+        help="Draft length for speculator (auto if unset).",
+    )
+    parser.add_argument(
+        "--spec_layers",
+        type=int,
+        default=None,
+        help="Transformer layers in speculator (auto if unset).",
+    )
     parser.add_argument(
         "--head_rank",
         type=int,
         default=None,
         help="Low-rank speculator head size (overrides config if set; full head if unset).",
     )
-    parser.add_argument("--spec_dropout", type=float, default=0.0)
     parser.add_argument("--no_speculator", action="store_true")
+    parser.add_argument("--no_chat_template", action="store_true")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--dtype", type=str, default="bfloat16")
     args = parser.parse_args()
 
-    def seed_round(round_idx: int) -> None:
-        seed = int(args.seed) + int(round_idx)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
+    torch.manual_seed(int(args.seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(args.seed))
 
     device = torch.device(args.device)
     dtype = _resolve_dtype(args.dtype)
@@ -656,17 +188,23 @@ def main() -> None:
     spec_len, spec_layers = _resolve_spec_config(
         args.spec_len, args.spec_layers, param_count=_count_params_torch(target)
     )
-    head_rank = args.head_rank if args.head_rank is not None and int(args.head_rank) > 0 else None
+    head_rank = (
+        args.head_rank
+        if args.head_rank is not None and int(args.head_rank) > 0
+        else None
+    )
     if not args.no_speculator:
+        speculator_dir = Path(args.speculator_dir)
+        speculator_ckpt = Path(args.speculator_ckpt) if args.speculator_ckpt else None
         speculator, spec_len = load_speculator(
             target=target,
-            speculator_dir=args.speculator_dir,
-            speculator_ckpt=args.speculator_ckpt,
+            speculator_dir=speculator_dir,
+            speculator_ckpt=speculator_ckpt,
             spec_len=spec_len,
             spec_layers=spec_layers,
-            spec_heads=args.spec_heads,
+            spec_heads=0,
             head_rank=head_rank,
-            dropout=args.spec_dropout,
+            dropout=0.0,
         )
         speculator = speculator.to(device)
 
@@ -680,31 +218,51 @@ def main() -> None:
         seed=args.seed,
     )
 
-    total_samples = int(args.rounds) * len(prompt_messages)
+    prompt_inputs: List[torch.Tensor] = []
+    for messages in prompt_messages:
+        if args.no_chat_template:
+            prompt_text = messages[-1]["content"]
+        else:
+            prompt_text = _apply_chat_template(
+                tokenizer, messages, add_generation_prompt=True
+            )
+        input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors="pt").input_ids
+        prompt_inputs.append(input_ids.to(device))
+
+    baseline_results: List[BenchResult] = []
+    spec_results: List[SpecBenchResult] = []
+
+    total_samples = int(args.rounds) * len(prompt_inputs)
     if total_samples <= 0:
-        raise ValueError("No prompts to benchmark; check --max_samples or prompts file.")
+        raise ValueError(
+            "No prompts to benchmark; check --max_samples or prompts file."
+        )
     completed = 0
-
-    responses = []
+    use_cache = args.target_arch != "minillm"
+    prompt_count = len(prompt_inputs)
     for round_idx in range(int(args.rounds)):
-        seed_round(round_idx)
-        for messages in prompt_messages:
-            prompt_text = _apply_chat_template(tokenizer, messages, add_generation_prompt=True)
-            input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
-
-            baseline = baseline_generate(
+        for prompt_idx, input_ids in enumerate(prompt_inputs):
+            seed_base = int(args.seed) + (int(round_idx) * prompt_count) + int(prompt_idx)
+            torch.manual_seed(seed_base)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed_base)
+            baseline = _run_baseline(
                 target=target,
                 input_ids=input_ids,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_p=args.top_p,
                 eos_token_id=tokenizer.eos_token_id,
+                use_cache=use_cache,
+                device=device,
             )
+            baseline_results.append(baseline)
 
-            if speculator is None:
-                spec = baseline
-            else:
-                spec = speculative_generate(
+            if speculator is not None:
+                torch.manual_seed(seed_base)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed_base)
+                spec = _run_spec(
                     target=target,
                     speculator=speculator,
                     input_ids=input_ids,
@@ -713,62 +271,88 @@ def main() -> None:
                     temperature=args.temperature,
                     top_p=args.top_p,
                     eos_token_id=tokenizer.eos_token_id,
-                    use_cache=True,
+                    use_cache=use_cache,
+                    device=device,
                 )
-
-            responses.append({1: baseline, spec_len: spec})
+                spec_results.append(spec)
             completed += 1
             _render_progress(completed, total_samples)
 
-    prompt_lens = [r[1].num_input_tokens for r in responses]
-    out_lens_base = [r[1].num_output_tokens for r in responses]
-    out_lens_spec = [r[spec_len].num_output_tokens for r in responses]
+    def summarize(rows: List[BenchResult]) -> Dict[str, float]:
+        total_out = sum(r.num_output_tokens for r in rows)
+        total_time = sum(r.elapsed_s for r in rows)
+        total_in = sum(r.num_input_tokens for r in rows)
+        return {
+            "input_tokens": float(total_in),
+            "output_tokens": float(total_out),
+            "total_time_s": float(total_time),
+            "tok_per_s": float(total_out / max(total_time, 1e-6)),
+        }
 
-    base_total_times = [
-        r[1].time_to_first_token + (r[1].time_per_output_token * r[1].num_output_tokens)
-        for r in responses
-    ]
-    spec_total_times = [
-        r[spec_len].time_to_first_token + (r[spec_len].time_per_output_token * r[spec_len].num_output_tokens)
-        for r in responses
-    ]
+    def summarize_acceptance(rows: List[SpecBenchResult]) -> Dict[str, float]:
+        total_accept = sum(r.stats.total_accept for r in rows)
+        total_draft = sum(r.stats.total_draft for r in rows)
+        total_steps = sum(r.stats.steps for r in rows)
+        zero_accept = sum(r.stats.zero_accept for r in rows)
+        accept_rate = float(total_accept / total_draft) if total_draft else 0.0
+        mean_accept = float(total_accept / total_steps) if total_steps else 0.0
+        zero_rate = float(zero_accept / total_steps) if total_steps else 0.0
+        return {
+            "accept_rate": accept_rate,
+            "mean_accept": mean_accept,
+            "zero_rate": zero_rate,
+        }
 
-    base_ttft = _stats([r[1].time_to_first_token for r in responses])
-    spec_ttft = _stats([r[spec_len].time_to_first_token for r in responses])
-    t1 = sum(r[1].time_per_output_token for r in responses) / max(len(responses), 1)
-    tb = sum(r[spec_len].time_per_output_token for r in responses) / max(len(responses), 1)
-    speedup = (t1 / tb) if tb > 0 else None
+    def summarize_tokens(rows: List[SpecBenchResult]) -> Dict[str, float]:
+        total_draft = sum(r.stats.total_draft for r in rows)
+        total_target = sum(r.stats.target_tokens for r in rows)
+        return {"draft_tokens": float(total_draft), "target_tokens": float(total_target)}
 
-    acceptance_lengths = []
-    for r in responses:
-        acceptance_lengths.extend(r[spec_len].acceptance_lengths)
-    accept_stats = _stats(acceptance_lengths)
-    accept_rate = None
-    zero_accept = None
-    if acceptance_lengths:
-        accept_rate = sum(acceptance_lengths) / (len(acceptance_lengths) * spec_len)
-        zero_accept = sum(1 for x in acceptance_lengths if x == 0) / len(acceptance_lengths)
+    def summarize_timing(rows: List[SpecBenchResult]) -> Dict[str, float]:
+        total_spec = sum(r.stats.spec_time_s for r in rows)
+        total_target = sum(r.stats.target_time_s for r in rows)
+        return {"spec_time_s": float(total_spec), "target_time_s": float(total_target)}
 
-    print(f"[bench] rounds={int(args.rounds)} spec_len={spec_len} temp={args.temperature} top_p={args.top_p} dtype={args.dtype}")
-    print(f"Samples: {len(responses)} | prompts={len(prompt_messages)} | rounds={int(args.rounds)}")
-    print(f"Prompt tokens: {_fmt(_stats(prompt_lens))}")
-    print(f"Output tokens (baseline): {_fmt(_stats(out_lens_base))}")
-    print(f"Output tokens (spec): {_fmt(_stats(out_lens_spec))}")
-    print(f"Wall ms/sample (baseline): {_fmt(_stats(base_total_times), scale=1000.0, unit='ms')}")
-    print(f"Wall ms/sample (spec): {_fmt(_stats(spec_total_times), scale=1000.0, unit='ms')}")
-    print(f"TTFT ms (baseline): {_fmt(base_ttft, scale=1000.0, unit='ms')}")
-    print(f"TTFT ms (spec): {_fmt(spec_ttft, scale=1000.0, unit='ms')}")
-    if speedup is not None:
-        print(f"Decoding speedup: {speedup:.2f}")
-    else:
-        print("Decoding speedup: n/a")
+    base_stats = summarize(baseline_results)
+    print(
+        f"[bench] rounds={int(args.rounds)} samples={len(baseline_results)} prompts={len(prompt_inputs)} "
+        f"temp={args.temperature} top_p={args.top_p}"
+    )
+    print(
+        f"[bench] baseline output_tokens={base_stats['output_tokens']:.0f} "
+        f"time_s={base_stats['total_time_s']:.2f} tok/s={base_stats['tok_per_s']:.2f}"
+    )
 
-    if acceptance_lengths:
-        print(f"Acceptance length: {_fmt(accept_stats)}")
-        if accept_rate is not None:
-            print(f"Acceptance rate (~mean/spec_len): {accept_rate * 100:.2f}% | zero-accept: {zero_accept * 100:.2f}%")
-    else:
-        print("Acceptance length: n/a")
+    if spec_results:
+        spec_stats = summarize(spec_results)
+        speedup_tok = spec_stats["tok_per_s"] / max(base_stats["tok_per_s"], 1e-6)
+        accept_stats = summarize_acceptance(spec_results)
+        token_stats = summarize_tokens(spec_results)
+        timing_stats = summarize_timing(spec_results)
+        target_per_out = token_stats["target_tokens"] / max(spec_stats["output_tokens"], 1e-6)
+        draft_per_out = token_stats["draft_tokens"] / max(spec_stats["output_tokens"], 1e-6)
+        print(
+            f"[bench] spec_len={spec_len} output_tokens={spec_stats['output_tokens']:.0f} "
+            f"time_s={spec_stats['total_time_s']:.2f} tok/s={spec_stats['tok_per_s']:.2f} "
+            f"speedup_tok/s={speedup_tok:.2f}x"
+        )
+        print(
+            f"[bench] acceptance mean={accept_stats['mean_accept']:.2f} "
+            f"rate={accept_stats['accept_rate'] * 100:.2f}% "
+            f"zero_accept={accept_stats['zero_rate'] * 100:.2f}%"
+        )
+        other_time = spec_stats["total_time_s"] - timing_stats["spec_time_s"] - timing_stats["target_time_s"]
+        print(
+            f"[bench] time_s baseline={base_stats['total_time_s']:.2f} "
+            f"draft={timing_stats['spec_time_s']:.2f} "
+            f"target={timing_stats['target_time_s']:.2f} other={other_time:.2f}"
+        )
+        print(
+            f"[bench] tokens baseline_out={base_stats['output_tokens']:.0f} "
+            f"draft_proposed={token_stats['draft_tokens']:.0f} "
+            f"target_eval={token_stats['target_tokens']:.0f} "
+            f"target/out={target_per_out:.2f} draft/out={draft_per_out:.2f}"
+        )
 
 
 if __name__ == "__main__":

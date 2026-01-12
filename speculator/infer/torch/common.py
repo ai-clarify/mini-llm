@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -38,9 +39,9 @@ def _auto_spec_config(param_count: Optional[int]) -> Tuple[int, int]:
         return 2, 2
     params_b = float(param_count) / 1e9
     if params_b <= 1.0:
-        return 2, 2
+        return 4, 2
     if params_b <= 3.0:
-        return 2, 2
+        return 3, 2
     if params_b <= 7.0:
         return 3, 2
     if params_b <= 13.0:
@@ -59,6 +60,37 @@ def _resolve_spec_config(
     return int(spec_len), int(spec_layers)
 
 
+@dataclass(frozen=True)
+class SpecStats:
+    total_accept: int
+    total_draft: int
+    zero_accept: int
+    steps: int
+    spec_time_s: float
+    target_time_s: float
+    target_tokens: int
+
+
+def _select_feature_layers(num_layers: int, *, count: int = 4) -> List[int]:
+    if num_layers <= 0:
+        return []
+    if num_layers <= count:
+        return list(range(int(num_layers)))
+    step = (num_layers - 1) / float(count - 1)
+    layers = [int(round(step * i)) for i in range(int(count))]
+    selected: List[int] = []
+    for idx in layers:
+        if not selected or idx != selected[-1]:
+            selected.append(idx)
+    return selected
+
+
+def _resolve_feature_layers(feature_layers: Optional[List[int]], *, num_layers: int) -> List[int]:
+    if feature_layers:
+        return [int(i) for i in feature_layers]
+    return _select_feature_layers(num_layers)
+
+
 def _load_minillm_config(path: Optional[str]) -> MiniLLMConfig:
     if not path:
         return MiniLLMConfig()
@@ -73,6 +105,56 @@ def _load_minillm_config(path: Optional[str]) -> MiniLLMConfig:
 def _extract_hidden_state(output: Any) -> torch.Tensor:
     return output.last_hidden_state
 
+
+def _extract_hidden_layers(output: Any, layer_ids: List[int]) -> List[torch.Tensor]:
+    hidden_states = output.hidden_states
+    if not hidden_states:
+        return [output.last_hidden_state for _ in layer_ids]
+    offset = 1 if len(hidden_states) > max(layer_ids) + 1 else 0
+    return [hidden_states[int(layer_id) + offset] for layer_id in layer_ids]
+
+
+def _project_logits_minillm(target: MiniLLMForCausalLM, hidden: torch.Tensor) -> torch.Tensor:
+    return target.lm_head(hidden)
+
+
+def _minillm_forward_hidden_states(
+    target: MiniLLMForCausalLM,
+    input_ids: torch.Tensor,
+    *,
+    attention_mask: Optional[torch.Tensor],
+    layer_ids: List[int],
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    model = target.model
+    h = model.embed_tokens(input_ids)
+    h = model.dropout(h)
+    seq_len = int(input_ids.shape[1])
+    position_embeddings = (
+        model.freqs_cos[:seq_len],
+        model.freqs_sin[:seq_len],
+    )
+    layer_index = {int(layer_id): idx for idx, layer_id in enumerate(layer_ids)}
+    hiddens: List[Optional[torch.Tensor]] = [None] * len(layer_ids)
+    for idx, layer in enumerate(model.layers):
+        h, _ = layer(
+            h,
+            position_embeddings,
+            past_key_value=None,
+            use_cache=False,
+            attention_mask=attention_mask,
+        )
+        if idx in layer_index:
+            hiddens[layer_index[idx]] = h
+    h = model.norm(h)
+    return h, [hidden for hidden in hiddens if hidden is not None]
+
+
+def _embed_tokens(target: AutoModelForCausalLM, token_ids: List[int]) -> Optional[torch.Tensor]:
+    if not token_ids:
+        return None
+    device = next(target.parameters()).device
+    token_tensor = torch.tensor([token_ids], device=device, dtype=torch.long)
+    return target.get_input_embeddings()(token_tensor)
 
 def _load_target_and_tokenizer(args, device: torch.device, dtype: torch.dtype):
     if args.target_arch == "minillm":
@@ -189,6 +271,81 @@ def _token_prob_from_logits(
     return float(prob.item())
 
 
+def _token_probs_from_logits_batch(
+    logits: torch.Tensor,
+    tokens: torch.Tensor,
+    *,
+    temperature: float,
+    top_p: float,
+) -> torch.Tensor:
+    """Token probs for batched logits. Time O(kV) best/avg, O(kV log V) when top_p<1; space O(kV)."""
+    if logits.numel() == 0:
+        return torch.empty((0,), device=logits.device, dtype=torch.float32)
+    logits = logits.reshape(int(logits.shape[0]), -1)
+    tokens = tokens.reshape(-1)
+    if temperature <= 0:
+        argmax = torch.argmax(logits, dim=-1)
+        return torch.where(
+            argmax == tokens,
+            torch.ones_like(tokens, dtype=torch.float32),
+            torch.zeros_like(tokens, dtype=torch.float32),
+        )
+    scaled = logits / float(temperature)
+    if top_p >= 1.0:
+        probs = torch.softmax(scaled, dim=-1)
+        return probs.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
+
+    sorted_logits, sorted_idx = torch.sort(scaled, descending=True)
+    sorted_probs = torch.softmax(sorted_logits, dim=-1)
+    cumprobs = torch.cumsum(sorted_probs, dim=-1)
+    keep_prefix = torch.cat(
+        [
+            torch.ones((int(logits.shape[0]), 1), device=logits.device, dtype=torch.bool),
+            cumprobs[:, :-1] <= float(top_p),
+        ],
+        dim=-1,
+    )
+    neg_inf = torch.tensor(-1e9, device=logits.device, dtype=sorted_logits.dtype)
+    filtered_logits = torch.where(keep_prefix, sorted_logits, neg_inf)
+    filtered_probs = torch.softmax(filtered_logits, dim=-1)
+    mask = sorted_idx == tokens.unsqueeze(-1)
+    return torch.sum(filtered_probs * mask, dim=-1)
+
+
+def _accept_reject_block(
+    *,
+    draft_tokens: List[int],
+    draft_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+    temperature: float,
+    top_p: float,
+) -> Tuple[int, List[int], bool]:
+    """Reject-sampling acceptance for a draft block. Time O(kV) best/avg, O(kV log V) when top_p<1; space O(kV)."""
+    if not draft_tokens:
+        return 0, [], False
+    token_tensor = torch.tensor(draft_tokens, device=draft_logits.device, dtype=torch.long)
+    q_probs = _token_probs_from_logits_batch(
+        draft_logits, token_tensor, temperature=temperature, top_p=top_p
+    )
+    p_probs = _token_probs_from_logits_batch(
+        target_logits, token_tensor, temperature=temperature, top_p=top_p
+    )
+    accept_probs = torch.where(
+        q_probs <= 0.0,
+        torch.zeros_like(p_probs),
+        torch.minimum(torch.ones_like(p_probs), p_probs / q_probs),
+    )
+    accept_draws = torch.rand_like(accept_probs)
+    accepted = accept_draws < accept_probs
+    if bool(torch.all(accepted).item()):
+        return len(draft_tokens), draft_tokens, False
+
+    reject_idx = int(torch.argmax(torch.logical_not(accepted)).item())
+    token = sample_next_token(target_logits[reject_idx], temperature=temperature, top_p=top_p)
+    new_tokens = list(draft_tokens[:reject_idx]) + [int(token)]
+    return reject_idx, new_tokens, True
+
+
 class LowRankHead(nn.Module):
     def __init__(self, *, hidden_size: int, vocab_size: int, rank: int) -> None:
         super().__init__()
@@ -199,20 +356,39 @@ class LowRankHead(nn.Module):
         return self.out(self.proj(x))
 
 
+class FeatureFusion(nn.Module):
+    def __init__(self, *, hidden_size: int, num_layers: int) -> None:
+        super().__init__()
+        self.projs = nn.ModuleList(
+            [nn.Linear(hidden_size, hidden_size, bias=False) for _ in range(int(num_layers))]
+        )
+        self.weights = nn.Parameter(torch.zeros(int(num_layers)))
+
+    def forward(self, hiddens: List[torch.Tensor]) -> torch.Tensor:
+        weights = torch.softmax(self.weights, dim=0)
+        fused = None
+        for idx, (proj, hidden) in enumerate(zip(self.projs, hiddens)):
+            contrib = proj(hidden) * weights[idx]
+            fused = contrib if fused is None else fused + contrib
+        return fused
+
+
 class Eagle3Speculator(nn.Module):
     def __init__(
         self,
         *,
         hidden_size: int,
         vocab_size: int,
-        spec_len: int,
         spec_layers: int,
         spec_heads: int,
         dropout: float,
+        feature_layers: List[int],
         init_weight: Optional[torch.Tensor],
         head_rank: Optional[int] = None,
     ) -> None:
         super().__init__()
+        self.feature_layers = [int(i) for i in feature_layers]
+        self.fusion = FeatureFusion(hidden_size=hidden_size, num_layers=len(self.feature_layers))
         self.layers = nn.ModuleList(
             [
                 nn.TransformerEncoderLayer(
@@ -230,29 +406,35 @@ class Eagle3Speculator(nn.Module):
         self.norm = nn.LayerNorm(hidden_size)
         rank = int(head_rank) if head_rank is not None and int(head_rank) > 0 else 0
         if rank > 0:
-            self.heads = nn.ModuleList(
-                [LowRankHead(hidden_size=hidden_size, vocab_size=vocab_size, rank=rank) for _ in range(int(spec_len))]
-            )
+            self.head = LowRankHead(hidden_size=hidden_size, vocab_size=vocab_size, rank=rank)
         else:
-            self.heads = nn.ModuleList([nn.Linear(hidden_size, vocab_size, bias=False) for _ in range(int(spec_len))])
+            self.head = nn.Linear(hidden_size, vocab_size, bias=False)
             if init_weight is not None:
-                for head in self.heads:
-                    head.weight.data.copy_(init_weight)
+                self.head.weight.data.copy_(init_weight)
 
-    def forward(self, hidden: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> List[torch.Tensor]:
-        x = hidden
-        key_padding_mask = None
+    def fuse(self, hiddens: List[torch.Tensor], attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        fused = self.fusion(hiddens)
         if attention_mask is not None:
-            key_padding_mask = attention_mask == 0
+            fused = fused * attention_mask.unsqueeze(-1)
+        return fused
+
+    def decode(self, *, fused_context: torch.Tensor, token_embeds: Optional[torch.Tensor]) -> torch.Tensor:
+        if token_embeds is None or int(token_embeds.shape[1]) == 0:
+            x = fused_context
+        else:
+            x = torch.cat([fused_context, token_embeds], dim=1)
         seq_len = x.shape[1]
         causal_mask = None
         if seq_len > 1:
-            # Prevent peeking at future positions during multi-token drafting.
-            causal_mask = torch.triu(torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool), diagonal=1)
+            causal_mask = torch.triu(
+                torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool),
+                diagonal=1,
+            )
         for layer in self.layers:
-            x = layer(x, src_mask=causal_mask, src_key_padding_mask=key_padding_mask)
+            x = layer(x, src_mask=causal_mask, src_key_padding_mask=None)
         x = self.norm(x)
-        return [head(x) for head in self.heads]
+        logits = self.head(x)
+        return logits[:, -1, :]
 
 
 def load_speculator(
@@ -267,12 +449,15 @@ def load_speculator(
     dropout: float,
 ) -> Tuple[Eagle3Speculator, int]:
     cfg_path = speculator_dir / "speculator_config.json"
+    feature_layers: Optional[List[int]] = None
     if cfg_path.is_file():
         with cfg_path.open("r", encoding="utf-8") as f:
             cfg = json.load(f)
         spec_len = int(cfg.get("spec_len", spec_len))
         spec_layers = int(cfg.get("spec_layers", spec_layers))
         spec_heads = int(cfg.get("spec_heads", spec_heads))
+        if "feature_layers" in cfg:
+            feature_layers = [int(i) for i in cfg.get("feature_layers") or []]
         if "head_rank" in cfg:
             head_rank = cfg.get("head_rank", head_rank)
 
@@ -289,13 +474,17 @@ def load_speculator(
 
     init_weight = target.lm_head.weight.detach().clone()
 
+    feature_layers = _resolve_feature_layers(
+        feature_layers, num_layers=int(target.config.num_hidden_layers)
+    )
+
     speculator = Eagle3Speculator(
         hidden_size=hidden_size,
         vocab_size=vocab_size,
-        spec_len=spec_len,
         spec_layers=spec_layers,
         spec_heads=spec_heads,
         dropout=dropout,
+        feature_layers=feature_layers,
         init_weight=init_weight,
         head_rank=head_rank,
     )
@@ -346,7 +535,7 @@ def baseline_decode(
 
 
 @torch.inference_mode()
-def speculative_decode(
+def _speculative_decode_qwen3(
     *,
     target: AutoModelForCausalLM,
     speculator: Eagle3Speculator,
@@ -359,35 +548,55 @@ def speculative_decode(
     use_cache: bool,
     optimized: bool,
     max_consecutive_misses: int = 2,
-) -> torch.Tensor:
+    collect_stats: bool,
+) -> Tuple[torch.Tensor, Optional[SpecStats]]:
     device = input_ids.device
     output_ids = input_ids.clone()
+    produced = 0
+    consecutive_misses = 0
+    total_accept = 0
+    total_draft = 0
+    zero_accept = 0
+    steps = 0
+    spec_time_s = 0.0
+    target_time_s = 0.0
+    target_tokens = 0
 
+    t0 = time.perf_counter()
     out = target(
         input_ids=output_ids,
         use_cache=bool(use_cache),
         output_hidden_states=True,
         return_dict=True,
     )
+    target_time_s += time.perf_counter() - t0
     past = out.past_key_values if use_cache else None
-    hidden = _extract_hidden_state(out)
-    last_hidden = hidden[:, -1:, :]
+    layer_hiddens = _extract_hidden_layers(out, speculator.feature_layers)
+    last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
     last_logits = out.logits[:, -1, :]
 
-    produced = 0
-    consecutive_misses = 0
     while produced < int(max_new_tokens):
         remaining = int(max_new_tokens) - produced
         block_len = min(int(spec_len), int(remaining))
-        logits_list = speculator(last_hidden, attention_mask=None)
-        draft_tokens = [
-            sample_next_token(logits_list[i][:, -1, :], temperature=temperature, top_p=top_p)
-            for i in range(int(block_len))
-        ]
+        fused_context = speculator.fuse(last_layer_hiddens, attention_mask=None)
+        draft_tokens: List[int] = []
+        draft_logits_steps: List[torch.Tensor] = []
+        token_embeds = None
+        for _ in range(int(block_len)):
+            t0 = time.perf_counter()
+            logits = speculator.decode(fused_context=fused_context, token_embeds=token_embeds)
+            spec_time_s += time.perf_counter() - t0
+            token = sample_next_token(logits[0], temperature=temperature, top_p=top_p)
+            draft_tokens.append(int(token))
+            draft_logits_steps.append(logits)
+            token_embed = _embed_tokens(target, [int(token)])
+            token_embeds = token_embed if token_embeds is None else torch.cat([token_embeds, token_embed], dim=1)
+        draft_logits = torch.cat(draft_logits_steps, dim=0)
 
+        draft_tensor = torch.tensor([draft_tokens], dtype=torch.long, device=device)
         if use_cache:
             past_snapshot = _clone_past_key_values(past)
-            draft_tensor = torch.tensor([draft_tokens], dtype=torch.long, device=device)
+            t0 = time.perf_counter()
             block_out = target(
                 input_ids=draft_tensor,
                 past_key_values=past,
@@ -395,44 +604,32 @@ def speculative_decode(
                 output_hidden_states=True,
                 return_dict=True,
             )
+            target_time_s += time.perf_counter() - t0
             block_logits = block_out.logits
-            block_hidden = _extract_hidden_state(block_out)
+            block_layer_hiddens = _extract_hidden_layers(block_out, speculator.feature_layers)
         else:
-            draft_tensor = torch.tensor([draft_tokens], dtype=torch.long, device=device)
+            t0 = time.perf_counter()
             block_out = target(
                 input_ids=torch.cat([output_ids, draft_tensor], dim=1),
                 use_cache=False,
                 output_hidden_states=True,
                 return_dict=True,
             )
+            target_time_s += time.perf_counter() - t0
             block_logits = block_out.logits[:, -len(draft_tokens) :, :]
-            block_hidden = _extract_hidden_state(block_out)[:, -len(draft_tokens) :, :]
+            block_layer_hiddens = [
+                h[:, -len(draft_tokens) :, :] for h in _extract_hidden_layers(block_out, speculator.feature_layers)
+            ]
             past_snapshot = None
+        target_tokens += int(block_len)
         shifted_logits = torch.cat([last_logits.unsqueeze(1), block_logits[:, :-1, :]], dim=1)
-
-        accept_len = 0
-        new_tokens: List[int] = []
-        rejected = False
-        for i in range(len(draft_tokens)):
-            draft_token = int(draft_tokens[i])
-            draft_logits = logits_list[i][:, -1, :]
-            target_logits = shifted_logits[:, i, :]
-            q_prob = _token_prob_from_logits(
-                draft_logits, draft_token, temperature=temperature, top_p=top_p
-            )
-            p_prob = _token_prob_from_logits(
-                target_logits, draft_token, temperature=temperature, top_p=top_p
-            )
-            accept_prob = 0.0 if q_prob <= 0.0 else min(1.0, p_prob / q_prob)
-            u = float(torch.rand(1, device=device).item())
-            if u < accept_prob:
-                new_tokens.append(draft_token)
-                accept_len += 1
-                continue
-            token = sample_next_token(target_logits, temperature=temperature, top_p=top_p)
-            new_tokens.append(int(token))
-            rejected = True
-            break
+        accept_len, new_tokens, rejected = _accept_reject_block(
+            draft_tokens=draft_tokens,
+            draft_logits=draft_logits,
+            target_logits=shifted_logits[0],
+            temperature=temperature,
+            top_p=top_p,
+        )
 
         bonus_added = False
         if not rejected and accept_len == len(draft_tokens) and remaining > len(draft_tokens):
@@ -440,6 +637,14 @@ def speculative_decode(
             bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
             new_tokens.append(int(bonus_token))
             bonus_added = True
+            target_tokens += 1
+
+        if collect_stats:
+            total_accept += int(accept_len)
+            total_draft += int(block_len)
+            steps += 1
+            if accept_len == 0:
+                zero_accept += 1
 
         if accept_len == 0:
             consecutive_misses += 1
@@ -465,18 +670,16 @@ def speculative_decode(
                 output_ids = output_ids[:, :-tail]
             break
 
-        if optimized and consecutive_misses >= max_consecutive_misses:
-            break
-
         if use_cache:
             if accept_len == len(draft_tokens):
                 past = block_out.past_key_values
-                last_hidden = block_hidden[:, -1:, :]
-                last_logits = block_out.logits[:, -1, :]
+                last_layer_hiddens = [h[:, -1:, :] for h in block_layer_hiddens]
+                last_logits = block_logits[:, -1, :]
                 if bonus_added:
                     bonus_tensor = torch.tensor(
                         [[new_tokens[-1]]], dtype=torch.long, device=device
                     )
+                    t0 = time.perf_counter()
                     bonus_out = target(
                         input_ids=bonus_tensor,
                         past_key_values=past,
@@ -484,23 +687,31 @@ def speculative_decode(
                         output_hidden_states=True,
                         return_dict=True,
                     )
+                    target_time_s += time.perf_counter() - t0
                     past = bonus_out.past_key_values
-                    last_hidden = _extract_hidden_state(bonus_out)[:, -1:, :]
+                    last_layer_hiddens = [
+                        h[:, -1:, :] for h in _extract_hidden_layers(bonus_out, speculator.feature_layers)
+                    ]
                     last_logits = bonus_out.logits[:, -1, :]
             else:
                 if past_snapshot is None:
+                    t0 = time.perf_counter()
                     out = target(
                         input_ids=output_ids,
                         use_cache=bool(use_cache),
                         output_hidden_states=True,
                         return_dict=True,
                     )
+                    target_time_s += time.perf_counter() - t0
                     past = out.past_key_values if use_cache else None
-                    last_hidden = _extract_hidden_state(out)[:, -1:, :]
+                    last_layer_hiddens = [
+                        h[:, -1:, :] for h in _extract_hidden_layers(out, speculator.feature_layers)
+                    ]
                     last_logits = out.logits[:, -1, :]
                 else:
                     past = past_snapshot
                     accept_tensor = torch.tensor([new_tokens], dtype=torch.long, device=device)
+                    t0 = time.perf_counter()
                     accept_out = target(
                         input_ids=accept_tensor,
                         past_key_values=past,
@@ -508,20 +719,32 @@ def speculative_decode(
                         output_hidden_states=True,
                         return_dict=True,
                     )
+                    target_time_s += time.perf_counter() - t0
                     past = accept_out.past_key_values
-                    last_hidden = _extract_hidden_state(accept_out)[:, -1:, :]
+                    last_layer_hiddens = [
+                        h[:, -1:, :] for h in _extract_hidden_layers(accept_out, speculator.feature_layers)
+                    ]
                     last_logits = accept_out.logits[:, -1, :]
         else:
+            t0 = time.perf_counter()
             out = target(
                 input_ids=output_ids,
                 use_cache=False,
                 output_hidden_states=True,
                 return_dict=True,
             )
-            last_hidden = _extract_hidden_state(out)[:, -1:, :]
+            target_time_s += time.perf_counter() - t0
+            last_layer_hiddens = [
+                h[:, -1:, :] for h in _extract_hidden_layers(out, speculator.feature_layers)
+            ]
             last_logits = out.logits[:, -1, :]
 
+        if optimized and consecutive_misses >= max_consecutive_misses:
+            break
+
     if optimized and produced < int(max_new_tokens):
+        t0 = time.perf_counter()
+        before_len = int(output_ids.shape[1])
         fallback_ids = baseline_decode(
             target=target,
             input_ids=output_ids,
@@ -531,9 +754,243 @@ def speculative_decode(
             eos_token_id=eos_token_id,
             use_cache=use_cache,
         )
+        target_time_s += time.perf_counter() - t0
+        target_tokens += int(fallback_ids.shape[1]) - before_len
         output_ids = fallback_ids
 
+    stats = None
+    if collect_stats:
+        stats = SpecStats(
+            total_accept=int(total_accept),
+            total_draft=int(total_draft),
+            zero_accept=int(zero_accept),
+            steps=int(steps),
+            spec_time_s=float(spec_time_s),
+            target_time_s=float(target_time_s),
+            target_tokens=int(target_tokens),
+        )
+    return output_ids, stats
+
+
+@torch.inference_mode()
+def _speculative_decode_minillm(
+    *,
+    target: MiniLLMForCausalLM,
+    speculator: Eagle3Speculator,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    spec_len: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+    optimized: bool,
+    max_consecutive_misses: int = 2,
+    collect_stats: bool,
+) -> Tuple[torch.Tensor, Optional[SpecStats]]:
+    device = input_ids.device
+    output_ids = input_ids.clone()
+    produced = 0
+    consecutive_misses = 0
+    total_accept = 0
+    total_draft = 0
+    zero_accept = 0
+    steps = 0
+    spec_time_s = 0.0
+    target_time_s = 0.0
+    target_tokens = 0
+
+    while produced < int(max_new_tokens):
+        t0 = time.perf_counter()
+        hidden, layer_hiddens = _minillm_forward_hidden_states(
+            target,
+            output_ids,
+            attention_mask=None,
+            layer_ids=speculator.feature_layers,
+        )
+        target_time_s += time.perf_counter() - t0
+        last_hidden = hidden[:, -1:, :]
+        last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
+
+        remaining = int(max_new_tokens) - produced
+        block_len = min(int(spec_len), int(remaining))
+        fused_context = speculator.fuse(last_layer_hiddens, attention_mask=None)
+        draft_tokens: List[int] = []
+        draft_logits_steps: List[torch.Tensor] = []
+        token_embeds = None
+        for _ in range(int(block_len)):
+            t0 = time.perf_counter()
+            logits = speculator.decode(fused_context=fused_context, token_embeds=token_embeds)
+            spec_time_s += time.perf_counter() - t0
+            token = sample_next_token(logits[0], temperature=temperature, top_p=top_p)
+            draft_tokens.append(int(token))
+            draft_logits_steps.append(logits)
+            token_embed = _embed_tokens(target, [int(token)])
+            token_embeds = token_embed if token_embeds is None else torch.cat([token_embeds, token_embed], dim=1)
+        draft_logits = torch.cat(draft_logits_steps, dim=0)
+
+        draft_tensor = torch.tensor([draft_tokens], dtype=torch.long, device=device)
+        full_ids = torch.cat([output_ids, draft_tensor], dim=1)
+        t0 = time.perf_counter()
+        full_hidden, _ = _minillm_forward_hidden_states(
+            target,
+            full_ids,
+            attention_mask=None,
+            layer_ids=speculator.feature_layers,
+        )
+        target_time_s += time.perf_counter() - t0
+        block_hidden = full_hidden[:, -len(draft_tokens) :, :]
+        prev_hidden = torch.cat([last_hidden, block_hidden], dim=1)[:, :-1, :]
+        block_logits = _project_logits_minillm(target, prev_hidden)
+        target_tokens += int(block_len)
+
+        accept_len, new_tokens, rejected = _accept_reject_block(
+            draft_tokens=draft_tokens,
+            draft_logits=draft_logits,
+            target_logits=block_logits[0],
+            temperature=temperature,
+            top_p=top_p,
+        )
+
+        if not rejected and accept_len == len(draft_tokens) and remaining > len(draft_tokens):
+            bonus_logits = _project_logits_minillm(target, block_hidden[:, -1:, :])[:, -1, :]
+            bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
+            new_tokens.append(int(bonus_token))
+            target_tokens += 1
+
+        if collect_stats:
+            total_accept += int(accept_len)
+            total_draft += int(block_len)
+            steps += 1
+            if accept_len == 0:
+                zero_accept += 1
+
+        if accept_len == 0:
+            consecutive_misses += 1
+        else:
+            consecutive_misses = 0
+
+        output_ids = torch.cat(
+            [output_ids, torch.tensor([new_tokens], dtype=torch.long, device=device)], dim=1
+        )
+        produced += len(new_tokens)
+
+        if eos_token_id is not None and eos_token_id in new_tokens:
+            eos_idx = new_tokens.index(eos_token_id)
+            tail = len(new_tokens) - eos_idx - 1
+            if tail > 0:
+                output_ids = output_ids[:, :-tail]
+            break
+
+        if optimized and consecutive_misses >= max_consecutive_misses:
+            break
+
+    if optimized and produced < int(max_new_tokens):
+        t0 = time.perf_counter()
+        before_len = int(output_ids.shape[1])
+        output_ids = baseline_decode(
+            target=target,
+            input_ids=output_ids,
+            max_new_tokens=int(max_new_tokens) - produced,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            use_cache=False,
+        )
+        target_time_s += time.perf_counter() - t0
+        target_tokens += int(output_ids.shape[1]) - before_len
+
+    stats = None
+    if collect_stats:
+        stats = SpecStats(
+            total_accept=int(total_accept),
+            total_draft=int(total_draft),
+            zero_accept=int(zero_accept),
+            steps=int(steps),
+            spec_time_s=float(spec_time_s),
+            target_time_s=float(target_time_s),
+            target_tokens=int(target_tokens),
+        )
+    return output_ids, stats
+
+
+@torch.inference_mode()
+def speculative_decode(
+    *,
+    target: AutoModelForCausalLM,
+    speculator: Eagle3Speculator,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    spec_len: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+    use_cache: bool,
+    optimized: bool,
+    max_consecutive_misses: int = 2,
+) -> torch.Tensor:
+    output_ids, _ = speculative_decode_with_stats(
+        target=target,
+        speculator=speculator,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        spec_len=spec_len,
+        temperature=temperature,
+        top_p=top_p,
+        eos_token_id=eos_token_id,
+        use_cache=use_cache,
+        optimized=optimized,
+        max_consecutive_misses=max_consecutive_misses,
+    )
     return output_ids
+
+
+@torch.inference_mode()
+def speculative_decode_with_stats(
+    *,
+    target: AutoModelForCausalLM,
+    speculator: Eagle3Speculator,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    spec_len: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+    use_cache: bool,
+    optimized: bool,
+    max_consecutive_misses: int = 2,
+) -> Tuple[torch.Tensor, SpecStats]:
+    if isinstance(target, MiniLLMForCausalLM):
+        output_ids, stats = _speculative_decode_minillm(
+            target=target,
+            speculator=speculator,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            spec_len=spec_len,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            optimized=optimized,
+            max_consecutive_misses=max_consecutive_misses,
+            collect_stats=True,
+        )
+    else:
+        output_ids, stats = _speculative_decode_qwen3(
+            target=target,
+            speculator=speculator,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            spec_len=spec_len,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            use_cache=use_cache,
+            optimized=optimized,
+            max_consecutive_misses=max_consecutive_misses,
+            collect_stats=True,
+        )
+    if stats is None:
+        raise RuntimeError("Speculative decode stats missing")
+    return output_ids, stats
 
 
 def build_arg_parser(description: str) -> argparse.ArgumentParser:

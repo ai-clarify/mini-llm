@@ -18,7 +18,16 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from speculator.infer.mlx.common import _load_target, build_speculator
+from speculator.infer.mlx.common import (
+    _load_target,
+    _minillm_forward_hidden_states,
+    _project_logits_minillm,
+    _project_logits_qwen3,
+    _qwen3_forward_hidden_states,
+    _resolve_feature_layers,
+    build_speculator,
+    sample_next_token,
+)
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -114,31 +123,169 @@ class SyntheticChatDataset:
         )
 
 
-def _spec_loss(
-    logits_list: List[mx.array],
-    input_ids: mx.array,
+def _select_positions(
     loss_mask: mx.array,
     attention_mask: mx.array,
-) -> mx.array:
-    total_loss = mx.array(0.0, dtype=mx.float32)
-    total_tokens = mx.array(0.0, dtype=mx.float32)
-    for i, logits in enumerate(logits_list):
-        offset = i + 1
-        if input_ids.shape[1] <= offset:
-            continue
-        labels = input_ids[:, offset:]
-        pred = logits[:, :-offset, :]
-        label_mask = loss_mask[:, offset:] * attention_mask[:, offset:]
-        vocab = int(pred.shape[-1])
-        loss = nn.losses.cross_entropy(
-            pred.reshape(-1, vocab),
-            labels.reshape(-1),
-            reduction="none",
-        ).reshape(labels.shape)
-        total_loss = total_loss + mx.sum(loss * label_mask)
-        total_tokens = total_tokens + mx.sum(label_mask)
+    *,
+    spec_len: int,
+    rng: random.Random,
+) -> List[int]:
+    batch, seq_len = loss_mask.shape
+    positions: List[int] = []
+    limit = int(seq_len) - int(spec_len) - 1
+    for b in range(int(batch)):
+        valid: List[int] = []
+        for i in range(int(max(limit, 0))):
+            if float(loss_mask[b, i].item()) <= 0.0:
+                continue
+            ok = True
+            for j in range(1, int(spec_len) + 1):
+                if float(loss_mask[b, i + j].item()) <= 0.0:
+                    ok = False
+                    break
+                if float(attention_mask[b, i + j].item()) <= 0.0:
+                    ok = False
+                    break
+            if ok:
+                valid.append(i)
+        if valid:
+            positions.append(valid[rng.randrange(len(valid))])
+        else:
+            positions.append(-1)
+    return positions
 
-    denom = mx.maximum(total_tokens, mx.array(1.0, dtype=mx.float32))
+
+def _self_feed_prob(
+    *,
+    step: int,
+    max_steps: int,
+    offset: float,
+    start: float,
+    end: float,
+) -> float:
+    if max_steps <= 1:
+        base = float(end)
+    else:
+        progress = float(step) / float(max_steps)
+        base = float(start) + (float(end) - float(start)) * progress
+    return max(0.0, min(1.0, base * float(offset)))
+
+
+def _embed_tokens(target: nn.Module, token_ids: List[int]) -> Optional[mx.array]:
+    if not token_ids:
+        return None
+    token_arr = mx.array([token_ids], dtype=mx.int32)
+    return target.model.embed_tokens(token_arr)
+
+
+def _spec_loss_autoregressive(
+    *,
+    speculator: nn.Module,
+    target: nn.Module,
+    input_ids: mx.array,
+    attention_mask: mx.array,
+    loss_mask: mx.array,
+    spec_len: int,
+    step: int,
+    max_steps: int,
+    self_feed_start: float,
+    self_feed_end: float,
+    self_feed_temperature: float,
+    loss_decay: float,
+    rng: random.Random,
+    target_arch: str,
+    dtype: Any,
+) -> mx.array:
+    if target_arch == "minillm":
+        hidden, layer_hiddens = _minillm_forward_hidden_states(
+            target,
+            input_ids,
+            attention_mask=attention_mask,
+            layer_ids=speculator.feature_layers,
+        )
+    else:
+        hidden, layer_hiddens = _qwen3_forward_hidden_states(
+            target,
+            input_ids,
+            cache=None,
+            layer_ids=speculator.feature_layers,
+        )
+    hidden = mx.stop_gradient(hidden)
+    layer_hiddens = [mx.stop_gradient(h) for h in layer_hiddens]
+    if layer_hiddens and layer_hiddens[0].dtype != dtype:
+        layer_hiddens = [h.astype(dtype) for h in layer_hiddens]
+
+    total_loss = mx.array(0.0, dtype=mx.float32)
+    total_weight = mx.array(0.0, dtype=mx.float32)
+    positions = _select_positions(
+        loss_mask,
+        attention_mask,
+        spec_len=spec_len,
+        rng=rng,
+    )
+    for b, pos in enumerate(positions):
+        if pos < 0:
+            continue
+        context_hiddens = [h[b : b + 1, pos : pos + 1, :] for h in layer_hiddens]
+        fused_context = speculator.fuse(context_hiddens, attention_mask=None)
+        feed_tokens: List[int] = []
+        draft_tokens: List[int] = []
+        spec_logits_steps: List[mx.array] = []
+        for j in range(int(spec_len)):
+            token_embeds = _embed_tokens(target, feed_tokens)
+            logits = speculator.decode(fused_context=fused_context, token_embeds=token_embeds)
+            spec_logits_steps.append(logits)
+            pred_token = sample_next_token(
+                logits[0],
+                temperature=self_feed_temperature,
+                top_p=1.0,
+            )
+            draft_tokens.append(int(pred_token))
+            prob = _self_feed_prob(
+                step=step,
+                max_steps=max_steps,
+                offset=float(j + 1) / float(spec_len),
+                start=self_feed_start,
+                end=self_feed_end,
+            )
+            target_id = int(input_ids[b, pos + j + 1].item())
+            if rng.random() < prob:
+                feed_tokens.append(int(pred_token))
+            else:
+                feed_tokens.append(target_id)
+
+        context_ids = [int(x) for x in input_ids[b, : pos + 1].tolist()]
+        full_ids = context_ids + draft_tokens
+        full_arr = mx.array([full_ids], dtype=mx.int32)
+        if target_arch == "minillm":
+            target_hidden, _ = _minillm_forward_hidden_states(
+                target,
+                full_arr,
+                attention_mask=None,
+                layer_ids=speculator.feature_layers,
+            )
+            target_logits_full = _project_logits_minillm(target, target_hidden)
+        else:
+            target_hidden, _ = _qwen3_forward_hidden_states(
+                target,
+                full_arr,
+                cache=None,
+                layer_ids=speculator.feature_layers,
+            )
+            target_logits_full = _project_logits_qwen3(target, target_hidden)
+
+        start_idx = len(context_ids) - 1
+        target_logits = target_logits_full[:, start_idx : start_idx + int(spec_len), :]
+        for j, spec_logits in enumerate(spec_logits_steps):
+            tgt_logits = target_logits[:, j, :]
+            target_probs = mx.softmax(tgt_logits, axis=-1)
+            spec_log_probs = mx.log_softmax(spec_logits, axis=-1)
+            loss = -mx.sum(target_probs * spec_log_probs, axis=-1)[0]
+            weight = float(loss_decay) ** int(j)
+            total_loss = total_loss + (loss * weight)
+            total_weight = total_weight + weight
+
+    denom = mx.maximum(total_weight, mx.array(1.0, dtype=mx.float32))
     return total_loss / denom
 
 
@@ -165,9 +312,9 @@ def _auto_spec_config(param_count: Optional[int]) -> Tuple[int, int]:
         return 2, 2
     params_b = float(param_count) / 1e9
     if params_b <= 1.0:
-        return 2, 2
+        return 4, 2
     if params_b <= 3.0:
-        return 2, 2
+        return 3, 2
     if params_b <= 7.0:
         return 3, 2
     if params_b <= 13.0:
@@ -233,14 +380,7 @@ def _ensure_synth_data(args) -> None:
 
 
 def _count_tokens(loss_mask: mx.array, attention_mask: mx.array, *, spec_len: int) -> float:
-    tokens = 0.0
-    for i in range(int(spec_len)):
-        offset = i + 1
-        if loss_mask.shape[1] <= offset:
-            continue
-        mask = loss_mask[:, offset:] * attention_mask[:, offset:]
-        tokens += float(mx.sum(mask).item())
-    return tokens
+    return float(int(loss_mask.shape[0]) * int(spec_len))
 
 
 def save_optimizer_state(optimizer: optim.Optimizer, path: str) -> None:
@@ -354,6 +494,16 @@ def main() -> None:
     )
     parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
     parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
+    parser.add_argument(
+        "--feature_layers",
+        type=str,
+        default=None,
+        help="Comma-separated target layer indices for fusion (auto if unset).",
+    )
+    parser.add_argument("--self_feed_start", type=float, default=0.1)
+    parser.add_argument("--self_feed_end", type=float, default=0.9)
+    parser.add_argument("--self_feed_temperature", type=float, default=0.8)
+    parser.add_argument("--loss_decay", type=float, default=0.9)
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--min_samples", type=int, default=20000)
@@ -392,6 +542,16 @@ def main() -> None:
             args.spec_layers = int(resume_cfg["spec_layers"])
         if "head_rank" in resume_cfg:
             args.head_rank = resume_cfg["head_rank"]
+        if resume_cfg.get("feature_layers"):
+            args.feature_layers = ",".join(str(i) for i in resume_cfg["feature_layers"])
+        if "self_feed_start" in resume_cfg:
+            args.self_feed_start = float(resume_cfg["self_feed_start"])
+        if "self_feed_end" in resume_cfg:
+            args.self_feed_end = float(resume_cfg["self_feed_end"])
+        if "self_feed_temperature" in resume_cfg:
+            args.self_feed_temperature = float(resume_cfg["self_feed_temperature"])
+        if "loss_decay" in resume_cfg:
+            args.loss_decay = float(resume_cfg["loss_decay"])
 
     if not args.no_auto_generate:
         _ensure_synth_data(args)
@@ -441,11 +601,19 @@ def main() -> None:
         head_rank = None
     else:
         head_rank = int(args.head_rank)
+    parsed_layers: Optional[List[int]] = None
+    if args.feature_layers:
+        parsed_layers = [int(x) for x in str(args.feature_layers).split(",") if x.strip()]
+    if args.target_arch == "minillm":
+        feature_layers = _resolve_feature_layers(parsed_layers, num_layers=int(target.config.num_hidden_layers))
+    else:
+        feature_layers = _resolve_feature_layers(parsed_layers, num_layers=int(target.args.num_hidden_layers))
     speculator = build_speculator(
         target_arch=args.target_arch,
         target=target,
         spec_len=args.spec_len,
         spec_layers=args.spec_layers,
+        feature_layers=feature_layers,
         head_rank=head_rank,
     )
 
@@ -459,9 +627,10 @@ def main() -> None:
 
     trainable = _count_trainable_params(speculator.trainable_parameters())
     head_note = f" head_rank={head_rank}" if head_rank else ""
+    layer_note = ",".join(str(i) for i in feature_layers)
     print(
         f"[speculator] params={trainable / 1e6:.2f}M spec_len={args.spec_len} "
-        f"spec_layers={args.spec_layers}{head_note}"
+        f"spec_layers={args.spec_layers} feature_layers=[{layer_note}]{head_note}"
     )
 
     dataset = SyntheticChatDataset(Path(args.data_path), tokenizer, max_seq_len=args.max_seq_len)
@@ -475,16 +644,34 @@ def main() -> None:
         if opt_path.is_file():
             load_optimizer_state(optimizer, os.fspath(opt_path))
 
-    def loss_wrapped(input_ids: mx.array, attention_mask: mx.array, loss_mask: mx.array) -> mx.array:
-        if args.target_arch == "minillm":
-            hidden = target.model(input_ids, attention_mask=attention_mask)
-        else:
-            hidden = target.model(input_ids, cache=None)
-        hidden = mx.stop_gradient(hidden)
-        if hidden.dtype != dtype:
-            hidden = hidden.astype(dtype)
-        logits_list = speculator(hidden, attention_mask=attention_mask)
-        return _spec_loss(logits_list, input_ids, loss_mask, attention_mask)
+    def loss_wrapped(
+        input_ids: mx.array,
+        attention_mask: mx.array,
+        loss_mask: mx.array,
+        *,
+        step: int,
+        max_steps: int,
+        rng: random.Random,
+    ) -> mx.array:
+        if input_ids.dtype != mx.int32:
+            input_ids = input_ids.astype(mx.int32)
+        return _spec_loss_autoregressive(
+            speculator=speculator,
+            target=target,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            loss_mask=loss_mask,
+            spec_len=args.spec_len,
+            step=step,
+            max_steps=max_steps,
+            self_feed_start=args.self_feed_start,
+            self_feed_end=args.self_feed_end,
+            self_feed_temperature=args.self_feed_temperature,
+            loss_decay=args.loss_decay,
+            rng=rng,
+            target_arch=args.target_arch,
+            dtype=dtype,
+        )
 
     value_and_grad = nn.value_and_grad(speculator, loss_wrapped)
 
@@ -498,6 +685,7 @@ def main() -> None:
         "max_seq_len": args.max_seq_len,
         "spec_len": args.spec_len,
         "spec_layers": args.spec_layers,
+        "feature_layers": feature_layers,
         "head_rank": head_rank,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
@@ -506,6 +694,10 @@ def main() -> None:
         "dtype": args.dtype,
         "early_stop_loss": args.early_stop_loss,
         "early_stop_patience": args.early_stop_patience,
+        "self_feed_start": args.self_feed_start,
+        "self_feed_end": args.self_feed_end,
+        "self_feed_temperature": args.self_feed_temperature,
+        "loss_decay": args.loss_decay,
     }
     (out_dir / "speculator_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -531,12 +723,21 @@ def main() -> None:
             grad_accum = mlx_utils.tree_map(lambda p: p, grad_template)
             tokens_seen = 0.0
 
-            for _ in range(accum_steps):
+            for accum_idx in range(accum_steps):
                 input_ids, attention_mask, loss_mask = dataset.sample_batch(
                     batch_size=args.batch_size, rng=rng
                 )
                 tokens_seen += _count_tokens(loss_mask, attention_mask, spec_len=args.spec_len)
-                loss, grads = value_and_grad(input_ids, attention_mask, loss_mask)
+                step_seed = int(args.seed) + (int(step) * int(accum_steps)) + int(accum_idx)
+                step_rng = random.Random(step_seed)
+                loss, grads = value_and_grad(
+                    input_ids,
+                    attention_mask,
+                    loss_mask,
+                    step=step,
+                    max_steps=int(args.max_steps),
+                    rng=step_rng,
+                )
                 loss_sum = loss_sum + loss.astype(mx.float32)
                 grad_accum = mlx_utils.tree_map(lambda a, b: a + b, grad_accum, grads)
 

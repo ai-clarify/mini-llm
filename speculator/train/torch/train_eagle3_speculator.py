@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import random
 import subprocess
 import sys
 import time
@@ -9,7 +10,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -19,6 +19,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
+from speculator.infer.torch.common import (
+    Eagle3Speculator,
+    _count_params_torch,
+    _extract_hidden_layers,
+    _minillm_forward_hidden_states,
+    _project_logits_minillm,
+    _resolve_dtype,
+    _resolve_feature_layers,
+    _resolve_spec_config,
+    sample_next_token,
+)
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -88,16 +99,16 @@ class SyntheticChatDataset(Dataset):
             full_ids = full_ids[: self.max_seq_len]
 
         attention_mask = [1] * len(full_ids)
-        loss_mask = [0] * len(full_ids)
+        loss_mask = [0.0] * len(full_ids)
         start = min(len(prompt_ids), len(full_ids))
         for i in range(start, len(full_ids)):
-            loss_mask[i] = 1
+            loss_mask[i] = 1.0
 
         pad_len = self.max_seq_len - len(full_ids)
         if pad_len > 0:
             full_ids += [self.pad_id] * pad_len
             attention_mask += [0] * pad_len
-            loss_mask += [0] * pad_len
+            loss_mask += [0.0] * pad_len
 
         return (
             torch.tensor(full_ids, dtype=torch.long),
@@ -106,145 +117,192 @@ class SyntheticChatDataset(Dataset):
         )
 
 
-class LowRankHead(nn.Module):
-    def __init__(self, *, hidden_size: int, vocab_size: int, rank: int) -> None:
-        super().__init__()
-        self.proj = nn.Linear(hidden_size, int(rank), bias=False)
-        self.out = nn.Linear(int(rank), vocab_size, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.out(self.proj(x))
-
-
-class Eagle3Speculator(nn.Module):
-    def __init__(
-        self,
-        *,
-        hidden_size: int,
-        vocab_size: int,
-        spec_len: int,
-        spec_layers: int,
-        spec_heads: int,
-        dropout: float,
-        init_weight: Optional[torch.Tensor],
-        head_rank: Optional[int] = None,
-    ) -> None:
-        super().__init__()
-        self.layers = nn.ModuleList(
-            [
-                nn.TransformerEncoderLayer(
-                    d_model=hidden_size,
-                    nhead=spec_heads,
-                    dim_feedforward=hidden_size * 4,
-                    dropout=dropout,
-                    activation="gelu",
-                    batch_first=True,
-                    norm_first=True,
-                )
-                for _ in range(int(spec_layers))
-            ]
-        )
-        self.norm = nn.LayerNorm(hidden_size)
-        rank = int(head_rank) if head_rank is not None and int(head_rank) > 0 else 0
-        if rank > 0:
-            self.heads = nn.ModuleList(
-                [LowRankHead(hidden_size=hidden_size, vocab_size=vocab_size, rank=rank) for _ in range(int(spec_len))]
-            )
-        else:
-            self.heads = nn.ModuleList([nn.Linear(hidden_size, vocab_size, bias=False) for _ in range(int(spec_len))])
-            if init_weight is not None:
-                for head in self.heads:
-                    head.weight.data.copy_(init_weight)
-
-    def forward(self, hidden: torch.Tensor, attention_mask: Optional[torch.Tensor]) -> List[torch.Tensor]:
-        x = hidden
-        key_padding_mask = None
-        if attention_mask is not None:
-            key_padding_mask = attention_mask == 0
-        seq_len = x.shape[1]
-        causal_mask = None
-        if seq_len > 1:
-            # Prevent peeking at future positions during multi-token training.
-            causal_mask = torch.triu(torch.ones((seq_len, seq_len), device=x.device, dtype=torch.bool), diagonal=1)
-        for layer in self.layers:
-            x = layer(x, src_mask=causal_mask, src_key_padding_mask=key_padding_mask)
-        x = self.norm(x)
-        return [head(x) for head in self.heads]
-
-
-def _spec_loss(
-    logits_list: List[torch.Tensor],
-    input_ids: torch.Tensor,
+def _select_positions(
     loss_mask: torch.Tensor,
     attention_mask: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    total_loss = torch.tensor(0.0, device=input_ids.device)
-    total_tokens = torch.tensor(0.0, device=input_ids.device)
-    vocab_size = logits_list[0].shape[-1] if logits_list else 0
-    for i, logits in enumerate(logits_list):
-        offset = i + 1
-        if input_ids.shape[1] <= offset:
-            continue
-        labels = input_ids[:, offset:]
-        pred = logits[:, :-offset, :]
-        label_mask = loss_mask[:, offset:] * attention_mask[:, offset:]
-        if label_mask.sum() == 0:
-            continue
-        loss = F.cross_entropy(pred.reshape(-1, vocab_size), labels.reshape(-1), reduction="none")
-        loss = loss.view_as(labels)
-        total_loss += (loss * label_mask).sum()
-        total_tokens += label_mask.sum()
-    if total_tokens.item() == 0:
-        return total_loss, total_tokens
-    return total_loss / total_tokens, total_tokens
+    *,
+    spec_len: int,
+    rng: random.Random,
+) -> List[int]:
+    batch, seq_len = loss_mask.shape
+    positions: List[int] = []
+    limit = int(seq_len) - int(spec_len) - 1
+    for b in range(int(batch)):
+        valid: List[int] = []
+        for i in range(int(max(limit, 0))):
+            if float(loss_mask[b, i].item()) <= 0.0:
+                continue
+            ok = True
+            for j in range(1, int(spec_len) + 1):
+                if float(loss_mask[b, i + j].item()) <= 0.0:
+                    ok = False
+                    break
+                if float(attention_mask[b, i + j].item()) <= 0.0:
+                    ok = False
+                    break
+            if ok:
+                valid.append(i)
+        if valid:
+            positions.append(valid[rng.randrange(len(valid))])
+        else:
+            positions.append(-1)
+    return positions
 
 
-def _resolve_dtype(name: str) -> torch.dtype:
-    name = str(name).lower()
-    if name == "float16":
-        return torch.float16
-    if name == "bfloat16":
-        return torch.bfloat16
-    if name == "float32":
-        return torch.float32
-    raise ValueError(f"Unsupported dtype: {name}")
+def _self_feed_prob(
+    *,
+    step: int,
+    max_steps: int,
+    offset: float,
+    start: float,
+    end: float,
+) -> float:
+    if max_steps <= 1:
+        base = float(end)
+    else:
+        progress = float(step) / float(max_steps)
+        base = float(start) + (float(end) - float(start)) * progress
+    return max(0.0, min(1.0, base * float(offset)))
 
 
-def _count_params_torch(model: nn.Module) -> Optional[int]:
-    try:
-        return int(sum(p.numel() for p in model.parameters()))
-    except Exception:
+def _embed_tokens(target: AutoModelForCausalLM, token_ids: List[int]) -> Optional[torch.Tensor]:
+    if not token_ids:
         return None
+    device = next(target.parameters()).device
+    token_tensor = torch.tensor([token_ids], device=device, dtype=torch.long)
+    return target.get_input_embeddings()(token_tensor)
 
 
-def _auto_spec_config(param_count: Optional[int]) -> Tuple[int, int]:
-    if not param_count or param_count <= 0:
-        return 2, 2
-    params_b = float(param_count) / 1e9
-    if params_b <= 1.0:
-        return 2, 2
-    if params_b <= 3.0:
-        return 2, 2
-    if params_b <= 7.0:
-        return 3, 2
-    if params_b <= 13.0:
-        return 4, 2
-    return 5, 2
+def _qwen3_forward_hidden_states(
+    target: AutoModelForCausalLM,
+    input_ids: torch.Tensor,
+    *,
+    attention_mask: Optional[torch.Tensor],
+    layer_ids: List[int],
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    out = target(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+        output_hidden_states=True,
+        return_dict=True,
+    )
+    return out.last_hidden_state, _extract_hidden_layers(out, layer_ids)
 
 
-def _resolve_spec_config(
-    spec_len: Optional[int], spec_layers: Optional[int], *, param_count: Optional[int]
-) -> Tuple[int, int]:
-    auto_len, auto_layers = _auto_spec_config(param_count)
-    if spec_len is None or int(spec_len) <= 0:
-        spec_len = auto_len
-    if spec_layers is None or int(spec_layers) <= 0:
-        spec_layers = auto_layers
-    return int(spec_len), int(spec_layers)
+def _spec_loss_autoregressive(
+    *,
+    speculator: Eagle3Speculator,
+    target: AutoModelForCausalLM,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    loss_mask: torch.Tensor,
+    spec_len: int,
+    step: int,
+    max_steps: int,
+    self_feed_start: float,
+    self_feed_end: float,
+    self_feed_temperature: float,
+    loss_decay: float,
+    rng: random.Random,
+    target_arch: str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    device = input_ids.device
+    with torch.no_grad():
+        if target_arch == "minillm":
+            hidden, layer_hiddens = _minillm_forward_hidden_states(
+                target,
+                input_ids,
+                attention_mask=attention_mask,
+                layer_ids=speculator.feature_layers,
+            )
+        else:
+            hidden, layer_hiddens = _qwen3_forward_hidden_states(
+                target,
+                input_ids,
+                attention_mask=attention_mask,
+                layer_ids=speculator.feature_layers,
+            )
+    if layer_hiddens and layer_hiddens[0].dtype != dtype:
+        layer_hiddens = [h.to(dtype) for h in layer_hiddens]
+
+    total_loss = torch.tensor(0.0, device=device)
+    total_weight = torch.tensor(0.0, device=device)
+    positions = _select_positions(
+        loss_mask,
+        attention_mask,
+        spec_len=spec_len,
+        rng=rng,
+    )
+    for b, pos in enumerate(positions):
+        if pos < 0:
+            continue
+        context_hiddens = [h[b : b + 1, pos : pos + 1, :] for h in layer_hiddens]
+        fused_context = speculator.fuse(context_hiddens, attention_mask=None)
+        feed_tokens: List[int] = []
+        draft_tokens: List[int] = []
+        spec_logits_steps: List[torch.Tensor] = []
+        for j in range(int(spec_len)):
+            token_embeds = _embed_tokens(target, feed_tokens)
+            logits = speculator.decode(fused_context=fused_context, token_embeds=token_embeds)
+            spec_logits_steps.append(logits)
+            pred_token = sample_next_token(
+                logits[0],
+                temperature=self_feed_temperature,
+                top_p=1.0,
+            )
+            draft_tokens.append(int(pred_token))
+            prob = _self_feed_prob(
+                step=step,
+                max_steps=max_steps,
+                offset=float(j + 1) / float(spec_len),
+                start=self_feed_start,
+                end=self_feed_end,
+            )
+            target_id = int(input_ids[b, pos + j + 1].item())
+            if rng.random() < prob:
+                feed_tokens.append(int(pred_token))
+            else:
+                feed_tokens.append(target_id)
+
+        context_ids = [int(x) for x in input_ids[b, : pos + 1].tolist()]
+        full_ids = context_ids + draft_tokens
+        full_tensor = torch.tensor([full_ids], device=device, dtype=torch.long)
+        with torch.no_grad():
+            if target_arch == "minillm":
+                target_hidden, _ = _minillm_forward_hidden_states(
+                    target,
+                    full_tensor,
+                    attention_mask=None,
+                    layer_ids=speculator.feature_layers,
+                )
+                target_logits_full = _project_logits_minillm(target, target_hidden)
+            else:
+                out = target(
+                    input_ids=full_tensor,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                target_logits_full = out.logits
+
+        start_idx = len(context_ids) - 1
+        target_logits = target_logits_full[:, start_idx : start_idx + int(spec_len), :]
+        for j, spec_logits in enumerate(spec_logits_steps):
+            tgt_logits = target_logits[:, j, :]
+            target_probs = torch.softmax(tgt_logits.float(), dim=-1)
+            spec_log_probs = torch.log_softmax(spec_logits.float(), dim=-1)
+            loss = -(target_probs * spec_log_probs).sum(dim=-1)[0]
+            weight = float(loss_decay) ** int(j)
+            total_loss = total_loss + (loss * weight)
+            total_weight = total_weight + weight
+
+    denom = torch.clamp(total_weight, min=1.0)
+    return total_loss / denom
 
 
-def _default_head_rank(hidden_size: int) -> int:
-    return max(32, min(256, int(hidden_size) // 8))
+def _count_tokens(*, batch_size: int, spec_len: int) -> float:
+    return float(int(batch_size) * int(spec_len))
 
 
 def _save_checkpoint(
@@ -252,13 +310,57 @@ def _save_checkpoint(
 ) -> None:
     ckpt_dir = out_dir / "checkpoints" / f"step_{step:08d}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(speculator.state_dict(), ckpt_dir / "speculator.pt")
-    torch.save(optimizer.state_dict(), ckpt_dir / "optimizer.pt")
+    model_path = ckpt_dir / "speculator.pt"
+    tmp_model = Path(os.fspath(model_path) + ".tmp")
+    torch.save(speculator.state_dict(), tmp_model)
+    os.replace(tmp_model, model_path)
+    opt_path = ckpt_dir / "optimizer.pt"
+    tmp_opt = Path(os.fspath(opt_path) + ".tmp")
+    torch.save(optimizer.state_dict(), tmp_opt)
+    os.replace(tmp_opt, opt_path)
     (ckpt_dir / "train_state.json").write_text(
         json.dumps({"step": step, "timestamp": time.time()}, indent=2),
         encoding="utf-8",
     )
     print(f"[ckpt] saved {ckpt_dir}")
+
+
+def _find_latest_checkpoint(out_dir: Path) -> Optional[Tuple[int, Path]]:
+    ckpt_root = out_dir / "checkpoints"
+    if not ckpt_root.is_dir():
+        return None
+    best_step = -1
+    best_dir: Optional[Path] = None
+    for child in ckpt_root.iterdir():
+        if not child.is_dir() or not child.name.startswith("step_"):
+            continue
+        try:
+            step = int(child.name.split("_", 1)[1])
+        except ValueError:
+            continue
+        if not (child / "speculator.pt").is_file():
+            continue
+        if step > best_step:
+            best_step = step
+            best_dir = child
+    if best_dir is None:
+        return None
+    return best_step, best_dir
+
+
+def _load_train_state_step(ckpt_dir: Path, *, fallback: int) -> int:
+    state_path = ckpt_dir / "train_state.json"
+    if not state_path.is_file():
+        return fallback
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    return int(state.get("step", fallback))
+
+
+def _load_speculator_config(out_dir: Path) -> Optional[Dict[str, Any]]:
+    cfg_path = out_dir / "speculator_config.json"
+    if not cfg_path.is_file():
+        return None
+    return json.loads(cfg_path.read_text(encoding="utf-8"))
 
 
 def _load_minillm_config(path: Optional[str]) -> MiniLLMConfig:
@@ -270,30 +372,6 @@ def _load_minillm_config(path: Optional[str]) -> MiniLLMConfig:
     if not isinstance(data, dict):
         raise ValueError(f"MiniLLM config must be a JSON object: {cfg_path}")
     return MiniLLMConfig(**data)
-
-
-def _forward_hidden_qwen3(
-    target: nn.Module, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor]
-) -> torch.Tensor:
-    out = target.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=False,
-        output_hidden_states=True,
-        return_dict=True,
-    )
-    return out.last_hidden_state
-
-
-def _forward_hidden_minillm(
-    target: nn.Module, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor]
-) -> torch.Tensor:
-    hidden, _, _ = target.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        use_cache=False,
-    )
-    return hidden
 
 
 def _ensure_synth_data(args) -> None:
@@ -333,6 +411,10 @@ def _infinite_loader(loader: DataLoader):
     while True:
         for batch in loader:
             yield batch
+
+
+def _default_head_rank(hidden_size: int) -> int:
+    return max(32, min(256, int(hidden_size) // 8))
 
 
 def main() -> None:
@@ -379,6 +461,16 @@ def main() -> None:
     parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
     parser.add_argument("--spec_heads", type=int, default=0)
     parser.add_argument("--spec_dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--feature_layers",
+        type=str,
+        default=None,
+        help="Comma-separated target layer indices for fusion (auto if unset).",
+    )
+    parser.add_argument("--self_feed_start", type=float, default=0.1)
+    parser.add_argument("--self_feed_end", type=float, default=0.9)
+    parser.add_argument("--self_feed_temperature", type=float, default=0.8)
+    parser.add_argument("--loss_decay", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--min_samples", type=int, default=20000)
 
@@ -390,17 +482,48 @@ def main() -> None:
     parser.add_argument("--gen_temperature", type=float, default=0.2)
     parser.add_argument("--gen_top_p", type=float, default=0.95)
     parser.add_argument("--no_auto_generate", action="store_true")
+    parser.add_argument("--no_resume", action="store_true")
     args = parser.parse_args()
 
     torch.manual_seed(int(args.seed))
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(int(args.seed))
 
-    if not args.no_auto_generate:
-        _ensure_synth_data(args)
-
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    resume_dir: Optional[Path] = None
+    resume_step = 0
+    resume_cfg: Optional[Dict[str, Any]] = None
+    if not args.no_resume:
+        resume_info = _find_latest_checkpoint(out_dir)
+        if resume_info is not None:
+            resume_step, resume_dir = resume_info
+            resume_step = _load_train_state_step(resume_dir, fallback=resume_step)
+            resume_cfg = _load_speculator_config(out_dir)
+
+    if resume_cfg is not None:
+        if resume_cfg.get("spec_len") is not None:
+            args.spec_len = int(resume_cfg["spec_len"])
+        if resume_cfg.get("spec_layers") is not None:
+            args.spec_layers = int(resume_cfg["spec_layers"])
+        if resume_cfg.get("spec_heads") is not None:
+            args.spec_heads = int(resume_cfg["spec_heads"])
+        if "head_rank" in resume_cfg:
+            args.head_rank = resume_cfg["head_rank"]
+        if resume_cfg.get("feature_layers"):
+            args.feature_layers = ",".join(str(i) for i in resume_cfg["feature_layers"])
+        if "self_feed_start" in resume_cfg:
+            args.self_feed_start = float(resume_cfg["self_feed_start"])
+        if "self_feed_end" in resume_cfg:
+            args.self_feed_end = float(resume_cfg["self_feed_end"])
+        if "self_feed_temperature" in resume_cfg:
+            args.self_feed_temperature = float(resume_cfg["self_feed_temperature"])
+        if "loss_decay" in resume_cfg:
+            args.loss_decay = float(resume_cfg["loss_decay"])
+
+    if not args.no_auto_generate:
+        _ensure_synth_data(args)
 
     dtype = _resolve_dtype(args.dtype)
     device = torch.device(args.device)
@@ -471,22 +594,33 @@ def main() -> None:
         head_rank = None
     else:
         head_rank = int(args.head_rank)
+
+    parsed_layers: Optional[List[int]] = None
+    if args.feature_layers:
+        parsed_layers = [int(x) for x in str(args.feature_layers).split(",") if x.strip()]
+    feature_layers = _resolve_feature_layers(parsed_layers, num_layers=int(target.config.num_hidden_layers))
+
     speculator = Eagle3Speculator(
         hidden_size=hidden_size,
         vocab_size=vocab_size,
-        spec_len=args.spec_len,
         spec_layers=args.spec_layers,
         spec_heads=spec_heads,
         dropout=args.spec_dropout,
+        feature_layers=feature_layers,
         init_weight=init_weight,
         head_rank=head_rank,
     ).to(device)
 
+    if resume_dir is not None:
+        speculator.load_state_dict(torch.load(resume_dir / "speculator.pt", map_location=device))
+        print(f"[resume] step={resume_step} from {resume_dir}")
+
     trainable = sum(p.numel() for p in speculator.parameters() if p.requires_grad)
     head_note = f" head_rank={head_rank}" if head_rank else ""
+    layer_note = ",".join(str(i) for i in feature_layers)
     print(
         f"[speculator] params={trainable / 1e6:.2f}M spec_len={args.spec_len} "
-        f"spec_layers={args.spec_layers}{head_note}"
+        f"spec_layers={args.spec_layers} feature_layers=[{layer_note}]{head_note}"
     )
 
     dataset = SyntheticChatDataset(Path(args.data_path), tokenizer, max_seq_len=args.max_seq_len)
@@ -494,6 +628,10 @@ def main() -> None:
     data_iter = _infinite_loader(loader)
 
     optimizer = torch.optim.AdamW(speculator.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    if resume_dir is not None:
+        opt_path = resume_dir / "optimizer.pt"
+        if opt_path.is_file():
+            optimizer.load_state_dict(torch.load(opt_path, map_location=device))
 
     use_amp = device.type == "cuda" and dtype in (torch.float16, torch.bfloat16)
     amp_dtype = dtype if dtype in (torch.float16, torch.bfloat16) else torch.float32
@@ -510,6 +648,7 @@ def main() -> None:
         "spec_len": args.spec_len,
         "spec_layers": args.spec_layers,
         "spec_heads": spec_heads,
+        "feature_layers": feature_layers,
         "head_rank": head_rank,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
@@ -518,6 +657,10 @@ def main() -> None:
         "dtype": args.dtype,
         "early_stop_loss": args.early_stop_loss,
         "early_stop_patience": args.early_stop_patience,
+        "self_feed_start": args.self_feed_start,
+        "self_feed_end": args.self_feed_end,
+        "self_feed_temperature": args.self_feed_temperature,
+        "loss_decay": args.loss_decay,
     }
     (out_dir / "speculator_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
@@ -532,32 +675,62 @@ def main() -> None:
     if early_stop_loss is not None and early_stop_patience <= 0:
         early_stop_patience = 1
     early_stop_hits = 0
-    last_step = 0
-    try:
-        for step in range(1, int(args.max_steps) + 1):
-            input_ids, attention_mask, loss_mask = next(data_iter)
-            input_ids = input_ids.to(device)
-            attention_mask = attention_mask.to(device)
-            loss_mask = loss_mask.to(device)
-            with torch.no_grad():
-                if args.target_arch == "minillm":
-                    hidden = _forward_hidden_minillm(target, input_ids, attention_mask)
-                else:
-                    hidden = _forward_hidden_qwen3(target, input_ids, attention_mask)
 
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                logits_list = speculator(hidden, attention_mask)
-                loss, tokens = _spec_loss(logits_list, input_ids, loss_mask, attention_mask)
-                if tokens.item() == 0:
-                    continue
-                loss = loss / accum_steps
+    last_step = resume_step
+    if resume_step >= int(args.max_steps):
+        print(f"[resume] step={resume_step} >= max_steps={int(args.max_steps)}; nothing to do.")
+        return
+    try:
+        for step in range(resume_step + 1, int(args.max_steps) + 1):
+            loss_sum = 0.0
+            tokens_seen = 0.0
+            for accum_idx in range(accum_steps):
+                input_ids, attention_mask, loss_mask = next(data_iter)
+                input_ids = input_ids.to(device)
+                attention_mask = attention_mask.to(device)
+                loss_mask = loss_mask.to(device)
+                tokens_seen += _count_tokens(batch_size=input_ids.shape[0], spec_len=args.spec_len)
+                step_seed = int(args.seed) + (int(step) * int(accum_steps)) + int(accum_idx)
+                step_rng = random.Random(step_seed)
+
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+                    loss = _spec_loss_autoregressive(
+                        speculator=speculator,
+                        target=target,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        loss_mask=loss_mask,
+                        spec_len=args.spec_len,
+                        step=step,
+                        max_steps=int(args.max_steps),
+                        self_feed_start=args.self_feed_start,
+                        self_feed_end=args.self_feed_end,
+                        self_feed_temperature=args.self_feed_temperature,
+                        loss_decay=args.loss_decay,
+                        rng=step_rng,
+                        target_arch=args.target_arch,
+                        dtype=dtype,
+                    )
+                    loss = loss / float(accum_steps)
+
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+                loss_sum += float(loss.item() * float(accum_steps))
 
             if scaler.is_enabled():
-                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(speculator.parameters(), args.grad_clip)
+            if scaler.is_enabled():
+                scaler.step(optimizer)
+                scaler.update()
             else:
-                loss.backward()
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
 
-            loss_val = float(loss.item() * accum_steps)
+            loss_val = loss_sum / float(accum_steps)
             stop_training = False
             if early_stop_loss is not None:
                 if loss_val <= float(early_stop_loss):
@@ -571,21 +744,9 @@ def main() -> None:
                 else:
                     early_stop_hits = 0
 
-            if step % accum_steps == 0:
-                if scaler.is_enabled():
-                    scaler.unscale_(optimizer)
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(speculator.parameters(), args.grad_clip)
-                if scaler.is_enabled():
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-
             if step % args.log_interval == 0:
                 elapsed = time.time() - start_time
-                tok_s = tokens.item() / max(elapsed, 1e-6)
+                tok_s = tokens_seen / max(elapsed, 1e-6)
                 print(f"[train] step={step} loss={loss_val:.4f} tok/s={tok_s:.2f}")
                 start_time = time.time()
 

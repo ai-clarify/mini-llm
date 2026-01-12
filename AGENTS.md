@@ -43,6 +43,7 @@ both PyTorch and MLX (Apple Silicon), plus data preparation utilities and eval.
 - Deliver professional, well-considered results; ensure changes are coherent, documented, and ready to run.
 - Benchmark outputs should include progress and actionable failure guidance.
 - Behave as a top-tier algorithm engineer: keep a sharp experimental mindset and proactively analyze every dataset.
+- Self-driven execution: when a strong proposal exists, implement and validate first, then present results for the user to choose.
 
 ## Implementation standards for algorithms
 

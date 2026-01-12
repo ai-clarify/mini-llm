@@ -188,7 +188,7 @@ def main() -> None:
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=32)
     parser.add_argument("--max_new_tokens", type=int, default=1024)
-    parser.add_argument("--temperature", type=float, default=0.5)
+    parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument(
         "--spec_len",
@@ -275,9 +275,11 @@ def main() -> None:
         )
     completed = 0
 
+    prompt_count = len(prompt_inputs)
     for round_idx in range(int(args.rounds)):
-        mx.random.seed(int(args.seed) + int(round_idx))
-        for input_ids in prompt_inputs:
+        for prompt_idx, input_ids in enumerate(prompt_inputs):
+            seed_base = int(args.seed) + (int(round_idx) * prompt_count) + int(prompt_idx)
+            mx.random.seed(seed_base)
             if args.target_arch == "minillm":
                 baseline = _run_baseline_minillm(
                     target=target,
@@ -299,6 +301,7 @@ def main() -> None:
             baseline_results.append(baseline)
 
             if speculator is not None:
+                mx.random.seed(seed_base)
                 if args.target_arch == "minillm":
                     spec = _run_spec_minillm(
                         target=target,
@@ -374,14 +377,16 @@ def main() -> None:
 
     if spec_results:
         spec_stats = summarize(spec_results)
-        speedup = base_stats["total_time_s"] / max(spec_stats["total_time_s"], 1e-6)
+        speedup_tok = spec_stats["tok_per_s"] / max(base_stats["tok_per_s"], 1e-6)
         accept_stats = summarize_acceptance(spec_results)
         token_stats = summarize_tokens(spec_results)
         timing_stats = summarize_timing(spec_results)
+        target_per_out = token_stats["target_tokens"] / max(spec_stats["output_tokens"], 1e-6)
+        draft_per_out = token_stats["draft_tokens"] / max(spec_stats["output_tokens"], 1e-6)
         print(
             f"[bench] spec_len={spec_len} output_tokens={spec_stats['output_tokens']:.0f} "
             f"time_s={spec_stats['total_time_s']:.2f} tok/s={spec_stats['tok_per_s']:.2f} "
-            f"speedup={speedup:.2f}x"
+            f"speedup_tok/s={speedup_tok:.2f}x"
         )
         print(
             f"[bench] acceptance mean={accept_stats['mean_accept']:.2f} "
@@ -395,9 +400,10 @@ def main() -> None:
             f"target={timing_stats['target_time_s']:.2f} other={other_time:.2f}"
         )
         print(
-            f"[bench] tokens baseline={base_stats['output_tokens']:.0f} "
-            f"draft={token_stats['draft_tokens']:.0f} "
-            f"target={token_stats['target_tokens']:.0f}"
+            f"[bench] tokens baseline_out={base_stats['output_tokens']:.0f} "
+            f"draft_proposed={token_stats['draft_tokens']:.0f} "
+            f"target_eval={token_stats['target_tokens']:.0f} "
+            f"target/out={target_per_out:.2f} draft/out={draft_per_out:.2f}"
         )
 
 

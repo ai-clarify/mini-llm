@@ -77,9 +77,9 @@ def _auto_spec_config(param_count: Optional[int]) -> Tuple[int, int]:
         return 2, 2
     params_b = float(param_count) / 1e9
     if params_b <= 1.0:
-        return 2, 2
+        return 4, 2
     if params_b <= 3.0:
-        return 2, 2
+        return 3, 2
     if params_b <= 7.0:
         return 3, 2
     if params_b <= 13.0:
@@ -96,6 +96,26 @@ def _resolve_spec_config(
     if spec_layers is None or int(spec_layers) <= 0:
         spec_layers = auto_layers
     return int(spec_len), int(spec_layers)
+
+
+def _select_feature_layers(num_layers: int, *, count: int = 4) -> List[int]:
+    if num_layers <= 0:
+        return []
+    if num_layers <= count:
+        return list(range(int(num_layers)))
+    step = (num_layers - 1) / float(count - 1)
+    layers = [int(round(step * i)) for i in range(int(count))]
+    selected: List[int] = []
+    for idx in layers:
+        if not selected or idx != selected[-1]:
+            selected.append(idx)
+    return selected
+
+
+def _resolve_feature_layers(feature_layers: Optional[List[int]], *, num_layers: int) -> List[int]:
+    if feature_layers:
+        return [int(i) for i in feature_layers]
+    return _select_feature_layers(num_layers)
 
 
 def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_generation_prompt: bool) -> str:
@@ -130,6 +150,32 @@ def sample_next_token(logits: mx.array, *, temperature: float, top_p: float) -> 
     return int(sorted_idx[picked_i].item())
 
 
+def _sample_next_token_batch(logits: mx.array, *, temperature: float, top_p: float) -> mx.array:
+    """Sample tokens from batched logits. Time O(kV) best/avg/worst, O(kV log V) when top_p<1; space O(kV)."""
+    if int(logits.size) == 0:
+        return mx.array([], dtype=mx.int32)
+    logits = logits.reshape(int(logits.shape[0]), -1)
+    if temperature <= 0:
+        return mx.argmax(logits, axis=-1)
+    scaled = logits / float(temperature)
+    if top_p >= 1.0:
+        return mx.random.categorical(scaled, axis=-1)
+
+    sorted_idx = mx.argsort(-scaled, axis=-1)
+    sorted_logits = mx.take_along_axis(scaled, sorted_idx, axis=-1)
+    sorted_probs = mx.softmax(sorted_logits, axis=-1)
+    cumprobs = mx.cumsum(sorted_probs, axis=-1)
+    keep_prefix = mx.concatenate(
+        [mx.ones((int(logits.shape[0]), 1), dtype=mx.bool_), cumprobs[:, :-1] <= float(top_p)],
+        axis=-1,
+    )
+    neg_inf = mx.array(-1e9, dtype=sorted_logits.dtype)
+    filtered_logits = mx.where(keep_prefix, sorted_logits, neg_inf)
+    picked = mx.random.categorical(filtered_logits, axis=-1)
+    tokens = mx.take_along_axis(sorted_idx, picked[:, None], axis=-1).squeeze(-1)
+    return tokens
+
+
 def _token_prob_from_logits(
     logits: mx.array,
     token: int,
@@ -160,37 +206,73 @@ def _token_prob_from_logits(
     return float(prob.item())
 
 
+def _token_probs_from_logits_batch(
+    logits: mx.array,
+    tokens: mx.array,
+    *,
+    temperature: float,
+    top_p: float,
+) -> mx.array:
+    """Token probs for batched logits. Time O(kV) best/avg/worst, O(kV log V) when top_p<1; space O(kV)."""
+    if int(logits.size) == 0:
+        return mx.array([], dtype=mx.float32)
+    logits = logits.reshape(int(logits.shape[0]), -1)
+    tokens = tokens.reshape(-1)
+    if temperature <= 0:
+        argmax = mx.argmax(logits, axis=-1)
+        return mx.where(argmax == tokens, mx.ones_like(tokens, dtype=mx.float32), mx.zeros_like(tokens, dtype=mx.float32))
+
+    scaled = logits / float(temperature)
+    if top_p >= 1.0:
+        probs = mx.softmax(scaled, axis=-1)
+        return mx.take_along_axis(probs, tokens[:, None], axis=-1).squeeze(-1)
+
+    sorted_idx = mx.argsort(-scaled, axis=-1)
+    sorted_logits = mx.take_along_axis(scaled, sorted_idx, axis=-1)
+    sorted_probs = mx.softmax(sorted_logits, axis=-1)
+    cumprobs = mx.cumsum(sorted_probs, axis=-1)
+    keep_prefix = mx.concatenate(
+        [mx.ones((int(logits.shape[0]), 1), dtype=mx.bool_), cumprobs[:, :-1] <= float(top_p)],
+        axis=-1,
+    )
+    neg_inf = mx.array(-1e9, dtype=sorted_logits.dtype)
+    filtered_logits = mx.where(keep_prefix, sorted_logits, neg_inf)
+    filtered_probs = mx.softmax(filtered_logits, axis=-1)
+    mask = sorted_idx == tokens[:, None]
+    probs = mx.sum(filtered_probs * mask, axis=-1)
+    return probs
+
+
 def _accept_reject_block(
     *,
     draft_tokens: List[int],
-    draft_logits_list: List[mx.array],
+    draft_logits: mx.array,
     target_logits: mx.array,
     temperature: float,
     top_p: float,
 ) -> Tuple[int, List[int], bool]:
-    """Reject-sampling acceptance for a draft block. Time O(k) best/avg/worst, space O(k), k=block_len."""
-    accept_len = 0
-    new_tokens: List[int] = []
-    rejected = False
-    for i, draft_token in enumerate(draft_tokens):
-        draft_logits = draft_logits_list[i][0, -1, :]
-        target_step_logits = target_logits[0, i, :]
-        q_prob = _token_prob_from_logits(
-            draft_logits, draft_token, temperature=temperature, top_p=top_p
-        )
-        p_prob = _token_prob_from_logits(
-            target_step_logits, draft_token, temperature=temperature, top_p=top_p
-        )
-        accept_prob = 0.0 if q_prob <= 0.0 else min(1.0, p_prob / q_prob)
-        if float(mx.random.uniform().item()) < accept_prob:
-            new_tokens.append(int(draft_token))
-            accept_len += 1
-            continue
-        token = sample_next_token(target_step_logits, temperature=temperature, top_p=top_p)
-        new_tokens.append(int(token))
-        rejected = True
-        break
-    return accept_len, new_tokens, rejected
+    """Reject-sampling acceptance for a draft block. Time O(kV) best/avg, O(kV log V) when top_p<1; space O(kV)."""
+    if not draft_tokens:
+        return 0, [], False
+    draft_tokens_arr = mx.array(draft_tokens, dtype=mx.int32)
+    q_probs = _token_probs_from_logits_batch(
+        draft_logits, draft_tokens_arr, temperature=temperature, top_p=top_p
+    )
+    p_probs = _token_probs_from_logits_batch(
+        target_logits, draft_tokens_arr, temperature=temperature, top_p=top_p
+    )
+    zero = mx.zeros_like(p_probs)
+    accept_probs = mx.where(q_probs <= 0.0, zero, mx.minimum(1.0, p_probs / q_probs))
+    accept_draws = mx.random.uniform(shape=accept_probs.shape)
+    accepted = accept_draws < accept_probs
+    all_accepted = bool(mx.all(accepted).item())
+    if all_accepted:
+        return len(draft_tokens), draft_tokens, False
+
+    reject_idx = int(mx.argmax(mx.logical_not(accepted)).item())
+    token = sample_next_token(target_logits[reject_idx], temperature=temperature, top_p=top_p)
+    new_tokens = list(draft_tokens[:reject_idx]) + [int(token)]
+    return reject_idx, new_tokens, True
 
 
 def _project_logits_qwen3(target: nn.Module, hidden: mx.array) -> mx.array:
@@ -201,6 +283,49 @@ def _project_logits_qwen3(target: nn.Module, hidden: mx.array) -> mx.array:
 
 def _project_logits_minillm(target: nn.Module, hidden: mx.array) -> mx.array:
     return hidden @ target.model.embed_tokens.weight.transpose()
+
+
+def _qwen3_forward_hidden_states(
+    target: nn.Module,
+    input_ids: mx.array,
+    *,
+    cache: Optional[List[Any]],
+    layer_ids: List[int],
+) -> Tuple[mx.array, List[mx.array]]:
+    _, _, _, create_attention_mask = _get_qwen3_deps()
+    model = target.model
+    h = model.embed_tokens(input_ids)
+    if cache is None:
+        cache = [None] * len(model.layers)
+    mask = create_attention_mask(h, cache[0])
+    layer_index = {int(layer_id): idx for idx, layer_id in enumerate(layer_ids)}
+    hiddens: List[Optional[mx.array]] = [None] * len(layer_ids)
+    for idx, (layer, c) in enumerate(zip(model.layers, cache)):
+        h = layer(h, mask, c)
+        if idx in layer_index:
+            hiddens[layer_index[idx]] = h
+    h = model.norm(h)
+    return h, [hidden for hidden in hiddens if hidden is not None]
+
+
+def _minillm_forward_hidden_states(
+    target: nn.Module,
+    input_ids: mx.array,
+    *,
+    attention_mask: Optional[mx.array],
+    layer_ids: List[int],
+) -> Tuple[mx.array, List[mx.array]]:
+    model = target.model
+    h = model.embed_tokens(input_ids)
+    h = model.dropout(h)
+    layer_index = {int(layer_id): idx for idx, layer_id in enumerate(layer_ids)}
+    hiddens: List[Optional[mx.array]] = [None] * len(layer_ids)
+    for idx, layer in enumerate(model.layers):
+        h = layer(h, start_pos=0, attention_mask=attention_mask)
+        if idx in layer_index:
+            hiddens[layer_index[idx]] = h
+    h = model.norm(h)
+    return h, [hidden for hidden in hiddens if hidden is not None]
 
 
 def _pick_latest_checkpoint(ckpt_root: Path) -> Optional[Path]:
@@ -252,41 +377,65 @@ class LowRankHead(nn.Module):
         return self.out(self.proj(x))
 
 
+class FeatureFusion(nn.Module):
+    def __init__(self, *, hidden_size: int, num_layers: int) -> None:
+        super().__init__()
+        self.projs = [nn.Linear(hidden_size, hidden_size, bias=False) for _ in range(int(num_layers))]
+        self.weights = mx.zeros((int(num_layers),), dtype=mx.float32)
+
+    def __call__(self, hiddens: List[mx.array]) -> mx.array:
+        weights = mx.softmax(self.weights)
+        fused = None
+        for idx, (proj, hidden) in enumerate(zip(self.projs, hiddens)):
+            contrib = proj(hidden) * weights[idx]
+            fused = contrib if fused is None else fused + contrib
+        return fused
+
+
 class Qwen3Speculator(nn.Module):
     def __init__(
         self,
         *,
         args: Any,
-        spec_len: int,
         spec_layers: int,
+        feature_layers: List[int],
         init_weight: Optional[mx.array],
         head_rank: Optional[int] = None,
     ) -> None:
         super().__init__()
         _, _, qwen3_model, create_attention_mask = _get_qwen3_deps()
         self._create_attention_mask = create_attention_mask
+        self.feature_layers = [int(i) for i in feature_layers]
+        self.fusion = FeatureFusion(hidden_size=args.hidden_size, num_layers=len(self.feature_layers))
         self.layers = [qwen3_model.TransformerBlock(args=args) for _ in range(int(spec_layers))]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         rank = int(head_rank) if head_rank is not None and int(head_rank) > 0 else 0
         if rank > 0:
-            self.heads = [LowRankHead(hidden_size=args.hidden_size, vocab_size=args.vocab_size, rank=rank) for _ in range(int(spec_len))]
+            self.head = LowRankHead(hidden_size=args.hidden_size, vocab_size=args.vocab_size, rank=rank)
         else:
-            self.heads = [nn.Linear(args.hidden_size, args.vocab_size, bias=False) for _ in range(int(spec_len))]
+            self.head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
             if init_weight is not None:
-                for head in self.heads:
-                    head.weight = init_weight
+                self.head.weight = init_weight
 
-    def __call__(self, hidden: mx.array, attention_mask: Optional[mx.array] = None) -> List[mx.array]:
-        x = hidden
+    def fuse(self, hiddens: List[mx.array], attention_mask: Optional[mx.array] = None) -> mx.array:
+        fused = self.fusion(hiddens)
         if attention_mask is not None:
-            x = x * attention_mask[..., None]
+            fused = fused * attention_mask[..., None]
+        return fused
+
+    def decode(self, *, fused_context: mx.array, token_embeds: Optional[mx.array]) -> mx.array:
+        if token_embeds is None or int(token_embeds.shape[1]) == 0:
+            x = fused_context
+        else:
+            x = mx.concatenate([fused_context, token_embeds], axis=1)
         mask = None
         if x.shape[1] > 1:
             mask = self._create_attention_mask(x, cache=None)
         for layer in self.layers:
             x = layer(x, mask=mask, cache=None)
         x = self.norm(x)
-        return [head(x) for head in self.heads]
+        logits = self.head(x)
+        return logits[:, -1, :]
 
 
 class MiniLLMSpeculator(nn.Module):
@@ -294,35 +443,41 @@ class MiniLLMSpeculator(nn.Module):
         self,
         *,
         config: Any,
-        spec_len: int,
         spec_layers: int,
+        feature_layers: List[int],
         init_weight: Optional[mx.array],
         head_rank: Optional[int] = None,
     ) -> None:
         super().__init__()
         _, _, _, MiniLLMBlock, RMSNorm = _get_minillm_deps()
+        self.feature_layers = [int(i) for i in feature_layers]
+        self.fusion = FeatureFusion(hidden_size=config.hidden_size, num_layers=len(self.feature_layers))
         self.layers = [MiniLLMBlock(i, config) for i in range(int(spec_layers))]
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         rank = int(head_rank) if head_rank is not None and int(head_rank) > 0 else 0
         if rank > 0:
-            self.heads = [
-                LowRankHead(hidden_size=config.hidden_size, vocab_size=config.vocab_size, rank=rank)
-                for _ in range(int(spec_len))
-            ]
+            self.head = LowRankHead(hidden_size=config.hidden_size, vocab_size=config.vocab_size, rank=rank)
         else:
-            self.heads = [nn.Linear(config.hidden_size, config.vocab_size, bias=False) for _ in range(int(spec_len))]
+            self.head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
             if init_weight is not None:
-                for head in self.heads:
-                    head.weight = init_weight
+                self.head.weight = init_weight
 
-    def __call__(self, hidden: mx.array, attention_mask: Optional[mx.array] = None) -> List[mx.array]:
-        x = hidden
+    def fuse(self, hiddens: List[mx.array], attention_mask: Optional[mx.array] = None) -> mx.array:
+        fused = self.fusion(hiddens)
         if attention_mask is not None:
-            x = x * attention_mask[..., None]
+            fused = fused * attention_mask[..., None]
+        return fused
+
+    def decode(self, *, fused_context: mx.array, token_embeds: Optional[mx.array]) -> mx.array:
+        if token_embeds is None or int(token_embeds.shape[1]) == 0:
+            x = fused_context
+        else:
+            x = mx.concatenate([fused_context, token_embeds], axis=1)
         for layer in self.layers:
-            x = layer(x)
+            x = layer(x, start_pos=0, attention_mask=None)
         x = self.norm(x)
-        return [head(x) for head in self.heads]
+        logits = self.head(x)
+        return logits[:, -1, :]
 
 
 def build_speculator(
@@ -331,6 +486,7 @@ def build_speculator(
     target: nn.Module,
     spec_len: int,
     spec_layers: int,
+    feature_layers: Optional[List[int]] = None,
     head_rank: Optional[int] = None,
 ) -> nn.Module:
     init_weight = None
@@ -343,18 +499,20 @@ def build_speculator(
             init_weight = target.lm_head.weight
 
     if target_arch == "minillm":
+        layers = _resolve_feature_layers(feature_layers, num_layers=int(target.config.num_hidden_layers))
         return MiniLLMSpeculator(
             config=target.config,
-            spec_len=spec_len,
             spec_layers=spec_layers,
+            feature_layers=layers,
             init_weight=init_weight,
             head_rank=head_rank,
         )
 
+    layers = _resolve_feature_layers(feature_layers, num_layers=int(target.args.num_hidden_layers))
     return Qwen3Speculator(
         args=target.args,
-        spec_len=spec_len,
         spec_layers=spec_layers,
+        feature_layers=layers,
         init_weight=init_weight,
         head_rank=head_rank,
     )
@@ -371,12 +529,15 @@ def load_speculator(
     head_rank: Optional[int],
 ) -> Tuple[nn.Module, int]:
     cfg_path = speculator_dir / "speculator_config.json"
+    feature_layers: Optional[List[int]] = None
     if cfg_path.is_file():
         with cfg_path.open("r", encoding="utf-8") as f:
             cfg = json.load(f)
         spec_len = int(cfg.get("spec_len", spec_len))
         spec_layers = int(cfg.get("spec_layers", spec_layers))
         target_arch = str(cfg.get("target_arch", target_arch))
+        if "feature_layers" in cfg:
+            feature_layers = [int(i) for i in cfg.get("feature_layers") or []]
         if "head_rank" in cfg:
             head_rank = cfg.get("head_rank", head_rank)
 
@@ -385,6 +546,7 @@ def load_speculator(
         target=target,
         spec_len=spec_len,
         spec_layers=spec_layers,
+        feature_layers=feature_layers,
         head_rank=head_rank,
     )
 
@@ -532,27 +694,45 @@ def _speculative_decode_qwen3(
     cache = mlx_cache.make_prompt_cache(target.model) if use_cache else None
     prompt = mx.array([output_ids], dtype=mx.int32)
     t0 = time.perf_counter()
-    hidden = target.model(prompt, cache=cache)
+    hidden, layer_hiddens = _qwen3_forward_hidden_states(
+        target,
+        prompt,
+        cache=cache,
+        layer_ids=speculator.feature_layers,
+    )
     mx.eval(hidden)
     target_time_s += time.perf_counter() - t0
     last_hidden = hidden[:, -1:, :]
+    last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
 
     while produced < int(max_new_tokens):
         remaining = int(max_new_tokens) - produced
         block_len = min(int(spec_len), int(remaining))
-        t0 = time.perf_counter()
-        logits_list = speculator(last_hidden)
-        mx.eval(*logits_list)
-        spec_time_s += time.perf_counter() - t0
-        draft_tokens = [
-            sample_next_token(logits_list[i][0, -1, :], temperature=temperature, top_p=top_p)
-            for i in range(int(block_len))
-        ]
+        fused_context = speculator.fuse(last_layer_hiddens, attention_mask=None)
+        draft_tokens: List[int] = []
+        draft_logits_list: List[mx.array] = []
+        token_embeds = None
+        for _ in range(int(block_len)):
+            t0 = time.perf_counter()
+            logits = speculator.decode(fused_context=fused_context, token_embeds=token_embeds)
+            mx.eval(logits)
+            spec_time_s += time.perf_counter() - t0
+            token = sample_next_token(logits[0], temperature=temperature, top_p=top_p)
+            draft_tokens.append(int(token))
+            draft_logits_list.append(logits)
+            token_embed = target.model.embed_tokens(mx.array([[int(token)]], dtype=mx.int32))
+            token_embeds = token_embed if token_embeds is None else mx.concatenate([token_embeds, token_embed], axis=1)
+        draft_logits = mx.concatenate(draft_logits_list, axis=0)
 
         if use_cache:
             draft_arr = mx.array([draft_tokens], dtype=mx.int32)
             t0 = time.perf_counter()
-            block_hidden = target.model(draft_arr, cache=cache)
+            block_hidden, block_layer_hiddens = _qwen3_forward_hidden_states(
+                target,
+                draft_arr,
+                cache=cache,
+                layer_ids=speculator.feature_layers,
+            )
             prev_hidden = mx.concatenate([last_hidden, block_hidden], axis=1)[:, :-1, :]
             block_logits = _project_logits_qwen3(target, prev_hidden)
             mx.eval(block_logits)
@@ -561,8 +741,14 @@ def _speculative_decode_qwen3(
         else:
             full = mx.array([output_ids + draft_tokens], dtype=mx.int32)
             t0 = time.perf_counter()
-            full_hidden = target.model(full, cache=None)
+            full_hidden, full_layer_hiddens = _qwen3_forward_hidden_states(
+                target,
+                full,
+                cache=None,
+                layer_ids=speculator.feature_layers,
+            )
             block_hidden = full_hidden[:, -len(draft_tokens) :, :]
+            block_layer_hiddens = [h[:, -len(draft_tokens) :, :] for h in full_layer_hiddens]
             prev_hidden = mx.concatenate([last_hidden, block_hidden], axis=1)[:, :-1, :]
             block_logits = _project_logits_qwen3(target, prev_hidden)
             mx.eval(block_logits)
@@ -571,8 +757,8 @@ def _speculative_decode_qwen3(
 
         accept_len, new_tokens, rejected = _accept_reject_block(
             draft_tokens=draft_tokens,
-            draft_logits_list=logits_list,
-            target_logits=block_logits,
+            draft_logits=draft_logits,
+            target_logits=block_logits[0],
             temperature=temperature,
             top_p=top_p,
         )
@@ -615,36 +801,61 @@ def _speculative_decode_qwen3(
                 if bonus_added:
                     step = mx.array([[int(new_tokens[-1])]], dtype=mx.int32)
                     t0 = time.perf_counter()
-                    hidden = target.model(step, cache=cache)
+                    hidden, layer_hiddens = _qwen3_forward_hidden_states(
+                        target,
+                        step,
+                        cache=cache,
+                        layer_ids=speculator.feature_layers,
+                    )
                     mx.eval(hidden)
                     target_time_s += time.perf_counter() - t0
                     last_hidden = hidden[:, -1:, :]
+                    last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
                 else:
                     last_hidden = block_hidden[:, -1:, :]
+                    last_layer_hiddens = [h[:, -1:, :] for h in block_layer_hiddens]
             else:
                 if not mlx_cache.can_trim_prompt_cache(cache):
                     cache = mlx_cache.make_prompt_cache(target.model)
                     prompt = mx.array([output_ids], dtype=mx.int32)
                     t0 = time.perf_counter()
-                    hidden = target.model(prompt, cache=cache)
+                    hidden, layer_hiddens = _qwen3_forward_hidden_states(
+                        target,
+                        prompt,
+                        cache=cache,
+                        layer_ids=speculator.feature_layers,
+                    )
                     mx.eval(hidden)
                     target_time_s += time.perf_counter() - t0
                     last_hidden = hidden[:, -1:, :]
+                    last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
                 else:
                     mlx_cache.trim_prompt_cache(cache, len(draft_tokens) - accept_len)
                     step = mx.array([[int(new_tokens[-1])]], dtype=mx.int32)
                     t0 = time.perf_counter()
-                    hidden = target.model(step, cache=cache)
+                    hidden, layer_hiddens = _qwen3_forward_hidden_states(
+                        target,
+                        step,
+                        cache=cache,
+                        layer_ids=speculator.feature_layers,
+                    )
                     mx.eval(hidden)
                     target_time_s += time.perf_counter() - t0
                     last_hidden = hidden[:, -1:, :]
+                    last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
         else:
             prompt = mx.array([output_ids], dtype=mx.int32)
             t0 = time.perf_counter()
-            hidden = target.model(prompt, cache=None)
+            hidden, layer_hiddens = _qwen3_forward_hidden_states(
+                target,
+                prompt,
+                cache=None,
+                layer_ids=speculator.feature_layers,
+            )
             mx.eval(hidden)
             target_time_s += time.perf_counter() - t0
             last_hidden = hidden[:, -1:, :]
+            last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
 
         if optimized and consecutive_misses >= max_consecutive_misses:
             break
@@ -791,25 +1002,43 @@ def _speculative_decode_minillm(
     while produced < int(max_new_tokens):
         prompt = mx.array([output_ids], dtype=mx.int32)
         t0 = time.perf_counter()
-        hidden = target.model(prompt)
+        hidden, layer_hiddens = _minillm_forward_hidden_states(
+            target,
+            prompt,
+            attention_mask=None,
+            layer_ids=speculator.feature_layers,
+        )
         mx.eval(hidden)
         target_time_s += time.perf_counter() - t0
         last_hidden = hidden[:, -1:, :]
+        last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
 
         remaining = int(max_new_tokens) - produced
         block_len = min(int(spec_len), int(remaining))
-        t0 = time.perf_counter()
-        logits_list = speculator(last_hidden)
-        mx.eval(*logits_list)
-        spec_time_s += time.perf_counter() - t0
-        draft_tokens = [
-            sample_next_token(logits_list[i][0, -1, :], temperature=temperature, top_p=top_p)
-            for i in range(int(block_len))
-        ]
+        fused_context = speculator.fuse(last_layer_hiddens, attention_mask=None)
+        draft_tokens: List[int] = []
+        draft_logits_list: List[mx.array] = []
+        token_embeds = None
+        for _ in range(int(block_len)):
+            t0 = time.perf_counter()
+            logits = speculator.decode(fused_context=fused_context, token_embeds=token_embeds)
+            mx.eval(logits)
+            spec_time_s += time.perf_counter() - t0
+            token = sample_next_token(logits[0], temperature=temperature, top_p=top_p)
+            draft_tokens.append(int(token))
+            draft_logits_list.append(logits)
+            token_embed = target.model.embed_tokens(mx.array([[int(token)]], dtype=mx.int32))
+            token_embeds = token_embed if token_embeds is None else mx.concatenate([token_embeds, token_embed], axis=1)
+        draft_logits = mx.concatenate(draft_logits_list, axis=0)
 
         full = mx.array([output_ids + draft_tokens], dtype=mx.int32)
         t0 = time.perf_counter()
-        full_hidden = target.model(full)
+        full_hidden, _ = _minillm_forward_hidden_states(
+            target,
+            full,
+            attention_mask=None,
+            layer_ids=speculator.feature_layers,
+        )
         block_hidden = full_hidden[:, -len(draft_tokens) :, :]
         prev_hidden = mx.concatenate([last_hidden, block_hidden], axis=1)[:, :-1, :]
         block_logits = _project_logits_minillm(target, prev_hidden)
@@ -819,8 +1048,8 @@ def _speculative_decode_minillm(
 
         accept_len, new_tokens, rejected = _accept_reject_block(
             draft_tokens=draft_tokens,
-            draft_logits_list=logits_list,
-            target_logits=block_logits,
+            draft_logits=draft_logits,
+            target_logits=block_logits[0],
             temperature=temperature,
             top_p=top_p,
         )
