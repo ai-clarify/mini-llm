@@ -44,7 +44,9 @@ def _count_jsonl_lines(path: Path, *, max_lines: Optional[int] = None) -> int:
     return n
 
 
-def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_generation_prompt: bool) -> str:
+def _apply_chat_template(
+    tokenizer, messages: List[Dict[str, Any]], *, add_generation_prompt: bool
+) -> str:
     return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -53,7 +55,9 @@ def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_gener
     )
 
 
-def _split_prompt(messages: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+def _split_prompt(
+    messages: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     last_assistant = None
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "assistant":
@@ -83,8 +87,12 @@ class SyntheticChatDataset:
                     continue
 
                 prompt_msgs, _ = _split_prompt(conversations)
-                full_text = _apply_chat_template(tokenizer, conversations, add_generation_prompt=False)
-                prompt_text = _apply_chat_template(tokenizer, prompt_msgs, add_generation_prompt=True)
+                full_text = _apply_chat_template(
+                    tokenizer, conversations, add_generation_prompt=False
+                )
+                prompt_text = _apply_chat_template(
+                    tokenizer, prompt_msgs, add_generation_prompt=True
+                )
 
                 full_ids = tokenizer.encode(full_text, add_special_tokens=False)
                 prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
@@ -109,7 +117,9 @@ class SyntheticChatDataset:
     def __len__(self) -> int:
         return len(self.samples)
 
-    def sample_batch(self, *, batch_size: int, rng: random.Random) -> Tuple[mx.array, mx.array, mx.array]:
+    def sample_batch(
+        self, *, batch_size: int, rng: random.Random
+    ) -> Tuple[mx.array, mx.array, mx.array]:
         if not self.samples:
             raise ValueError("Dataset is empty")
         idxs = [rng.randrange(len(self.samples)) for _ in range(int(batch_size))]
@@ -233,7 +243,9 @@ def _spec_loss_autoregressive(
         spec_logits_steps: List[mx.array] = []
         for j in range(int(spec_len)):
             token_embeds = _embed_tokens(target, feed_tokens)
-            logits = speculator.decode(fused_context=fused_context, token_embeds=token_embeds)
+            logits = speculator.decode(
+                fused_context=fused_context, token_embeds=token_embeds
+            )
             spec_logits_steps.append(logits)
             pred_token = sample_next_token(
                 logits[0],
@@ -379,7 +391,9 @@ def _ensure_synth_data(args) -> None:
     subprocess.run(cmd, check=True)
 
 
-def _count_tokens(loss_mask: mx.array, attention_mask: mx.array, *, spec_len: int) -> float:
+def _count_tokens(
+    loss_mask: mx.array, attention_mask: mx.array, *, spec_len: int
+) -> float:
     return float(int(loss_mask.shape[0]) * int(spec_len))
 
 
@@ -394,7 +408,9 @@ def load_optimizer_state(optimizer: optim.Optimizer, path: str) -> None:
     optimizer.state = mlx_utils.tree_unflatten(flat)
 
 
-def _save_checkpoint(*, step: int, speculator: nn.Module, optimizer: optim.Optimizer, out_dir: Path) -> None:
+def _save_checkpoint(
+    *, step: int, speculator: nn.Module, optimizer: optim.Optimizer, out_dir: Path
+) -> None:
     ckpt_dir = out_dir / "checkpoints" / f"step_{step:08d}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     model_path = ckpt_dir / "speculator.safetensors"
@@ -457,21 +473,27 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Train an EAGLE-3 style speculator for Qwen3-0.6B or MiniLLM (MLX backend, pure synthetic data)."
     )
-    parser.add_argument("--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3")
+    parser.add_argument(
+        "--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3"
+    )
     parser.add_argument("--hf_repo", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--model_dir", type=str, default=None)
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--minillm_ckpt_dir", type=str, default=None)
     parser.add_argument("--minillm_tokenizer", type=str, default="./model")
-    parser.add_argument("--data_path", type=str, default="out/distill_ollama_qwen3_0.6b/synth.jsonl")
-    parser.add_argument("--out_dir", type=str, default="out/eagle3_speculator_mlx/qwen3_0.6b")
+    parser.add_argument(
+        "--data_path", type=str, default="out/distill_ollama_qwen3_0.6b/synth.jsonl"
+    )
+    parser.add_argument(
+        "--out_dir", type=str, default="out/eagle3_speculator_mlx/qwen3_0.6b"
+    )
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--accum_steps", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=2e-4)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--max_steps", type=int, default=5000)
+    parser.add_argument("--max_steps", type=int, default=5500)
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=500)
     parser.add_argument(
@@ -492,8 +514,18 @@ def main() -> None:
         default=0,
         help="Consecutive steps meeting early_stop_loss before stopping (0 = immediate).",
     )
-    parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
-    parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
+    parser.add_argument(
+        "--spec_len",
+        type=int,
+        default=None,
+        help="Draft length for speculator (auto if unset).",
+    )
+    parser.add_argument(
+        "--spec_layers",
+        type=int,
+        default=None,
+        help="Transformer layers in speculator (auto if unset).",
+    )
     parser.add_argument(
         "--feature_layers",
         type=str,
@@ -603,11 +635,17 @@ def main() -> None:
         head_rank = int(args.head_rank)
     parsed_layers: Optional[List[int]] = None
     if args.feature_layers:
-        parsed_layers = [int(x) for x in str(args.feature_layers).split(",") if x.strip()]
+        parsed_layers = [
+            int(x) for x in str(args.feature_layers).split(",") if x.strip()
+        ]
     if args.target_arch == "minillm":
-        feature_layers = _resolve_feature_layers(parsed_layers, num_layers=int(target.config.num_hidden_layers))
+        feature_layers = _resolve_feature_layers(
+            parsed_layers, num_layers=int(target.config.num_hidden_layers)
+        )
     else:
-        feature_layers = _resolve_feature_layers(parsed_layers, num_layers=int(target.args.num_hidden_layers))
+        feature_layers = _resolve_feature_layers(
+            parsed_layers, num_layers=int(target.args.num_hidden_layers)
+        )
     speculator = build_speculator(
         target_arch=args.target_arch,
         target=target,
@@ -633,11 +671,15 @@ def main() -> None:
         f"spec_layers={args.spec_layers} feature_layers=[{layer_note}]{head_note}"
     )
 
-    dataset = SyntheticChatDataset(Path(args.data_path), tokenizer, max_seq_len=args.max_seq_len)
+    dataset = SyntheticChatDataset(
+        Path(args.data_path), tokenizer, max_seq_len=args.max_seq_len
+    )
     if len(dataset) == 0:
         raise ValueError("Dataset is empty; check --data_path")
 
-    optimizer = optim.AdamW(learning_rate=float(args.learning_rate), weight_decay=float(args.weight_decay))
+    optimizer = optim.AdamW(
+        learning_rate=float(args.learning_rate), weight_decay=float(args.weight_decay)
+    )
     optimizer.init(speculator.trainable_parameters())
     if resume_dir is not None:
         opt_path = resume_dir / "optimizer.npz"
@@ -699,14 +741,18 @@ def main() -> None:
         "self_feed_temperature": args.self_feed_temperature,
         "loss_decay": args.loss_decay,
     }
-    (out_dir / "speculator_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+    (out_dir / "speculator_config.json").write_text(
+        json.dumps(config, indent=2), encoding="utf-8"
+    )
 
     start_time = time.time()
     accum_steps = int(args.accum_steps)
     if accum_steps <= 0:
         raise ValueError("--accum_steps must be >= 1")
 
-    grad_template = mlx_utils.tree_map(lambda p: mx.zeros_like(p), speculator.trainable_parameters())
+    grad_template = mlx_utils.tree_map(
+        lambda p: mx.zeros_like(p), speculator.trainable_parameters()
+    )
     early_stop_loss = args.early_stop_loss
     early_stop_patience = int(args.early_stop_patience or 0)
     if early_stop_loss is not None and early_stop_patience <= 0:
@@ -715,7 +761,9 @@ def main() -> None:
 
     last_step = resume_step
     if resume_step >= int(args.max_steps):
-        print(f"[resume] step={resume_step} >= max_steps={int(args.max_steps)}; nothing to do.")
+        print(
+            f"[resume] step={resume_step} >= max_steps={int(args.max_steps)}; nothing to do."
+        )
         return
     try:
         for step in range(resume_step + 1, int(args.max_steps) + 1):
@@ -727,8 +775,12 @@ def main() -> None:
                 input_ids, attention_mask, loss_mask = dataset.sample_batch(
                     batch_size=args.batch_size, rng=rng
                 )
-                tokens_seen += _count_tokens(loss_mask, attention_mask, spec_len=args.spec_len)
-                step_seed = int(args.seed) + (int(step) * int(accum_steps)) + int(accum_idx)
+                tokens_seen += _count_tokens(
+                    loss_mask, attention_mask, spec_len=args.spec_len
+                )
+                step_seed = (
+                    int(args.seed) + (int(step) * int(accum_steps)) + int(accum_idx)
+                )
                 step_rng = random.Random(step_seed)
                 loss, grads = value_and_grad(
                     input_ids,
@@ -741,9 +793,13 @@ def main() -> None:
                 loss_sum = loss_sum + loss.astype(mx.float32)
                 grad_accum = mlx_utils.tree_map(lambda a, b: a + b, grad_accum, grads)
 
-            grad_accum = mlx_utils.tree_map(lambda g: g / float(accum_steps), grad_accum)
+            grad_accum = mlx_utils.tree_map(
+                lambda g: g / float(accum_steps), grad_accum
+            )
             if args.grad_clip > 0:
-                grad_accum, grad_norm = optim.clip_grad_norm(grad_accum, max_norm=float(args.grad_clip))
+                grad_accum, grad_norm = optim.clip_grad_norm(
+                    grad_accum, max_norm=float(args.grad_clip)
+                )
             else:
                 grad_norm = mx.array(0.0, dtype=mx.float32)
 
@@ -772,18 +828,33 @@ def main() -> None:
 
             saved = False
             if step % args.save_interval == 0 or step == int(args.max_steps):
-                _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+                _save_checkpoint(
+                    step=step,
+                    speculator=speculator,
+                    optimizer=optimizer,
+                    out_dir=out_dir,
+                )
                 saved = True
 
             last_step = step
             if stop_training:
                 if not saved:
-                    _save_checkpoint(step=step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+                    _save_checkpoint(
+                        step=step,
+                        speculator=speculator,
+                        optimizer=optimizer,
+                        out_dir=out_dir,
+                    )
                 break
     except KeyboardInterrupt:
         if last_step > 0:
             print(f"[train] interrupted at step={last_step}, saving checkpoint")
-            _save_checkpoint(step=last_step, speculator=speculator, optimizer=optimizer, out_dir=out_dir)
+            _save_checkpoint(
+                step=last_step,
+                speculator=speculator,
+                optimizer=optimizer,
+                out_dir=out_dir,
+            )
         else:
             print("[train] interrupted before first step; no checkpoint saved")
 
