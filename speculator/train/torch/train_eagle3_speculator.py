@@ -24,7 +24,6 @@ from speculator.infer.torch.common import (
     _count_params_torch,
     _extract_hidden_layers,
     _minillm_forward_hidden_states,
-    _project_logits_minillm,
     _resolve_dtype,
     _resolve_feature_layers,
     _resolve_spec_config,
@@ -223,14 +222,14 @@ def _spec_loss_autoregressive(
     device = input_ids.device
     with torch.no_grad():
         if target_arch == "minillm":
-            hidden, layer_hiddens = _minillm_forward_hidden_states(
+            _, layer_hiddens = _minillm_forward_hidden_states(
                 target,
                 input_ids,
                 attention_mask=attention_mask,
                 layer_ids=speculator.feature_layers,
             )
         else:
-            hidden, layer_hiddens = _qwen3_forward_hidden_states(
+            _, layer_hiddens = _qwen3_forward_hidden_states(
                 target,
                 input_ids,
                 attention_mask=attention_mask,
@@ -280,33 +279,10 @@ def _spec_loss_autoregressive(
             else:
                 feed_tokens.append(target_id)
 
-        context_ids = [int(x) for x in input_ids[b, : pos + 1].tolist()]
-        full_ids = context_ids + draft_tokens
-        full_tensor = torch.tensor([full_ids], device=device, dtype=torch.long)
-        with torch.no_grad():
-            if target_arch == "minillm":
-                target_hidden, _ = _minillm_forward_hidden_states(
-                    target,
-                    full_tensor,
-                    attention_mask=None,
-                    layer_ids=speculator.feature_layers,
-                )
-                target_logits_full = _project_logits_minillm(target, target_hidden)
-            else:
-                out = target(
-                    input_ids=full_tensor,
-                    use_cache=False,
-                    return_dict=True,
-                )
-                target_logits_full = out.logits
-
-        start_idx = len(context_ids) - 1
-        target_logits = target_logits_full[:, start_idx : start_idx + int(spec_len), :]
         for j, spec_logits in enumerate(spec_logits_steps):
-            tgt_logits = target_logits[:, j, :]
-            target_probs = torch.softmax(tgt_logits.float(), dim=-1)
             spec_log_probs = torch.log_softmax(spec_logits.float(), dim=-1)
-            loss = -(target_probs * spec_log_probs).sum(dim=-1)[0]
+            target_id = int(input_ids[b, pos + j + 1].item())
+            loss = -spec_log_probs[0, target_id]
             weight = float(loss_decay) ** int(j)
             total_loss = total_loss + (loss * weight)
             total_weight = total_weight + weight

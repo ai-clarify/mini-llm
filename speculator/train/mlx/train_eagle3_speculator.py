@@ -21,8 +21,6 @@ if str(ROOT) not in sys.path:
 from speculator.infer.mlx.common import (
     _load_target,
     _minillm_forward_hidden_states,
-    _project_logits_minillm,
-    _project_logits_qwen3,
     _qwen3_forward_hidden_states,
     _resolve_feature_layers,
     build_speculator,
@@ -207,20 +205,19 @@ def _spec_loss_autoregressive(
     dtype: Any,
 ) -> mx.array:
     if target_arch == "minillm":
-        hidden, layer_hiddens = _minillm_forward_hidden_states(
+        _, layer_hiddens = _minillm_forward_hidden_states(
             target,
             input_ids,
             attention_mask=attention_mask,
             layer_ids=speculator.feature_layers,
         )
     else:
-        hidden, layer_hiddens = _qwen3_forward_hidden_states(
+        _, layer_hiddens = _qwen3_forward_hidden_states(
             target,
             input_ids,
             cache=None,
             layer_ids=speculator.feature_layers,
         )
-    hidden = mx.stop_gradient(hidden)
     layer_hiddens = [mx.stop_gradient(h) for h in layer_hiddens]
     if layer_hiddens and layer_hiddens[0].dtype != dtype:
         layer_hiddens = [h.astype(dtype) for h in layer_hiddens]
@@ -266,33 +263,10 @@ def _spec_loss_autoregressive(
             else:
                 feed_tokens.append(target_id)
 
-        context_ids = [int(x) for x in input_ids[b, : pos + 1].tolist()]
-        full_ids = context_ids + draft_tokens
-        full_arr = mx.array([full_ids], dtype=mx.int32)
-        if target_arch == "minillm":
-            target_hidden, _ = _minillm_forward_hidden_states(
-                target,
-                full_arr,
-                attention_mask=None,
-                layer_ids=speculator.feature_layers,
-            )
-            target_logits_full = _project_logits_minillm(target, target_hidden)
-        else:
-            target_hidden, _ = _qwen3_forward_hidden_states(
-                target,
-                full_arr,
-                cache=None,
-                layer_ids=speculator.feature_layers,
-            )
-            target_logits_full = _project_logits_qwen3(target, target_hidden)
-
-        start_idx = len(context_ids) - 1
-        target_logits = target_logits_full[:, start_idx : start_idx + int(spec_len), :]
         for j, spec_logits in enumerate(spec_logits_steps):
-            tgt_logits = target_logits[:, j, :]
-            target_probs = mx.softmax(tgt_logits, axis=-1)
             spec_log_probs = nn.log_softmax(spec_logits, axis=-1)
-            loss = -mx.sum(target_probs * spec_log_probs, axis=-1)[0]
+            target_id = int(input_ids[b, pos + j + 1].item())
+            loss = -spec_log_probs[0, target_id]
             weight = float(loss_decay) ** int(j)
             total_loss = total_loss + (loss * weight)
             total_weight = total_weight + weight
