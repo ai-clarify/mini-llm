@@ -135,17 +135,32 @@ python speculator/infer/mlx/bench.py --hf_repo Qwen/Qwen3-0.6B --max_samples 16
 # 1) 安装 sglang（建议独立环境）
 pip install sglang
 
-# 2) 启动服务
+# 2) 下载 EAGLE3 draft 模型（示例：Qwen3-32B Eagle3）
+huggingface-cli download Qwen/Qwen3-32B-Eagle3 --local-dir out/qwen3_32b_eagle3
+
+# 3) 启动服务
 python -m sglang.launch_server \
-  --model Qwen/Qwen3-1.7B \
+  --model Qwen/Qwen3-32B \
   --speculative-algorithm EAGLE3 \
-  --speculative-draft-model-path <EAGLE3_DRAFT_MODEL> \
+  --speculative-draft-model-path out/qwen3_32b_eagle3 \
   --speculative-num-steps 1 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 2
 ```
 
-`<EAGLE3_DRAFT_MODEL>` 请替换为与你的 base 模型匹配的官方 Eagle3 draft 权重；可参考 SGLang 文档并使用其 `scripts/playground/bench_speculative.py` 搜索更优参数。
+如果你的模型有官方 Eagle3 draft 权重，也可以直接把 Hugging Face repo 作为 `--speculative-draft-model-path`：
+
+```bash
+python -m sglang.launch_server \
+  --model Qwen/Qwen3-32B \
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path Qwen/Qwen3-32B-Eagle3 \
+  --speculative-num-steps 1 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 2
+```
+
+更多参数调优可参考 SGLang 文档，并使用其 `scripts/playground/bench_speculative.py` 搜索更优配置。
 
 #### MiniLLM（Torch）
 

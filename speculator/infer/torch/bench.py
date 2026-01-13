@@ -24,12 +24,6 @@ from speculator.infer.torch.common import (
     load_speculator,
     speculative_decode_with_stats,
 )
-from speculator.infer.torch.eagle3 import (
-    baseline_decode_eagle3,
-    eagle3_decode_with_stats,
-    load_eagle3_drafter,
-    load_eagle3_target,
-)
 
 
 @dataclass(frozen=True)
@@ -134,66 +128,6 @@ def _run_spec(
     return SpecBenchResult(num_input, num_output, elapsed, stats)
 
 
-def _run_eagle3_baseline(
-    *,
-    target,
-    input_ids: torch.Tensor,
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    eos_token_id: Optional[int],
-    device: torch.device,
-) -> BenchResult:
-    _sync_device(device)
-    start = time.perf_counter()
-    output_ids = baseline_decode_eagle3(
-        target=target,
-        input_ids=input_ids,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        eos_token_id=eos_token_id,
-    )
-    _sync_device(device)
-    elapsed = time.perf_counter() - start
-    num_input = int(input_ids.shape[1])
-    num_output = max(int(output_ids.shape[1]) - num_input, 0)
-    return BenchResult(num_input, num_output, elapsed)
-
-
-def _run_eagle3_spec(
-    *,
-    target,
-    drafter,
-    input_ids: torch.Tensor,
-    max_new_tokens: int,
-    temperature: float,
-    top_p: float,
-    verify_top_k: int,
-    eos_token_id: Optional[int],
-    seed: int,
-    device: torch.device,
-) -> SpecBenchResult:
-    _sync_device(device)
-    start = time.perf_counter()
-    output_ids, stats = eagle3_decode_with_stats(
-        target=target,
-        drafter=drafter,
-        input_ids=input_ids,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=top_p,
-        top_k=verify_top_k,
-        eos_token_id=eos_token_id,
-        seed=seed,
-    )
-    _sync_device(device)
-    elapsed = time.perf_counter() - start
-    num_input = int(input_ids.shape[1])
-    num_output = max(int(output_ids.shape[1]) - num_input, 0)
-    return SpecBenchResult(num_input, num_output, elapsed, stats)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark EAGLE-3 speculator vs baseline (Torch backend)."
@@ -207,12 +141,6 @@ def main() -> None:
     parser.add_argument("--minillm_tokenizer", type=str, default="./model")
     parser.add_argument(
         "--speculator_dir", type=str, default="out/eagle3_speculator/qwen3_0.6b"
-    )
-    parser.add_argument(
-        "--eagle3_dir",
-        type=str,
-        default=None,
-        help="Use AngelSlim Eagle3 tree decoding with the given drafter directory.",
     )
     parser.add_argument("--speculator_ckpt", type=str, default=None)
     parser.add_argument("--prompts_jsonl", type=str, default=None)
@@ -240,16 +168,6 @@ def main() -> None:
         help="Low-rank speculator head size (overrides config if set; full head if unset).",
     )
     parser.add_argument("--no_speculator", action="store_true")
-    parser.add_argument("--eagle3_total_tokens", type=int, default=63)
-    parser.add_argument("--eagle3_depth", type=int, default=5)
-    parser.add_argument("--eagle3_top_k", type=int, default=8)
-    parser.add_argument("--eagle3_threshold", type=float, default=1.0)
-    parser.add_argument(
-        "--eagle3_verify_top_k",
-        type=int,
-        default=0,
-        help="Top-k for target sampling in Eagle3 verification (0 disables).",
-    )
     parser.add_argument("--no_chat_template", action="store_true")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1337)
@@ -264,57 +182,34 @@ def main() -> None:
     device = torch.device(args.device)
     dtype = _resolve_dtype(args.dtype)
 
-    use_eagle3 = args.eagle3_dir is not None
-    if use_eagle3 and args.target_arch != "qwen3":
-        raise ValueError("--eagle3_dir requires --target_arch qwen3.")
-
-    speculator_dir = Path(args.eagle3_dir) if use_eagle3 else Path(args.speculator_dir)
-    eagle3_drafter = None
-
-    if use_eagle3:
-        target, tokenizer = load_eagle3_target(
-            target_model=args.target_model, device=device, dtype=dtype
-        )
-        eagle3_drafter = load_eagle3_drafter(
-            eagle3_dir=speculator_dir,
-            target=target,
-            total_tokens=args.eagle3_total_tokens,
-            depth=args.eagle3_depth,
-            top_k=args.eagle3_top_k,
-            threshold=args.eagle3_threshold,
-        )
-    else:
-        target, tokenizer = _load_target_and_tokenizer(args, device, dtype)
+    target, tokenizer = _load_target_and_tokenizer(args, device, dtype)
 
     speculator = None
-    spec_len = int(args.eagle3_total_tokens) if use_eagle3 else None
-    if not use_eagle3:
-        spec_len, spec_layers = _resolve_spec_config(
-            args.spec_len, args.spec_layers, param_count=_count_params_torch(target)
+    spec_len, spec_layers = _resolve_spec_config(
+        args.spec_len, args.spec_layers, param_count=_count_params_torch(target)
+    )
+    head_rank = (
+        args.head_rank
+        if args.head_rank is not None and int(args.head_rank) > 0
+        else None
+    )
+    if not args.no_speculator:
+        speculator_dir = Path(args.speculator_dir)
+        speculator_ckpt = Path(args.speculator_ckpt) if args.speculator_ckpt else None
+        speculator, spec_len = load_speculator(
+            target=target,
+            speculator_dir=speculator_dir,
+            speculator_ckpt=speculator_ckpt,
+            spec_len=spec_len,
+            spec_layers=spec_layers,
+            spec_heads=0,
+            head_rank=head_rank,
+            dropout=0.0,
         )
-        head_rank = (
-            args.head_rank
-            if args.head_rank is not None and int(args.head_rank) > 0
-            else None
-        )
-        if not args.no_speculator:
-            speculator_ckpt = (
-                Path(args.speculator_ckpt) if args.speculator_ckpt else None
-            )
-            speculator, spec_len = load_speculator(
-                target=target,
-                speculator_dir=speculator_dir,
-                speculator_ckpt=speculator_ckpt,
-                spec_len=spec_len,
-                spec_layers=spec_layers,
-                spec_heads=0,
-                head_rank=head_rank,
-                dropout=0.0,
-            )
-            speculator = speculator.to(device)
+        speculator = speculator.to(device)
 
     prompts_jsonl = resolve_prompts_jsonl(
-        args.prompts_jsonl, speculator_dir=speculator_dir
+        args.prompts_jsonl, speculator_dir=Path(args.speculator_dir)
     )
     prompt_messages = load_prompt_messages(
         prompts_jsonl,
@@ -343,7 +238,7 @@ def main() -> None:
             "No prompts to benchmark; check --max_samples or prompts file."
         )
     completed = 0
-    use_cache = (args.target_arch != "minillm") and (not use_eagle3)
+    use_cache = args.target_arch != "minillm"
     prompt_count = len(prompt_inputs)
     for round_idx in range(int(args.rounds)):
         for prompt_idx, input_ids in enumerate(prompt_inputs):
@@ -351,65 +246,35 @@ def main() -> None:
             torch.manual_seed(seed_base)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed_base)
-            if use_eagle3:
-                baseline = _run_eagle3_baseline(
+            baseline = _run_baseline(
+                target=target,
+                input_ids=input_ids,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                eos_token_id=tokenizer.eos_token_id,
+                use_cache=use_cache,
+                device=device,
+            )
+            baseline_results.append(baseline)
+
+            if speculator is not None:
+                torch.manual_seed(seed_base)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(seed_base)
+                spec = _run_spec(
                     target=target,
+                    speculator=speculator,
                     input_ids=input_ids,
                     max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    eos_token_id=tokenizer.eos_token_id,
-                    device=device,
-                )
-            else:
-                baseline = _run_baseline(
-                    target=target,
-                    input_ids=input_ids,
-                    max_new_tokens=args.max_new_tokens,
+                    spec_len=spec_len,
                     temperature=args.temperature,
                     top_p=args.top_p,
                     eos_token_id=tokenizer.eos_token_id,
                     use_cache=use_cache,
                     device=device,
                 )
-            baseline_results.append(baseline)
-
-            if use_eagle3:
-                if not args.no_speculator and eagle3_drafter is not None:
-                    torch.manual_seed(seed_base)
-                    if torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(seed_base)
-                    spec = _run_eagle3_spec(
-                        target=target,
-                        drafter=eagle3_drafter,
-                        input_ids=input_ids,
-                        max_new_tokens=args.max_new_tokens,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        verify_top_k=args.eagle3_verify_top_k,
-                        eos_token_id=tokenizer.eos_token_id,
-                        seed=seed_base,
-                        device=device,
-                    )
-                    spec_results.append(spec)
-            else:
-                if speculator is not None:
-                    torch.manual_seed(seed_base)
-                    if torch.cuda.is_available():
-                        torch.cuda.manual_seed_all(seed_base)
-                    spec = _run_spec(
-                        target=target,
-                        speculator=speculator,
-                        input_ids=input_ids,
-                        max_new_tokens=args.max_new_tokens,
-                        spec_len=spec_len,
-                        temperature=args.temperature,
-                        top_p=args.top_p,
-                        eos_token_id=tokenizer.eos_token_id,
-                        use_cache=use_cache,
-                        device=device,
-                    )
-                    spec_results.append(spec)
+                spec_results.append(spec)
             completed += 1
             _render_progress(completed, total_samples)
 

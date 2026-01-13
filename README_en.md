@@ -137,17 +137,32 @@ python speculator/infer/mlx/bench.py --hf_repo Qwen/Qwen3-0.6B --max_samples 16
 # 1) Install sglang (use a clean env)
 pip install sglang
 
-# 2) Launch server
+# 2) Download an EAGLE3 draft model (example: Qwen3-32B Eagle3)
+huggingface-cli download Qwen/Qwen3-32B-Eagle3 --local-dir out/qwen3_32b_eagle3
+
+# 3) Launch server
 python -m sglang.launch_server \
-  --model Qwen/Qwen3-1.7B \
+  --model Qwen/Qwen3-32B \
   --speculative-algorithm EAGLE3 \
-  --speculative-draft-model-path <EAGLE3_DRAFT_MODEL> \
+  --speculative-draft-model-path out/qwen3_32b_eagle3 \
   --speculative-num-steps 1 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 2
 ```
 
-Replace `<EAGLE3_DRAFT_MODEL>` with the official EAGLE3 draft weights that match your base model. You can tune these parameters with SGLang's `scripts/playground/bench_speculative.py` as documented upstream.
+If your Eagle3 draft weights are on Hugging Face, you can also pass the repo ID directly:
+
+```bash
+python -m sglang.launch_server \
+  --model Qwen/Qwen3-32B \
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path Qwen/Qwen3-32B-Eagle3 \
+  --speculative-num-steps 1 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 2
+```
+
+For tuning, follow SGLang docs and use `scripts/playground/bench_speculative.py`.
 
 > MLX inference/training requires `mlx-lm` (currently pinned to transformers==5.0.0rc1). Use a clean venv if needed.
 
