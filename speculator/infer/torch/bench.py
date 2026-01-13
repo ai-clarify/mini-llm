@@ -17,7 +17,9 @@ from speculator.infer.torch.common import (
     SpecStats,
     _apply_chat_template,
     _count_params_torch,
+    _default_device_name,
     _load_target_and_tokenizer,
+    _maybe_adjust_dtype_for_device,
     _resolve_dtype,
     _resolve_spec_config,
     baseline_decode,
@@ -63,6 +65,8 @@ def _render_progress(current: int, total: int, *, label: str = "bench") -> None:
 def _sync_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize()
+    elif device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.synchronize()
 
 
 def _run_baseline(
@@ -171,7 +175,7 @@ def main() -> None:
     parser.add_argument("--no_chat_template", action="store_true")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default=_default_device_name())
     parser.add_argument("--dtype", type=str, default="bfloat16")
     args = parser.parse_args()
 
@@ -181,6 +185,7 @@ def main() -> None:
 
     device = torch.device(args.device)
     dtype = _resolve_dtype(args.dtype)
+    dtype = _maybe_adjust_dtype_for_device(device, dtype)
 
     target, tokenizer = _load_target_and_tokenizer(args, device, dtype)
 
