@@ -54,10 +54,21 @@ class SpecBenchResult:
 
 
 class TokenLogWriter:
-    def __init__(self, path: str, tokenizer, *, top_k: int = 50) -> None:
+    def __init__(
+        self,
+        path: str,
+        tokenizer,
+        *,
+        top_k: int = 50,
+        summary_path: Optional[str] = None,
+    ) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._fh = self._path.open("w", encoding="utf-8")
+        if summary_path is None:
+            self._summary_path = self._summary_path_for(self._path)
+        else:
+            self._summary_path = Path(summary_path)
         self._tokenizer = tokenizer
         self._top_k = int(top_k)
         self._accepted = Counter()
@@ -79,6 +90,17 @@ class TokenLogWriter:
             text = self._tokenizer.decode([token_id])
         self._token_cache[token_id] = text
         return text
+
+    @staticmethod
+    def _summary_path_for(path: Path) -> Path:
+        if path.suffix == ".jsonl":
+            base = path.with_suffix("")
+            return Path(str(base) + ".summary.json")
+        return Path(str(path) + ".summary.json")
+
+    @property
+    def summary_path(self) -> Path:
+        return self._summary_path
 
     def _contains_cjk(self, text: str) -> bool:
         for ch in text:
@@ -232,6 +254,9 @@ class TokenLogWriter:
         }
         self._fh.write(json.dumps(summary, ensure_ascii=False) + "\n")
         self._fh.close()
+        self._summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._summary_path.open("w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
 
 
 def _render_progress(current: int, total: int, *, label: str = "bench") -> None:
@@ -424,7 +449,10 @@ def main() -> None:
         else:
             token_log_path = Path(args.token_log)
             token_logger = TokenLogWriter(str(token_log_path), tokenizer)
-            print(f"[bench] token_log={token_log_path}", flush=True)
+            print(
+                f"[bench] token_log={token_log_path} token_summary={token_logger.summary_path}",
+                flush=True,
+            )
 
     prompts_jsonl = resolve_prompts_jsonl(
         args.prompts_jsonl, speculator_dir=Path(args.speculator_dir)
