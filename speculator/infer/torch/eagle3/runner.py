@@ -202,6 +202,8 @@ def eagle3_decode_with_stats(
     """Tree-based Eagle3 decode. Time O(S * L * V) avg; space O(L * V)."""
     random.seed(int(seed))
     device = input_ids.device
+    if hasattr(drafter, "reset_kv"):
+        drafter.reset_kv()
     output_ids: List[int] = input_ids[0].tolist()
     prompt_len = int(input_ids.shape[1])
 

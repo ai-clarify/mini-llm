@@ -277,12 +277,16 @@ class BaseEagle3Drafter(nn.Module, ABC):
         """Get initial hidden states and past key values."""
         if hasattr(self, "stable_kv") and self.stable_kv is not None:
             kv_len = self.stable_kv[0][0].shape[2]
-            outputs = self(
-                hidden_states,
-                input_ids=input_ids[:, kv_len:],
-                past_key_values=self.stable_kv,
-                use_cache=True,
-            )
+            if kv_len < input_ids.shape[1]:
+                outputs = self(
+                    hidden_states,
+                    input_ids=input_ids[:, kv_len:],
+                    past_key_values=self.stable_kv,
+                    use_cache=True,
+                )
+            else:
+                self.stable_kv = None
+                outputs = self(hidden_states, input_ids=input_ids, use_cache=True)
         else:
             outputs = self(hidden_states, input_ids=input_ids, use_cache=True)
         out_hidden, past_key_values, early_stop_signal = outputs
