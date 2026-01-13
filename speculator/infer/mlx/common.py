@@ -28,6 +28,9 @@ class SpecStats:
     target_prefill_time_s: float
     target_verify_time_s: float
     target_generate_time_s: float
+    target_prefill_calls: int
+    target_verify_calls: int
+    target_generate_calls: int
     target_generated: int
 
 
@@ -224,7 +227,9 @@ def _token_probs_from_logits_batch(
     tokens = tokens.reshape(-1)
     if temperature <= 0:
         argmax = mx.argmax(logits, axis=-1)
-        return mx.where(argmax == tokens, mx.ones_like(tokens, dtype=mx.float32), mx.zeros_like(tokens, dtype=mx.float32))
+        ones = mx.ones(tokens.shape, dtype=mx.float32)
+        zeros = mx.zeros(tokens.shape, dtype=mx.float32)
+        return mx.where(argmax == tokens, ones, zeros)
 
     scaled = logits / float(temperature)
     if top_p >= 1.0:
@@ -697,6 +702,9 @@ def _speculative_decode_qwen3(
     target_prefill_time_s = 0.0
     target_verify_time_s = 0.0
     target_generate_time_s = 0.0
+    target_prefill_calls = 0
+    target_verify_calls = 0
+    target_generate_calls = 0
     target_generated = 0
 
     cache = mlx_cache.make_prompt_cache(target.model) if use_cache else None
@@ -712,6 +720,7 @@ def _speculative_decode_qwen3(
     prefill_s = time.perf_counter() - t0
     target_time_s += prefill_s
     target_prefill_time_s += prefill_s
+    target_prefill_calls += 1
     last_hidden = hidden[:, -1:, :]
     last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
 
@@ -749,6 +758,7 @@ def _speculative_decode_qwen3(
             verify_s = time.perf_counter() - t0
             target_time_s += verify_s
             target_verify_time_s += verify_s
+            target_verify_calls += 1
         else:
             full = mx.array([output_ids + draft_tokens], dtype=mx.int32)
             t0 = time.perf_counter()
@@ -766,6 +776,7 @@ def _speculative_decode_qwen3(
             verify_s = time.perf_counter() - t0
             target_time_s += verify_s
             target_verify_time_s += verify_s
+            target_verify_calls += 1
 
         accept_len, new_tokens, rejected = _accept_reject_block(
             draft_tokens=draft_tokens,
@@ -783,6 +794,7 @@ def _speculative_decode_qwen3(
             gen_s = time.perf_counter() - t0
             target_time_s += gen_s
             target_generate_time_s += gen_s
+            target_generate_calls += 1
             bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
             new_tokens.append(int(bonus_token))
             bonus_added = True
@@ -834,6 +846,7 @@ def _speculative_decode_qwen3(
                     gen_s = time.perf_counter() - t0
                     target_time_s += gen_s
                     target_generate_time_s += gen_s
+                    target_generate_calls += 1
                     last_hidden = hidden[:, -1:, :]
                     last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
                 else:
@@ -854,6 +867,7 @@ def _speculative_decode_qwen3(
                     prefill_s = time.perf_counter() - t0
                     target_time_s += prefill_s
                     target_prefill_time_s += prefill_s
+                    target_prefill_calls += 1
                     last_hidden = hidden[:, -1:, :]
                     last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
                 else:
@@ -870,6 +884,7 @@ def _speculative_decode_qwen3(
                     gen_s = time.perf_counter() - t0
                     target_time_s += gen_s
                     target_generate_time_s += gen_s
+                    target_generate_calls += 1
                     last_hidden = hidden[:, -1:, :]
                     last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
         else:
@@ -885,6 +900,7 @@ def _speculative_decode_qwen3(
             prefill_s = time.perf_counter() - t0
             target_time_s += prefill_s
             target_prefill_time_s += prefill_s
+            target_prefill_calls += 1
             last_hidden = hidden[:, -1:, :]
             last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
 
@@ -909,6 +925,7 @@ def _speculative_decode_qwen3(
         target_generate_time_s += gen_s
         if collect_stats:
             target_generated += len(output_ids) - before_len
+            target_generate_calls += len(output_ids) - before_len
 
     stats = None
     if collect_stats:
@@ -923,6 +940,9 @@ def _speculative_decode_qwen3(
             target_prefill_time_s=float(target_prefill_time_s),
             target_verify_time_s=float(target_verify_time_s),
             target_generate_time_s=float(target_generate_time_s),
+            target_prefill_calls=int(target_prefill_calls),
+            target_verify_calls=int(target_verify_calls),
+            target_generate_calls=int(target_generate_calls),
             target_generated=int(target_generated),
         )
     return output_ids, stats
@@ -1039,6 +1059,9 @@ def _speculative_decode_minillm(
     target_prefill_time_s = 0.0
     target_verify_time_s = 0.0
     target_generate_time_s = 0.0
+    target_prefill_calls = 0
+    target_verify_calls = 0
+    target_generate_calls = 0
     target_generated = 0
 
     while produced < int(max_new_tokens):
@@ -1054,6 +1077,7 @@ def _speculative_decode_minillm(
         prefill_s = time.perf_counter() - t0
         target_time_s += prefill_s
         target_prefill_time_s += prefill_s
+        target_prefill_calls += 1
         last_hidden = hidden[:, -1:, :]
         last_layer_hiddens = [h[:, -1:, :] for h in layer_hiddens]
 
@@ -1090,6 +1114,7 @@ def _speculative_decode_minillm(
         verify_s = time.perf_counter() - t0
         target_time_s += verify_s
         target_verify_time_s += verify_s
+        target_verify_calls += 1
 
         accept_len, new_tokens, rejected = _accept_reject_block(
             draft_tokens=draft_tokens,
@@ -1107,6 +1132,7 @@ def _speculative_decode_minillm(
             gen_s = time.perf_counter() - t0
             target_time_s += gen_s
             target_generate_time_s += gen_s
+            target_generate_calls += 1
             bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
             new_tokens.append(int(bonus_token))
             bonus_added = True
@@ -1162,6 +1188,7 @@ def _speculative_decode_minillm(
         target_generate_time_s += gen_s
         if collect_stats:
             target_generated += len(output_ids) - before_len
+            target_generate_calls += len(output_ids) - before_len
 
     stats = None
     if collect_stats:
@@ -1176,6 +1203,9 @@ def _speculative_decode_minillm(
             target_prefill_time_s=float(target_prefill_time_s),
             target_verify_time_s=float(target_verify_time_s),
             target_generate_time_s=float(target_generate_time_s),
+            target_prefill_calls=int(target_prefill_calls),
+            target_verify_calls=int(target_verify_calls),
+            target_generate_calls=int(target_generate_calls),
             target_generated=int(target_generated),
         )
     return output_ids, stats

@@ -328,6 +328,16 @@ def main() -> None:
             "target_generate_time_s": float(total_generate),
         }
 
+    def summarize_calls(rows: List[SpecBenchResult]) -> Dict[str, float]:
+        total_prefill = sum(r.stats.target_prefill_calls for r in rows)
+        total_verify = sum(r.stats.target_verify_calls for r in rows)
+        total_generate = sum(r.stats.target_generate_calls for r in rows)
+        return {
+            "prefill": float(total_prefill),
+            "verify": float(total_verify),
+            "generate": float(total_generate),
+        }
+
     base_stats = summarize(baseline_results)
     print(
         f"[bench] rounds={int(args.rounds)} samples={len(baseline_results)} prompts={len(prompt_inputs)} "
@@ -344,6 +354,7 @@ def main() -> None:
         accept_stats = summarize_acceptance(spec_results)
         token_stats = summarize_tokens(spec_results)
         timing_stats = summarize_timing(spec_results)
+        call_stats = summarize_calls(spec_results)
         target_per_out = token_stats["target_generated"] / max(spec_stats["output_tokens"], 1e-6)
         accept_per_out = token_stats["accepted_tokens"] / max(spec_stats["output_tokens"], 1e-6)
         draft_per_out = token_stats["draft_tokens"] / max(spec_stats["output_tokens"], 1e-6)
@@ -367,6 +378,15 @@ def main() -> None:
             f"[bench] target_time_s prefill={timing_stats['target_prefill_time_s']:.2f} "
             f"verify={timing_stats['target_verify_time_s']:.2f} "
             f"generate={timing_stats['target_generate_time_s']:.2f}"
+        )
+        baseline_calls = base_stats["output_tokens"]
+        if args.target_arch == "qwen3":
+            baseline_calls += len(baseline_results)
+        print(
+            f"[bench] forward_calls baseline={baseline_calls:.0f} "
+            f"verify={call_stats['verify']:.0f} "
+            f"generate={call_stats['generate']:.0f} "
+            f"prefill={call_stats['prefill']:.0f}"
         )
         print(
             f"[bench] tokens baseline_out={base_stats['output_tokens']:.0f} "
