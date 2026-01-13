@@ -156,6 +156,7 @@ def load_eagle3_target(
     return target, tokenizer
 
 
+@torch.inference_mode()
 def baseline_decode_eagle3(
     *,
     target: Qwen3ForCausalLM,
@@ -187,6 +188,7 @@ def baseline_decode_eagle3(
     return output_ids
 
 
+@torch.inference_mode()
 def eagle3_decode_with_stats(
     *,
     target: Qwen3ForCausalLM,
