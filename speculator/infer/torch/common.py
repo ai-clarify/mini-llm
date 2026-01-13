@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
 from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -26,8 +27,6 @@ def _resolve_dtype(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
-
-
 def _count_params_torch(model: nn.Module) -> Optional[int]:
     try:
         return int(sum(p.numel() for p in model.parameters()))
@@ -37,16 +36,16 @@ def _count_params_torch(model: nn.Module) -> Optional[int]:
 
 def _auto_spec_config(param_count: Optional[int]) -> Tuple[int, int]:
     if not param_count or param_count <= 0:
-        return 2, 2
+        return 4, 2
     params_b = float(param_count) / 1e9
     if params_b <= 1.0:
         return 4, 2
     if params_b <= 3.0:
         return 4, 2
     if params_b <= 7.0:
-        return 3, 2
+        return 5, 2
     if params_b <= 13.0:
-        return 4, 2
+        return 5, 2
     return 5, 2
 
 
@@ -93,7 +92,9 @@ def _select_feature_layers(num_layers: int, *, count: int = 4) -> List[int]:
     return selected
 
 
-def _resolve_feature_layers(feature_layers: Optional[List[int]], *, num_layers: int) -> List[int]:
+def _resolve_feature_layers(
+    feature_layers: Optional[List[int]], *, num_layers: int
+) -> List[int]:
     if feature_layers:
         return [int(i) for i in feature_layers]
     return _select_feature_layers(num_layers)
@@ -122,7 +123,9 @@ def _extract_hidden_layers(output: Any, layer_ids: List[int]) -> List[torch.Tens
     return [hidden_states[int(layer_id) + offset] for layer_id in layer_ids]
 
 
-def _project_logits_minillm(target: MiniLLMForCausalLM, hidden: torch.Tensor) -> torch.Tensor:
+def _project_logits_minillm(
+    target: MiniLLMForCausalLM, hidden: torch.Tensor
+) -> torch.Tensor:
     return target.lm_head(hidden)
 
 
@@ -157,12 +160,15 @@ def _minillm_forward_hidden_states(
     return h, [hidden for hidden in hiddens if hidden is not None]
 
 
-def _embed_tokens(target: AutoModelForCausalLM, token_ids: List[int]) -> Optional[torch.Tensor]:
+def _embed_tokens(
+    target: AutoModelForCausalLM, token_ids: List[int]
+) -> Optional[torch.Tensor]:
     if not token_ids:
         return None
     device = next(target.parameters()).device
     token_tensor = torch.tensor([token_ids], device=device, dtype=torch.long)
     return target.get_input_embeddings()(token_tensor)
+
 
 def _load_target_and_tokenizer(args, device: torch.device, dtype: torch.dtype):
     if args.target_arch == "minillm":
@@ -180,7 +186,9 @@ def _load_target_and_tokenizer(args, device: torch.device, dtype: torch.dtype):
             print("[warn] MiniLLM checkpoint not provided; using random weights")
         target = target.to(device=device, dtype=dtype)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.target_model, trust_remote_code=True
+        )
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id or 0
         tokenizer.padding_side = "right"
@@ -193,7 +201,9 @@ def _load_target_and_tokenizer(args, device: torch.device, dtype: torch.dtype):
     return target, tokenizer
 
 
-def _apply_chat_template(tokenizer, messages: List[Dict[str, Any]], *, add_generation_prompt: bool) -> str:
+def _apply_chat_template(
+    tokenizer, messages: List[Dict[str, Any]], *, add_generation_prompt: bool
+) -> str:
     return tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -254,7 +264,9 @@ def sample_next_token(logits: torch.Tensor, *, temperature: float, top_p: float)
     mask = cumprobs > float(top_p)
     if mask[..., 0].item():
         mask[..., 0] = False
-    sorted_logits = torch.where(mask, torch.tensor(-1e9, device=logits.device), sorted_logits)
+    sorted_logits = torch.where(
+        mask, torch.tensor(-1e9, device=logits.device), sorted_logits
+    )
     probs = torch.softmax(sorted_logits, dim=-1)
     picked = torch.multinomial(probs, num_samples=1)
     return int(sorted_idx.gather(-1, picked).item())
@@ -320,7 +332,9 @@ def _token_probs_from_logits_batch(
     cumprobs = torch.cumsum(sorted_probs, dim=-1)
     keep_prefix = torch.cat(
         [
-            torch.ones((int(logits.shape[0]), 1), device=logits.device, dtype=torch.bool),
+            torch.ones(
+                (int(logits.shape[0]), 1), device=logits.device, dtype=torch.bool
+            ),
             cumprobs[:, :-1] <= float(top_p),
         ],
         dim=-1,
@@ -343,7 +357,9 @@ def _accept_reject_block(
     """Reject-sampling acceptance for a draft block. Time O(kV) best/avg, O(kV log V) when top_p<1; space O(kV)."""
     if not draft_tokens:
         return 0, [], False
-    token_tensor = torch.tensor(draft_tokens, device=draft_logits.device, dtype=torch.long)
+    token_tensor = torch.tensor(
+        draft_tokens, device=draft_logits.device, dtype=torch.long
+    )
     q_probs = _token_probs_from_logits_batch(
         draft_logits, token_tensor, temperature=temperature, top_p=top_p
     )
@@ -361,7 +377,9 @@ def _accept_reject_block(
         return len(draft_tokens), draft_tokens, False
 
     reject_idx = int(torch.argmax(torch.logical_not(accepted).to(torch.int32)).item())
-    token = sample_next_token(target_logits[reject_idx], temperature=temperature, top_p=top_p)
+    token = sample_next_token(
+        target_logits[reject_idx], temperature=temperature, top_p=top_p
+    )
     new_tokens = list(draft_tokens[:reject_idx]) + [int(token)]
     return reject_idx, new_tokens, True
 
@@ -380,7 +398,10 @@ class FeatureFusion(nn.Module):
     def __init__(self, *, hidden_size: int, num_layers: int) -> None:
         super().__init__()
         self.projs = nn.ModuleList(
-            [nn.Linear(hidden_size, hidden_size, bias=False) for _ in range(int(num_layers))]
+            [
+                nn.Linear(hidden_size, hidden_size, bias=False)
+                for _ in range(int(num_layers))
+            ]
         )
         self.weights = nn.Parameter(torch.zeros(int(num_layers)))
 
@@ -408,7 +429,9 @@ class Eagle3Speculator(nn.Module):
     ) -> None:
         super().__init__()
         self.feature_layers = [int(i) for i in feature_layers]
-        self.fusion = FeatureFusion(hidden_size=hidden_size, num_layers=len(self.feature_layers))
+        self.fusion = FeatureFusion(
+            hidden_size=hidden_size, num_layers=len(self.feature_layers)
+        )
         self.layers = nn.ModuleList(
             [
                 nn.TransformerEncoderLayer(
@@ -426,19 +449,25 @@ class Eagle3Speculator(nn.Module):
         self.norm = nn.LayerNorm(hidden_size)
         rank = int(head_rank) if head_rank is not None and int(head_rank) > 0 else 0
         if rank > 0:
-            self.head = LowRankHead(hidden_size=hidden_size, vocab_size=vocab_size, rank=rank)
+            self.head = LowRankHead(
+                hidden_size=hidden_size, vocab_size=vocab_size, rank=rank
+            )
         else:
             self.head = nn.Linear(hidden_size, vocab_size, bias=False)
             if init_weight is not None:
                 self.head.weight.data.copy_(init_weight)
 
-    def fuse(self, hiddens: List[torch.Tensor], attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def fuse(
+        self, hiddens: List[torch.Tensor], attention_mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         fused = self.fusion(hiddens)
         if attention_mask is not None:
             fused = fused * attention_mask.unsqueeze(-1)
         return fused
 
-    def decode(self, *, fused_context: torch.Tensor, token_embeds: Optional[torch.Tensor]) -> torch.Tensor:
+    def decode(
+        self, *, fused_context: torch.Tensor, token_embeds: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         if token_embeds is None or int(token_embeds.shape[1]) == 0:
             x = fused_context
         else:
@@ -455,8 +484,6 @@ class Eagle3Speculator(nn.Module):
         x = self.norm(x)
         logits = self.head(x)
         return logits[:, -1, :]
-
-
 
 
 def load_speculator(
@@ -497,7 +524,9 @@ def load_speculator(
     if speculator_ckpt is None:
         latest = _pick_latest_checkpoint(speculator_dir / "checkpoints")
         if latest is None:
-            raise FileNotFoundError(f"No checkpoints under {speculator_dir}/checkpoints")
+            raise FileNotFoundError(
+                f"No checkpoints under {speculator_dir}/checkpoints"
+            )
         speculator_ckpt = latest / "speculator.pt"
     if not speculator_ckpt.is_file():
         raise FileNotFoundError(f"Speculator checkpoint not found: {speculator_ckpt}")
@@ -543,11 +572,19 @@ def baseline_decode(
     past = out.past_key_values if use_cache else None
     for _ in range(int(max_new_tokens)):
         token = sample_next_token(last_logits, temperature=temperature, top_p=top_p)
-        output_ids = torch.cat([output_ids, torch.tensor([[token]], device=device, dtype=torch.long)], dim=1)
+        output_ids = torch.cat(
+            [output_ids, torch.tensor([[token]], device=device, dtype=torch.long)],
+            dim=1,
+        )
         if eos_token_id is not None and token == eos_token_id:
             break
         if use_cache:
-            out = target(input_ids=output_ids[:, -1:], past_key_values=past, use_cache=True, return_dict=True)
+            out = target(
+                input_ids=output_ids[:, -1:],
+                past_key_values=past,
+                use_cache=True,
+                return_dict=True,
+            )
             past = out.past_key_values
             last_logits = out.logits[:, -1, :]
         else:
@@ -616,13 +653,19 @@ def _speculative_decode_qwen3(
         token_embeds = None
         for _ in range(int(block_len)):
             t0 = time.perf_counter()
-            logits = speculator.decode(fused_context=fused_context, token_embeds=token_embeds)
+            logits = speculator.decode(
+                fused_context=fused_context, token_embeds=token_embeds
+            )
             spec_time_s += time.perf_counter() - t0
             token = sample_next_token(logits[0], temperature=temperature, top_p=top_p)
             draft_tokens.append(int(token))
             draft_logits_steps.append(logits)
             token_embed = _embed_tokens(target, [int(token)])
-            token_embeds = token_embed if token_embeds is None else torch.cat([token_embeds, token_embed], dim=1)
+            token_embeds = (
+                token_embed
+                if token_embeds is None
+                else torch.cat([token_embeds, token_embed], dim=1)
+            )
         draft_logits = torch.cat(draft_logits_steps, dim=0)
 
         draft_tensor = torch.tensor([draft_tokens], dtype=torch.long, device=device)
@@ -641,7 +684,9 @@ def _speculative_decode_qwen3(
             target_verify_time_s += verify_s
             target_verify_calls += 1
             block_logits = block_out.logits
-            block_layer_hiddens = _extract_hidden_layers(block_out, speculator.feature_layers)
+            block_layer_hiddens = _extract_hidden_layers(
+                block_out, speculator.feature_layers
+            )
         else:
             t0 = time.perf_counter()
             block_out = target(
@@ -656,10 +701,13 @@ def _speculative_decode_qwen3(
             target_verify_calls += 1
             block_logits = block_out.logits[:, -len(draft_tokens) :, :]
             block_layer_hiddens = [
-                h[:, -len(draft_tokens) :, :] for h in _extract_hidden_layers(block_out, speculator.feature_layers)
+                h[:, -len(draft_tokens) :, :]
+                for h in _extract_hidden_layers(block_out, speculator.feature_layers)
             ]
             past_snapshot = None
-        shifted_logits = torch.cat([last_logits.unsqueeze(1), block_logits[:, :-1, :]], dim=1)
+        shifted_logits = torch.cat(
+            [last_logits.unsqueeze(1), block_logits[:, :-1, :]], dim=1
+        )
         accept_len, new_tokens, rejected = _accept_reject_block(
             draft_tokens=draft_tokens,
             draft_logits=draft_logits,
@@ -669,9 +717,15 @@ def _speculative_decode_qwen3(
         )
 
         bonus_added = False
-        if not rejected and accept_len == len(draft_tokens) and remaining > len(draft_tokens):
+        if (
+            not rejected
+            and accept_len == len(draft_tokens)
+            and remaining > len(draft_tokens)
+        ):
             bonus_logits = block_logits[:, -1, :]
-            bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
+            bonus_token = sample_next_token(
+                bonus_logits, temperature=temperature, top_p=top_p
+            )
             new_tokens.append(int(bonus_token))
             bonus_added = True
 
@@ -711,7 +765,8 @@ def _speculative_decode_qwen3(
             break
 
         output_ids = torch.cat(
-            [output_ids, torch.tensor([new_tokens], dtype=torch.long, device=device)], dim=1
+            [output_ids, torch.tensor([new_tokens], dtype=torch.long, device=device)],
+            dim=1,
         )
         produced += len(new_tokens)
 
@@ -741,7 +796,10 @@ def _speculative_decode_qwen3(
                     target_generate_calls += 1
                     past = bonus_out.past_key_values
                     last_layer_hiddens = [
-                        h[:, -1:, :] for h in _extract_hidden_layers(bonus_out, speculator.feature_layers)
+                        h[:, -1:, :]
+                        for h in _extract_hidden_layers(
+                            bonus_out, speculator.feature_layers
+                        )
                     ]
                     last_logits = bonus_out.logits[:, -1, :]
             else:
@@ -759,12 +817,15 @@ def _speculative_decode_qwen3(
                     target_prefill_calls += 1
                     past = out.past_key_values if use_cache else None
                     last_layer_hiddens = [
-                        h[:, -1:, :] for h in _extract_hidden_layers(out, speculator.feature_layers)
+                        h[:, -1:, :]
+                        for h in _extract_hidden_layers(out, speculator.feature_layers)
                     ]
                     last_logits = out.logits[:, -1, :]
                 else:
                     past = past_snapshot
-                    accept_tensor = torch.tensor([new_tokens], dtype=torch.long, device=device)
+                    accept_tensor = torch.tensor(
+                        [new_tokens], dtype=torch.long, device=device
+                    )
                     t0 = time.perf_counter()
                     accept_out = target(
                         input_ids=accept_tensor,
@@ -779,7 +840,10 @@ def _speculative_decode_qwen3(
                     target_generate_calls += 1
                     past = accept_out.past_key_values
                     last_layer_hiddens = [
-                        h[:, -1:, :] for h in _extract_hidden_layers(accept_out, speculator.feature_layers)
+                        h[:, -1:, :]
+                        for h in _extract_hidden_layers(
+                            accept_out, speculator.feature_layers
+                        )
                     ]
                     last_logits = accept_out.logits[:, -1, :]
         else:
@@ -795,7 +859,8 @@ def _speculative_decode_qwen3(
             target_prefill_time_s += prefill_s
             target_prefill_calls += 1
             last_layer_hiddens = [
-                h[:, -1:, :] for h in _extract_hidden_layers(out, speculator.feature_layers)
+                h[:, -1:, :]
+                for h in _extract_hidden_layers(out, speculator.feature_layers)
             ]
             last_logits = out.logits[:, -1, :]
 
@@ -900,13 +965,19 @@ def _speculative_decode_minillm(
         token_embeds = None
         for _ in range(int(block_len)):
             t0 = time.perf_counter()
-            logits = speculator.decode(fused_context=fused_context, token_embeds=token_embeds)
+            logits = speculator.decode(
+                fused_context=fused_context, token_embeds=token_embeds
+            )
             spec_time_s += time.perf_counter() - t0
             token = sample_next_token(logits[0], temperature=temperature, top_p=top_p)
             draft_tokens.append(int(token))
             draft_logits_steps.append(logits)
             token_embed = _embed_tokens(target, [int(token)])
-            token_embeds = token_embed if token_embeds is None else torch.cat([token_embeds, token_embed], dim=1)
+            token_embeds = (
+                token_embed
+                if token_embeds is None
+                else torch.cat([token_embeds, token_embed], dim=1)
+            )
         draft_logits = torch.cat(draft_logits_steps, dim=0)
 
         draft_tensor = torch.tensor([draft_tokens], dtype=torch.long, device=device)
@@ -935,9 +1006,17 @@ def _speculative_decode_minillm(
         )
 
         bonus_added = False
-        if not rejected and accept_len == len(draft_tokens) and remaining > len(draft_tokens):
-            bonus_logits = _project_logits_minillm(target, block_hidden[:, -1:, :])[:, -1, :]
-            bonus_token = sample_next_token(bonus_logits, temperature=temperature, top_p=top_p)
+        if (
+            not rejected
+            and accept_len == len(draft_tokens)
+            and remaining > len(draft_tokens)
+        ):
+            bonus_logits = _project_logits_minillm(target, block_hidden[:, -1:, :])[
+                :, -1, :
+            ]
+            bonus_token = sample_next_token(
+                bonus_logits, temperature=temperature, top_p=top_p
+            )
             new_tokens.append(int(bonus_token))
             bonus_added = True
 
@@ -968,7 +1047,8 @@ def _speculative_decode_minillm(
             target_generated += int(len(token_sources) - accepted_step)
 
         output_ids = torch.cat(
-            [output_ids, torch.tensor([new_tokens], dtype=torch.long, device=device)], dim=1
+            [output_ids, torch.tensor([new_tokens], dtype=torch.long, device=device)],
+            dim=1,
         )
         produced += len(new_tokens)
 
@@ -1100,22 +1180,38 @@ def speculative_decode_with_stats(
 
 def build_arg_parser(description: str) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3")
+    parser.add_argument(
+        "--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3"
+    )
     parser.add_argument("--target_model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--minillm_ckpt", type=str, default=None)
     parser.add_argument("--minillm_config", type=str, default=None)
     parser.add_argument("--minillm_tokenizer", type=str, default="./model")
-    parser.add_argument("--speculator_dir", type=str, default="out/eagle3_speculator/qwen3_0.6b")
+    parser.add_argument(
+        "--speculator_dir", type=str, default="out/eagle3_speculator/qwen3_0.6b"
+    )
     parser.add_argument("--speculator_ckpt", type=str, default=None)
     parser.add_argument("--prompt", type=str, default="Hello")
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_p", type=float, default=1.0)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
     parser.add_argument("--dtype", type=str, default="bfloat16")
-    parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
-    parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
+    parser.add_argument(
+        "--spec_len",
+        type=int,
+        default=None,
+        help="Draft length for speculator (auto if unset).",
+    )
+    parser.add_argument(
+        "--spec_layers",
+        type=int,
+        default=None,
+        help="Transformer layers in speculator (auto if unset).",
+    )
     parser.add_argument("--spec_heads", type=int, default=0)
     parser.add_argument(
         "--head_rank",
@@ -1151,13 +1247,19 @@ def run_cli() -> None:
         messages.append({"role": "system", "content": args.system})
     messages.append({"role": "user", "content": args.prompt})
     prompt_text = _apply_chat_template(tokenizer, messages, add_generation_prompt=True)
-    input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors="pt").input_ids.to(device)
+    input_ids = tokenizer(
+        prompt_text, add_special_tokens=False, return_tensors="pt"
+    ).input_ids.to(device)
 
     speculator = None
     spec_len, spec_layers = _resolve_spec_config(
         args.spec_len, args.spec_layers, param_count=_count_params_torch(target)
     )
-    head_rank = args.head_rank if args.head_rank is not None and int(args.head_rank) > 0 else None
+    head_rank = (
+        args.head_rank
+        if args.head_rank is not None and int(args.head_rank) > 0
+        else None
+    )
     if not args.no_speculator:
         speculator_dir = Path(args.speculator_dir)
         speculator_ckpt = Path(args.speculator_ckpt) if args.speculator_ckpt else None
