@@ -217,8 +217,15 @@ def _load_target_and_tokenizer(args, device: torch.device, dtype: torch.dtype):
             tokenizer.pad_token_id = tokenizer.eos_token_id or 0
         tokenizer.padding_side = "right"
 
+        model_kwargs: Dict[str, Any] = {
+            "trust_remote_code": True,
+            "torch_dtype": dtype,
+        }
+        if device.type == "mps":
+            model_kwargs["attn_implementation"] = "eager"
         target = AutoModelForCausalLM.from_pretrained(
-            args.target_model, trust_remote_code=True, torch_dtype=dtype
+            args.target_model,
+            **model_kwargs,
         ).to(device)
 
     target.eval()
