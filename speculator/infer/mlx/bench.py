@@ -229,7 +229,9 @@ class TokenLogWriter:
             self._rejected[token_id] += 1
             self._cluster_rejected[record["cluster"]] += 1
 
-    def trace_for(self, *, round_idx: int, prompt_idx: int) -> Callable[[Dict[str, Any]], None]:
+    def trace_for(
+        self, *, round_idx: int, prompt_idx: int
+    ) -> Callable[[Dict[str, Any]], None]:
         def _trace(event: Dict[str, Any]) -> None:
             payload = dict(event)
             payload["round"] = int(round_idx)
@@ -430,8 +432,8 @@ def main() -> None:
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=32)
     parser.add_argument("--max_new_tokens", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--top_p", type=float, default=0.9)
+    parser.add_argument("--temperature", type=float, default=0)
+    parser.add_argument("--top_p", type=float, default=1)
     parser.add_argument(
         "--spec_len",
         type=int,
@@ -496,7 +498,9 @@ def main() -> None:
     token_logger: Optional[TokenLogWriter] = None
     if args.token_log:
         if speculator is None:
-            print("[warn] --token_log ignored because speculator is disabled", flush=True)
+            print(
+                "[warn] --token_log ignored because speculator is disabled", flush=True
+            )
         else:
             token_log_path = Path(args.token_log)
             token_logger = TokenLogWriter(str(token_log_path), tokenizer)
@@ -566,7 +570,9 @@ def main() -> None:
                 if speculator is not None:
                     mx.random.seed(seed_base)
                     trace = (
-                        token_logger.trace_for(round_idx=round_idx, prompt_idx=prompt_idx)
+                        token_logger.trace_for(
+                            round_idx=round_idx, prompt_idx=prompt_idx
+                        )
                         if token_logger is not None
                         else None
                     )
