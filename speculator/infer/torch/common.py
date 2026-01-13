@@ -363,7 +363,7 @@ def _accept_reject_block(
     if bool(torch.all(accepted).item()):
         return len(draft_tokens), draft_tokens, False
 
-    reject_idx = int(torch.argmax(torch.logical_not(accepted)).item())
+    reject_idx = int(torch.argmax(torch.logical_not(accepted).to(torch.int32)).item())
     token = sample_next_token(target_logits[reject_idx], temperature=temperature, top_p=top_p)
     new_tokens = list(draft_tokens[:reject_idx]) + [int(token)]
     return reject_idx, new_tokens, True
