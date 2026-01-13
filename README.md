@@ -127,54 +127,25 @@ python speculator/train/mlx/train_eagle3_speculator.py --hf_repo Qwen/Qwen3-0.6B
 python speculator/infer/mlx/bench.py --hf_repo Qwen/Qwen3-0.6B --max_samples 16
 ```
 
-#### Qwen3-1.7B + AngelSlim EAGLE-3 权重（MLX，免训练）
+#### Qwen3 + SGLang 官方 EAGLE3 复现（推荐）
+
+官方复现方式建议直接使用 SGLang 的 EAGLE3 推理路径（不走本仓库的 drafter/bench）。示例参数来自 SGLang 官方文档，按模型与硬件调整：
 
 ```bash
-# 1) 可选：先把 Qwen3-1.7B 转成 MLX 权重（避免首次加载从 HF 转换）
-python -m mlx_train.cli.hf_convert --hf_repo Qwen/Qwen3-1.7B --out_dir out/mlx_hf/qwen_qwen3_1_7b
+# 1) 安装 sglang（建议独立环境）
+pip install sglang
 
-# 2) 下载 AngelSlim EAGLE-3 drafter 权重
-python - <<'PY'
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id="AngelSlim/Qwen3-1.7B_eagle3",
-    local_dir="out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3",
-)
-PY
-
-# 3) MLX：基准对比（baseline vs EAGLE-3 weights）
-python speculator/infer/mlx/bench.py \
-  --hf_repo Qwen/Qwen3-1.7B \
-  --model_dir out/mlx_hf/qwen_qwen3_1_7b \
-  --eagle3_dir out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3 \
-  --max_samples 16
+# 2) 启动服务
+python -m sglang.launch_server \
+  --model Qwen/Qwen3-1.7B \
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path <EAGLE3_DRAFT_MODEL> \
+  --speculative-num-steps 1 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 2
 ```
 
-#### Qwen3-1.7B + AngelSlim EAGLE-3 权重（Torch，免训练）
-
-```bash
-# 1) 下载 AngelSlim EAGLE-3 drafter 权重
-python - <<'PY'
-from huggingface_hub import snapshot_download
-snapshot_download(
-    repo_id="AngelSlim/Qwen3-1.7B_eagle3",
-    local_dir="out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3",
-)
-PY
-
-# 2) Torch：基准对比（baseline vs EAGLE-3 weights）
-# 注意：AngelSlim EAGLE-3 需使用 --eagle3_dir（树解码路径），--speculator_dir 仅用于本项目训练的 speculator。
-python speculator/infer/torch/bench.py \
-  --target_arch qwen3 \
-  --target_model Qwen/Qwen3-1.7B \
-  --eagle3_dir out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3 \
-  --temperature 0 \
-  --max_samples 16
-
-# 速度/采样参数建议：
-# - 速度优先（T=0）：--temperature 0 --max_new_tokens 1024
-# - 采样场景（T=0.8~1.0）：--temperature 0.8 --eagle3_total_tokens 31 --eagle3_depth 4 --eagle3_top_k 6 --eagle3_verify_top_k 6
-```
+`<EAGLE3_DRAFT_MODEL>` 请替换为与你的 base 模型匹配的官方 Eagle3 draft 权重；可参考 SGLang 文档并使用其 `scripts/playground/bench_speculative.py` 搜索更优参数。
 
 #### MiniLLM（Torch）
 
