@@ -115,6 +115,8 @@ def load_eagle3_drafter(
     if pad_token_id is None:
         pad_token_id = 0
     cfg = _load_eagle3_config(cfg_path, pad_token_id=int(pad_token_id))
+    if cfg.target_hidden_size is None:
+        cfg.target_hidden_size = int(getattr(target.config, "hidden_size", cfg.hidden_size))
 
     drafter = Llama3Eagle3Drafter(
         cfg,

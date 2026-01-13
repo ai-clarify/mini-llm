@@ -323,8 +323,15 @@ class Eagle3Drafter(nn.Module):
         return tree_mask, input_hidden, input_ids, scores, topk_cs_index, past_key_values
 
     def _build_tree_mask(
-        self, top_indices: mx.array, parents_list: Sequence[mx.array]
+        self,
+        top_indices: mx.array,
+        parents_list: Sequence[mx.array],
+        *,
+        total_tokens: Optional[int] = None,
     ) -> Tuple[mx.array, mx.array]:
+        if total_tokens is None:
+            total_tokens = int(self.total_tokens)
+        total_tokens = int(total_tokens)
         top_indices_list = [int(x) for x in top_indices.tolist()]
         parents = mx.concatenate(list(parents_list), axis=0)
         parent_tokens = parents[top_indices // int(self.top_k)].tolist()
@@ -340,16 +347,13 @@ class Eagle3Drafter(nn.Module):
             mask_index_list.append(idx)
         mask_index_list = [idx + 1 for idx in mask_index_list]
 
-        tree_mask = [[False] * (self.total_tokens + 1) for _ in range(self.total_tokens + 1)]
-        for i in range(self.total_tokens + 1):
+        tree_mask = [[False] * (total_tokens + 1) for _ in range(total_tokens + 1)]
+        for i in range(total_tokens + 1):
             tree_mask[i][0] = True
-        for i in range(self.total_tokens):
+        for i in range(total_tokens):
             parent = mask_index_list[i]
             if parent >= 0:
-                tree_mask[i + 1] = [
-                    tree_mask[i + 1][j] or tree_mask[parent][j]
-                    for j in range(self.total_tokens + 1)
-                ]
+                tree_mask[i + 1] = [tree_mask[i + 1][j] or tree_mask[parent][j] for j in range(total_tokens + 1)]
             tree_mask[i + 1][i + 1] = True
 
         tree_position_ids = [sum(row) - 1 for row in tree_mask]
@@ -359,8 +363,16 @@ class Eagle3Drafter(nn.Module):
         )
 
     def _generate_retrieve_indices(
-        self, tree_position_ids: mx.array, top_indices: mx.array, parents_list: Sequence[mx.array]
+        self,
+        tree_position_ids: mx.array,
+        top_indices: mx.array,
+        parents_list: Sequence[mx.array],
+        *,
+        total_tokens: Optional[int] = None,
     ) -> mx.array:
+        if total_tokens is None:
+            total_tokens = int(self.total_tokens)
+        total_tokens = int(total_tokens)
         top_indices_list = [int(x) for x in top_indices.tolist()]
         parents = mx.concatenate(list(parents_list), axis=0)
         parent_tokens = parents[top_indices // int(self.top_k)].tolist()
@@ -377,12 +389,12 @@ class Eagle3Drafter(nn.Module):
         mask_index_list = [idx + 1 for idx in mask_index_list]
 
         noleaf = sorted(set(mask_index_list))
-        leaf_num = self.total_tokens - (len(noleaf) - 1)
+        leaf_num = total_tokens - (len(noleaf) - 1)
         max_depth = int(mx.max(tree_position_ids).item()) + 1
         retrieve_indices = [[-1] * max_depth for _ in range(leaf_num)]
         position_ids_list = tree_position_ids.tolist()
         rid = 0
-        for i in range(self.total_tokens + 1):
+        for i in range(total_tokens + 1):
             if i not in noleaf:
                 cid = i
                 depth = int(position_ids_list[i])
@@ -392,8 +404,15 @@ class Eagle3Drafter(nn.Module):
                 rid += 1
         return mx.array(retrieve_indices, dtype=mx.int32)
 
-    def _apply_logits_processor(self, retrieve_indices: mx.array) -> mx.array:
-        maxitem = int(self.total_tokens) + 5
+    def _apply_logits_processor(
+        self,
+        retrieve_indices: mx.array,
+        *,
+        total_tokens: Optional[int] = None,
+    ) -> mx.array:
+        if total_tokens is None:
+            total_tokens = int(self.total_tokens)
+        maxitem = int(total_tokens) + 5
 
         def custom_sort(row: List[int]) -> List[int]:
             return [x if x >= 0 else maxitem for x in row]
@@ -457,18 +476,49 @@ class Eagle3Drafter(nn.Module):
                 ss_token,
                 past_key_values,
             )
+            if self.threshold < 0.0:
+                max_score = float(mx.max(scores).item())
+                if max_score < self.threshold:
+                    break
 
         all_scores = mx.concatenate(scores_list, axis=0).reshape(-1)
-        order = mx.argsort(-all_scores)
-        top_indices = mx.sort(order[: self.total_tokens])
+        total_candidates = int(all_scores.shape[0])
+        neg_inf = mx.array(-1e9, dtype=all_scores.dtype)
+        if self.threshold < 0.0:
+            mask = all_scores > neg_inf
+            kept = int(mx.sum(mask).item())
+            if kept > 0:
+                masked_scores = mx.where(mask, all_scores, neg_inf)
+                order = mx.argsort(-masked_scores)
+                actual_total = min(int(self.total_tokens), kept)
+            else:
+                order = mx.argsort(-all_scores)
+                actual_total = min(int(self.total_tokens), 1)
+        else:
+            order = mx.argsort(-all_scores)
+            actual_total = int(self.total_tokens)
+        if actual_total > total_candidates:
+            actual_total = total_candidates
+        if actual_total <= 0:
+            actual_total = min(int(self.total_tokens), max(1, total_candidates))
+        top_indices = mx.sort(order[:actual_total])
         all_tokens = mx.concatenate(ss_token, axis=0).reshape(-1)
         draft_tokens = mx.take_along_axis(all_tokens, top_indices, axis=0)
         draft_tokens = mx.concatenate([sample_token, draft_tokens], axis=0)
 
-        tree_mask, tree_position_ids = self._build_tree_mask(top_indices, parents_list)
-        retrieve_indices = self._generate_retrieve_indices(tree_position_ids, top_indices, parents_list)
+        tree_mask, tree_position_ids = self._build_tree_mask(
+            top_indices,
+            parents_list,
+            total_tokens=actual_total,
+        )
+        retrieve_indices = self._generate_retrieve_indices(
+            tree_position_ids,
+            top_indices,
+            parents_list,
+            total_tokens=actual_total,
+        )
         if apply_logits_processor:
-            retrieve_indices = self._apply_logits_processor(retrieve_indices)
+            retrieve_indices = self._apply_logits_processor(retrieve_indices, total_tokens=actual_total)
         return (
             draft_tokens[None],
             retrieve_indices,
