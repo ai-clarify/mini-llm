@@ -251,6 +251,10 @@ class Eagle3Drafter(nn.Module):
     def _get_topk_tokens(self, hidden: mx.array) -> Tuple[mx.array, mx.array]:
         logits = self.lm_head(self.norm(hidden))
         log_probs = nn.log_softmax(logits, axis=-1)
+        if self.threshold < 0.0:
+            cutoff = mx.array(self.threshold, dtype=log_probs.dtype)
+            neg_inf = mx.array(-1e9, dtype=log_probs.dtype)
+            log_probs = mx.where(log_probs < cutoff, neg_inf, log_probs)
         order = mx.argsort(-log_probs, axis=-1)
         topk_idx = order[:, : self.top_k]
         topk_vals = mx.take_along_axis(log_probs, topk_idx, axis=-1)
@@ -262,6 +266,8 @@ class Eagle3Drafter(nn.Module):
         if self.stable_kv is not None:
             kv_len = int(self.stable_kv.offset)
             input_ids = input_ids[:, kv_len:]
+            if kv_len > 0:
+                hidden_states = hidden_states[:, kv_len:]
             outputs = self(hidden_states, input_ids=input_ids, past_key_values=self.stable_kv, use_cache=True)
         else:
             outputs = self(hidden_states, input_ids=input_ids, past_key_values=None, use_cache=True)
@@ -640,50 +646,57 @@ def _qwen3_attention_with_positions(
     return attn.o_proj(out)
 
 
-def _filter_logits_to_probs(
+def _topk_logits_to_distribution(
     logits: mx.array,
     *,
     temperature: float,
     top_p: float,
     top_k: int,
-) -> List[float]:
+) -> Tuple[List[int], List[float]]:
+    """Return top-k token ids + probs. Time O(k log k) best/avg/worst, space O(k)."""
     if temperature > 0:
         logits = logits / float(temperature)
-    logits_np = logits.astype(mx.float32).tolist()
-    if top_k and top_k > 0:
-        if top_k < len(logits_np):
-            threshold = sorted(logits_np, reverse=True)[int(top_k) - 1]
-            logits_np = [v if v >= threshold else -1e9 for v in logits_np]
+    logits = logits.astype(mx.float32)
+    vocab = int(logits.shape[-1])
+    k = int(top_k)
+    if k <= 0 or k > vocab:
+        k = vocab
+    if k <= 0:
+        return [0], [1.0]
+
+    values, indices = mx.topk(logits, k=k)
+    order = mx.argsort(-values, axis=-1)
+    values = mx.take_along_axis(values, order, axis=-1)
+    indices = mx.take_along_axis(indices, order, axis=-1)
+    probs = mx.softmax(values, axis=-1)
     if top_p < 1.0:
-        order = sorted(range(len(logits_np)), key=lambda i: logits_np[i], reverse=True)
-        max_logit = max(logits_np)
-        exp = [math.exp(logits_np[i] - max_logit) for i in order]
-        total = sum(exp)
-        probs = [v / total for v in exp]
-        cum = 0.0
-        keep = set()
-        for idx, p in zip(order, probs):
-            cum += p
-            keep.add(idx)
-            if cum >= top_p:
-                break
-        logits_np = [logits_np[i] if i in keep else -1e9 for i in range(len(logits_np))]
-    max_logit = max(logits_np)
-    exp = [math.exp(v - max_logit) for v in logits_np]
-    total = sum(exp)
-    if total <= 0:
-        return [0.0] * len(exp)
-    return [v / total for v in exp]
+        cum = mx.cumsum(probs, axis=-1)
+        keep = mx.concatenate(
+            [mx.array([True], dtype=mx.bool_), cum[:-1] <= float(top_p)],
+            axis=-1,
+        )
+        zeros = mx.zeros_like(probs)
+        probs = mx.where(keep, probs, zeros)
+        total = float(mx.sum(probs).item())
+        if total > 0.0:
+            probs = probs / total
+        else:
+            head = mx.array([1.0], dtype=probs.dtype)
+            tail = mx.zeros((k - 1,), dtype=probs.dtype) if k > 1 else mx.array([], dtype=probs.dtype)
+            probs = mx.concatenate([head, tail], axis=-1)
+    return indices.astype(mx.int32).tolist(), probs.astype(mx.float32).tolist()
 
 
-def _sample_from_probs(probs: List[float], rng: random.Random) -> int:
+def _sample_from_sparse(top_idx: List[int], probs: List[float], rng: random.Random) -> int:
+    if not top_idx:
+        return 0
     r = rng.random()
     cum = 0.0
-    for idx, p in enumerate(probs):
+    for tok, p in zip(top_idx, probs):
         cum += p
         if r <= cum:
-            return idx
-    return len(probs) - 1
+            return int(tok)
+    return int(top_idx[-1])
 
 
 def _evaluate_posterior(
@@ -696,17 +709,17 @@ def _evaluate_posterior(
     rng: random.Random,
 ) -> Tuple[int, int, int]:
     candidates_np = candidates.astype(mx.int32).tolist()
-    logits_np = logits.astype(mx.float32).tolist()
     num_cand = len(candidates_np)
     cand_len = len(candidates_np[0]) if candidates_np else 0
     if cand_len == 0:
         return 0, 0, 0
     if temperature <= 0:
+        argmax = mx.argmax(logits[:, :-1, :], axis=-1).astype(mx.int32).tolist()
         accept_lengths = []
         for row in range(num_cand):
             ok = 0
             for j in range(1, cand_len):
-                target_token = max(range(len(logits_np[row][j - 1])), key=lambda i: logits_np[row][j - 1][i])
+                target_token = int(argmax[row][j - 1])
                 if candidates_np[row][j] == target_token:
                     ok += 1
                 else:
@@ -714,56 +727,67 @@ def _evaluate_posterior(
             accept_lengths.append(ok)
         accept_length = max(accept_lengths)
         best_candidate = accept_lengths.index(accept_length) if accept_length > 0 else 0
-        next_logits = logits_np[best_candidate][accept_length]
-        sample_token = max(range(len(next_logits)), key=lambda i: next_logits[i])
+        sample_token = int(mx.argmax(logits[best_candidate, accept_length, :]).item())
         return best_candidate, accept_length, sample_token
+
+    if int(top_k) <= 0:
+        top_k = min(128, int(logits.shape[-1]))
 
     accept_length = 1
     accept_cand = candidates_np[0][:1]
     best_candidate = 0
     adjustflag = False
+    last_top_idx: Optional[List[int]] = None
+    last_probs: Optional[List[float]] = None
     for i in range(1, cand_len):
         if i != accept_length:
             break
         is_eq = [row[:accept_length] == accept_cand for row in candidates_np]
+        if True not in is_eq:
+            break
         fi = is_eq.index(True)
-        gtp = _filter_logits_to_probs(
-            mx.array(logits_np[fi][i - 1]),
+        top_idx, probs = _topk_logits_to_distribution(
+            logits[fi, i - 1, :],
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
         )
-        candidates_set: List[int] = []
+        idx_map = {tok: pos for pos, tok in enumerate(top_idx)}
+        last_top_idx = top_idx
+        last_probs = probs
+        candidates_set: set[int] = set()
         for j in range(num_cand):
             if not is_eq[j]:
                 continue
             xi = int(candidates_np[j][i])
             if xi in candidates_set or xi == -1:
                 continue
-            candidates_set.append(xi)
+            candidates_set.add(xi)
             r = rng.random()
-            px = gtp[xi]
-            acp = px
-            if r <= acp:
+            pos = idx_map.get(xi)
+            px = probs[pos] if pos is not None else 0.0
+            if r <= px:
                 accept_cand = accept_cand + [xi]
                 accept_length += 1
                 best_candidate = j
                 break
-            gtp[xi] = 0.0
-            total = sum(gtp)
-            if total > 0:
-                gtp = [p / total for p in gtp]
             adjustflag = True
-    if adjustflag and accept_length != cand_len:
-        sample_p = gtp
+            if pos is not None:
+                probs[pos] = 0.0
+                total = sum(probs)
+                if total > 0.0:
+                    probs = [p / total for p in probs]
+                last_probs = probs
+    if adjustflag and accept_length != cand_len and last_top_idx and last_probs is not None:
+        sample_token = _sample_from_sparse(last_top_idx, last_probs, rng)
     else:
-        sample_p = _filter_logits_to_probs(
-            mx.array(logits_np[best_candidate][accept_length - 1]),
+        top_idx, probs = _topk_logits_to_distribution(
+            logits[best_candidate, accept_length - 1, :],
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
         )
-    sample_token = _sample_from_probs(sample_p, rng)
+        sample_token = _sample_from_sparse(top_idx, probs, rng)
     return best_candidate, accept_length - 1, sample_token
 
 
@@ -799,6 +823,7 @@ def eagle3_decode_with_stats(
     cache = mlx_cache.make_prompt_cache(target.model)
     prompt = mx.array([output_ids], dtype=mx.int32)
     layer_ids = _resolve_eagle3_layers(len(target.model.layers))
+    drafter.reset_kv()
     t0 = time.perf_counter()
     hidden, layer_hiddens = _qwen3_forward_hidden_states(
         target,
@@ -821,7 +846,6 @@ def eagle3_decode_with_stats(
     full_hidden_concat = hidden_concat
 
     t0 = time.perf_counter()
-    drafter.reset_kv()
     draft_tokens, retrieve_indices, tree_mask, tree_position_ids, _ = drafter.topk_generate(
         hidden_states=full_hidden_concat,
         input_ids=draft_input,
@@ -936,7 +960,6 @@ def eagle3_decode_with_stats(
 
         draft_input = mx.array([output_ids + [int(sample_token)]], dtype=mx.int32)
         t0 = time.perf_counter()
-        drafter.reset_kv()
         draft_tokens, retrieve_indices, tree_mask, tree_position_ids, _ = drafter.topk_generate(
             hidden_states=full_hidden_concat,
             input_ids=draft_input,

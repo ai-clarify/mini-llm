@@ -29,21 +29,6 @@ def _resolve_dtype(name: str) -> torch.dtype:
     raise ValueError(f"Unsupported dtype: {name}")
 
 
-def _default_device_name() -> str:
-    if torch.cuda.is_available():
-        return "cuda"
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"
-
-
-def _maybe_adjust_dtype_for_device(device: torch.device, dtype: torch.dtype) -> torch.dtype:
-    if device.type == "mps" and dtype == torch.bfloat16:
-        try:
-            torch.empty((1,), device=device, dtype=dtype)
-        except Exception:
-            return torch.float16
-    return dtype
 
 
 def _count_params_torch(model: nn.Module) -> Optional[int]:
@@ -217,15 +202,8 @@ def _load_target_and_tokenizer(args, device: torch.device, dtype: torch.dtype):
             tokenizer.pad_token_id = tokenizer.eos_token_id or 0
         tokenizer.padding_side = "right"
 
-        model_kwargs: Dict[str, Any] = {
-            "trust_remote_code": True,
-            "torch_dtype": dtype,
-        }
-        if device.type == "mps":
-            model_kwargs["attn_implementation"] = "eager"
         target = AutoModelForCausalLM.from_pretrained(
-            args.target_model,
-            **model_kwargs,
+            args.target_model, trust_remote_code=True, torch_dtype=dtype
         ).to(device)
 
     target.eval()
@@ -1631,7 +1609,7 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top_p", type=float, default=1.0)
-    parser.add_argument("--device", type=str, default=_default_device_name())
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--spec_len", type=int, default=None, help="Draft length for speculator (auto if unset).")
     parser.add_argument("--spec_layers", type=int, default=None, help="Transformer layers in speculator (auto if unset).")
@@ -1662,7 +1640,6 @@ def run_cli() -> None:
 
     device = torch.device(args.device)
     dtype = _resolve_dtype(args.dtype)
-    dtype = _maybe_adjust_dtype_for_device(device, dtype)
 
     target, tokenizer = _load_target_and_tokenizer(args, device, dtype)
 
