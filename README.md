@@ -163,9 +163,11 @@ snapshot_download(
 PY
 
 # 2) Torch：基准对比（baseline vs EAGLE-3 weights）
+# 注意：AngelSlim EAGLE-3 需使用 --eagle3_dir（树解码路径），--speculator_dir 仅用于本项目训练的 speculator。
 python speculator/infer/torch/bench.py \
+  --target_arch qwen3 \
   --target_model Qwen/Qwen3-1.7B \
-  --speculator_dir out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3 \
+  --eagle3_dir out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3 \
   --max_samples 16
 ```
 

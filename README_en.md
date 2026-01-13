@@ -164,9 +164,11 @@ snapshot_download(
 PY
 
 # 2) Torch: benchmark (baseline vs EAGLE-3 weights)
+# Note: AngelSlim EAGLE-3 requires --eagle3_dir (tree decode). --speculator_dir is only for MiniLLM-trained speculators.
 python speculator/infer/torch/bench.py \
+  --target_arch qwen3 \
   --target_model Qwen/Qwen3-1.7B \
-  --speculator_dir out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3 \
+  --eagle3_dir out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3 \
   --max_samples 16
 ```
 
