@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -10,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers.activations import ACT2FN
 
 from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
 
@@ -41,7 +43,7 @@ def _auto_spec_config(param_count: Optional[int]) -> Tuple[int, int]:
     if params_b <= 1.0:
         return 4, 2
     if params_b <= 3.0:
-        return 3, 2
+        return 4, 2
     if params_b <= 7.0:
         return 3, 2
     if params_b <= 13.0:
@@ -76,6 +78,20 @@ class SpecStats:
     target_verify_calls: int
     target_generate_calls: int
     target_generated: int
+
+
+@dataclass(frozen=True)
+class Eagle3HFConfig:
+    hidden_size: int
+    intermediate_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    max_position_embeddings: int
+    rms_norm_eps: float
+    rope_theta: float
+    rope_scaling: Optional[Dict[str, Any]]
+    hidden_act: str
+    head_dim: Optional[int] = None
 
 
 def _select_feature_layers(num_layers: int, *, count: int = 4) -> List[int]:
@@ -444,6 +460,470 @@ class Eagle3Speculator(nn.Module):
         return logits[:, -1, :]
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    return torch.cat((-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1)
+
+
+def _apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    position_ids: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    cos = cos.squeeze(1).squeeze(0)
+    sin = sin.squeeze(1).squeeze(0)
+    cos = cos[position_ids].unsqueeze(1)
+    sin = sin[position_ids].unsqueeze(1)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def _repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    batch, num_key_value_heads, seq_len, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, seq_len, head_dim
+    )
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, seq_len, head_dim)
+
+
+class _Eagle3RotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        *,
+        max_position_embeddings: int = 2048,
+        base: float = 10000.0,
+    ) -> None:
+        super().__init__()
+        self.dim = int(dim)
+        self.max_position_embeddings = int(max_position_embeddings)
+        self.base = float(base)
+        inv_freq = 1.0 / (
+            self.base ** (torch.arange(0, self.dim, 2).float() / self.dim)
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._set_cos_sin_cache(
+            seq_len=self.max_position_embeddings,
+            device=self.inv_freq.device,
+            dtype=torch.get_default_dtype(),
+        )
+
+    def _set_cos_sin_cache(self, *, seq_len: int, device: torch.device, dtype: torch.dtype) -> None:
+        self.max_seq_len_cached = int(seq_len)
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer(
+            "cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False
+        )
+        self.register_buffer(
+            "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
+        )
+
+    def forward(self, x: torch.Tensor, *, seq_len: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if int(seq_len) > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=int(seq_len), device=x.device, dtype=x.dtype)
+        return (
+            self.cos_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+            self.sin_cached[:, :, :seq_len, ...].to(dtype=x.dtype),
+        )
+
+
+class _Eagle3LinearScalingRotaryEmbedding(_Eagle3RotaryEmbedding):
+    def __init__(
+        self,
+        dim: int,
+        *,
+        max_position_embeddings: int = 2048,
+        base: float = 10000.0,
+        scaling_factor: float = 1.0,
+    ) -> None:
+        self.scaling_factor = float(scaling_factor)
+        super().__init__(dim, max_position_embeddings=max_position_embeddings, base=base)
+
+    def _set_cos_sin_cache(self, *, seq_len: int, device: torch.device, dtype: torch.dtype) -> None:
+        self.max_seq_len_cached = int(seq_len)
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        t = t / self.scaling_factor
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer(
+            "cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False
+        )
+        self.register_buffer(
+            "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
+        )
+
+
+class _Eagle3DynamicNTKScalingRotaryEmbedding(_Eagle3RotaryEmbedding):
+    def __init__(
+        self,
+        dim: int,
+        *,
+        max_position_embeddings: int = 2048,
+        base: float = 10000.0,
+        scaling_factor: float = 1.0,
+    ) -> None:
+        self.scaling_factor = float(scaling_factor)
+        super().__init__(dim, max_position_embeddings=max_position_embeddings, base=base)
+
+    def _set_cos_sin_cache(self, *, seq_len: int, device: torch.device, dtype: torch.dtype) -> None:
+        self.max_seq_len_cached = int(seq_len)
+        if int(seq_len) > int(self.max_position_embeddings):
+            base = self.base * (
+                (self.scaling_factor * float(seq_len) / float(self.max_position_embeddings))
+                - (self.scaling_factor - 1.0)
+            ) ** (self.dim / max(self.dim - 2, 1))
+            inv_freq = 1.0 / (
+                base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
+            )
+            self.register_buffer("inv_freq", inv_freq, persistent=False)
+        t = torch.arange(self.max_seq_len_cached, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer(
+            "cos_cached", emb.cos()[None, None, :, :].to(dtype), persistent=False
+        )
+        self.register_buffer(
+            "sin_cached", emb.sin()[None, None, :, :].to(dtype), persistent=False
+        )
+
+
+class _Eagle3LlamaAttention(nn.Module):
+    def __init__(self, config: Eagle3HFConfig) -> None:
+        super().__init__()
+        self.hidden_size = int(config.hidden_size)
+        self.num_heads = int(config.num_attention_heads)
+        self.num_key_value_heads = int(config.num_key_value_heads)
+        self.head_dim = int(config.head_dim or self.hidden_size // self.num_heads)
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+        self.max_position_embeddings = int(config.max_position_embeddings)
+
+        self.q_proj = nn.Linear(self.hidden_size * 2, self.num_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(self.hidden_size * 2, self.num_key_value_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self._init_rope(config)
+
+    def _init_rope(self, config: Eagle3HFConfig) -> None:
+        if config.rope_scaling is None:
+            self.rotary_emb = _Eagle3RotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=config.rope_theta,
+            )
+            return
+        scaling_type = str(config.rope_scaling.get("type", ""))
+        scaling_factor = float(config.rope_scaling.get("factor", 1.0))
+        if scaling_type == "linear":
+            self.rotary_emb = _Eagle3LinearScalingRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=config.rope_theta,
+                scaling_factor=scaling_factor,
+            )
+        elif scaling_type == "dynamic":
+            self.rotary_emb = _Eagle3DynamicNTKScalingRotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=config.rope_theta,
+                scaling_factor=scaling_factor,
+            )
+        else:
+            self.rotary_emb = _Eagle3RotaryEmbedding(
+                self.head_dim,
+                max_position_embeddings=self.max_position_embeddings,
+                base=config.rope_theta,
+            )
+
+    def forward(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        bsz, q_len, _ = hidden_states.size()
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        cos, sin = self.rotary_emb(value_states, seq_len=q_len)
+        query_states, key_states = _apply_rotary_pos_emb(
+            query_states, key_states, cos, sin, position_ids
+        )
+
+        key_states = _repeat_kv(key_states, self.num_key_value_groups)
+        value_states = _repeat_kv(value_states, self.num_key_value_groups)
+
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if attention_mask is not None:
+            attn_weights = attn_weights + attention_mask
+
+        attn_probs = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_probs, value_states)
+        attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
+        return self.o_proj(attn_output)
+
+
+class _Eagle3LlamaMLP(nn.Module):
+    def __init__(self, config: Eagle3HFConfig) -> None:
+        super().__init__()
+        self.hidden_size = int(config.hidden_size)
+        self.intermediate_size = int(config.intermediate_size)
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = ACT2FN[str(config.hidden_act)]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class _Eagle3RMSNorm(nn.Module):
+    def __init__(self, hidden_size: int, *, eps: float) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(int(hidden_size)))
+        self.eps = float(eps)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps)
+        return self.weight * hidden_states.to(input_dtype)
+
+
+class _Eagle3LlamaDecoderLayer(nn.Module):
+    def __init__(self, config: Eagle3HFConfig) -> None:
+        super().__init__()
+        self.hidden_size = int(config.hidden_size)
+        self.self_attn = _Eagle3LlamaAttention(config)
+        self.mlp = _Eagle3LlamaMLP(config)
+        self.hidden_norm = _Eagle3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = _Eagle3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = _Eagle3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        *,
+        input_emb: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.hidden_norm(hidden_states)
+        input_emb = self.input_layernorm(input_emb)
+        hidden_states = torch.cat((input_emb, hidden_states), dim=-1)
+        hidden_states = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        hidden_states = residual + hidden_states
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        return residual + hidden_states
+
+
+class Eagle3HFSpeculator(nn.Module):
+    def __init__(
+        self,
+        *,
+        config: Eagle3HFConfig,
+        target_hidden_size: int,
+        target_vocab_size: int,
+        draft_vocab_size: int,
+        feature_layers: List[int],
+    ) -> None:
+        super().__init__()
+        self.feature_layers = [int(i) for i in feature_layers]
+        self.hidden_size = int(config.hidden_size)
+        self.target_vocab_size = int(target_vocab_size)
+        self.draft_vocab_size = int(draft_vocab_size)
+        self.fc = nn.Linear(
+            int(target_hidden_size) * len(self.feature_layers),
+            self.hidden_size,
+            bias=False,
+        )
+        self.midlayer = _Eagle3LlamaDecoderLayer(config)
+        self.norm = _Eagle3RMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = nn.Linear(self.hidden_size, self.draft_vocab_size, bias=False)
+        self.register_buffer("d2t", torch.zeros(self.draft_vocab_size, dtype=torch.long))
+        self.register_buffer("t2d", torch.zeros(self.target_vocab_size, dtype=torch.bool))
+        self.register_buffer(
+            "_draft_ids", torch.arange(self.draft_vocab_size, dtype=torch.long), persistent=False
+        )
+
+    def fuse(self, hiddens: List[torch.Tensor], attention_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if not hiddens:
+            raise ValueError("HF speculator requires non-empty hidden states.")
+        fused = torch.cat(hiddens, dim=-1).to(self.fc.weight.dtype)
+        fused = self.fc(fused)
+        if attention_mask is not None:
+            fused = fused * attention_mask.unsqueeze(-1)
+        return fused
+
+    def _map_draft_logits(self, draft_logits: torch.Tensor) -> torch.Tensor:
+        target_ids = self._draft_ids + self.d2t
+        target_logits = torch.full(
+            (draft_logits.shape[0], self.target_vocab_size),
+            float("-inf"),
+            device=draft_logits.device,
+            dtype=draft_logits.dtype,
+        )
+        target_logits.index_copy_(1, target_ids, draft_logits)
+        return target_logits
+
+    def decode(self, *, fused_context: torch.Tensor, token_embeds: Optional[torch.Tensor]) -> torch.Tensor:
+        if token_embeds is None or int(token_embeds.shape[1]) == 0:
+            token_embeds = torch.zeros_like(fused_context)
+        if fused_context.shape[1] != token_embeds.shape[1]:
+            fused_context = fused_context.expand(-1, token_embeds.shape[1], -1)
+        dtype = self.lm_head.weight.dtype
+        fused_context = fused_context.to(dtype)
+        token_embeds = token_embeds.to(dtype)
+
+        seq_len = int(token_embeds.shape[1])
+        attention_mask = None
+        if seq_len > 1:
+            attention_mask = torch.triu(
+                torch.full((seq_len, seq_len), float("-inf"), device=token_embeds.device),
+                diagonal=1,
+            )
+            attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
+        position_ids = torch.arange(seq_len, device=token_embeds.device).unsqueeze(0)
+        position_ids = position_ids.expand(token_embeds.shape[0], -1)
+
+        hidden_states = fused_context
+        if hidden_states.shape[-1] != self.hidden_size:
+            hidden_states = self.fc(hidden_states)
+        hidden_states = self.midlayer(
+            input_emb=token_embeds,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
+        hidden_states = self.norm(hidden_states)
+        draft_logits = self.lm_head(hidden_states[:, -1, :])
+        return self._map_draft_logits(draft_logits)
+
+
+def _parse_hf_eagle3_config(cfg: Dict[str, Any]) -> Eagle3HFConfig:
+    hidden_size = int(cfg.get("hidden_size", 0))
+    intermediate_size = int(cfg.get("intermediate_size", 0))
+    num_attention_heads = int(cfg.get("num_attention_heads", 0))
+    if hidden_size <= 0 or intermediate_size <= 0 or num_attention_heads <= 0:
+        raise ValueError("Invalid HF speculator config: missing core dimensions.")
+    num_key_value_heads = int(cfg.get("num_key_value_heads", num_attention_heads))
+    max_position_embeddings = int(cfg.get("max_position_embeddings", 2048))
+    rms_norm_eps = float(cfg.get("rms_norm_eps", 1e-6))
+    rope_theta = float(cfg.get("rope_theta", 10000.0))
+    rope_scaling = cfg.get("rope_scaling")
+    if rope_scaling is not None and not isinstance(rope_scaling, dict):
+        rope_scaling = None
+    hidden_act = str(cfg.get("hidden_act", "silu"))
+    head_dim = cfg.get("head_dim")
+    head_dim = int(head_dim) if head_dim is not None else None
+    return Eagle3HFConfig(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
+        max_position_embeddings=max_position_embeddings,
+        rms_norm_eps=rms_norm_eps,
+        rope_theta=rope_theta,
+        rope_scaling=rope_scaling,
+        hidden_act=hidden_act,
+        head_dim=head_dim,
+    )
+
+
+def _find_hf_speculator_ckpt(speculator_dir: Path) -> Optional[Path]:
+    candidate = speculator_dir / "pytorch_model.bin"
+    if candidate.is_file():
+        return candidate
+    return None
+
+
+def _load_hf_speculator(
+    *,
+    target: AutoModelForCausalLM,
+    speculator_dir: Path,
+    speculator_ckpt: Path,
+    spec_len: int,
+    feature_layers: Optional[List[int]],
+) -> Tuple[Eagle3HFSpeculator, int]:
+    cfg_path = speculator_dir / "config.json"
+    if not cfg_path.is_file():
+        cfg_path = speculator_ckpt.parent / "config.json"
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"Missing config.json for HF speculator: {speculator_dir}")
+    with cfg_path.open("r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    hf_cfg = _parse_hf_eagle3_config(cfg)
+
+    state = torch.load(speculator_ckpt, map_location="cpu")
+    if not isinstance(state, dict):
+        raise ValueError(f"HF speculator checkpoint must be a state dict: {speculator_ckpt}")
+    fc_weight = state.get("fc.weight")
+    if fc_weight is None:
+        raise KeyError("HF speculator checkpoint missing fc.weight.")
+    if int(fc_weight.shape[0]) != hf_cfg.hidden_size:
+        raise ValueError("HF speculator hidden_size does not match checkpoint.")
+
+    target_hidden_size = int(getattr(target.config, "hidden_size", hf_cfg.hidden_size))
+    if target_hidden_size <= 0:
+        target_hidden_size = hf_cfg.hidden_size
+    feature_count = int(fc_weight.shape[1]) // int(target_hidden_size)
+    if int(fc_weight.shape[1]) % int(target_hidden_size) != 0:
+        raise ValueError("HF speculator fc input does not align with target hidden size.")
+
+    if feature_layers is None:
+        num_layers = int(getattr(target.config, "num_hidden_layers", 0))
+        if num_layers <= 0:
+            raise ValueError("Target model missing num_hidden_layers for HF speculator.")
+        feature_layers = _select_feature_layers(num_layers, count=feature_count)
+    if len(feature_layers) != feature_count:
+        raise ValueError("HF speculator feature_layers count does not match checkpoint.")
+
+    expected_fc_in = int(target_hidden_size) * len(feature_layers)
+    if expected_fc_in != int(fc_weight.shape[1]):
+        raise ValueError("HF speculator feature_layers do not match fc input width.")
+
+    draft_vocab_size = int(cfg.get("draft_vocab_size") or 0)
+    if draft_vocab_size <= 0:
+        lm_head_weight = state.get("lm_head.weight")
+        if lm_head_weight is None:
+            raise KeyError("HF speculator checkpoint missing lm_head.weight.")
+        draft_vocab_size = int(lm_head_weight.shape[0])
+
+    speculator = Eagle3HFSpeculator(
+        config=hf_cfg,
+        target_hidden_size=target_hidden_size,
+        target_vocab_size=int(target.config.vocab_size),
+        draft_vocab_size=draft_vocab_size,
+        feature_layers=feature_layers,
+    )
+    speculator.load_state_dict(state, strict=True)
+    target_ids = speculator._draft_ids + speculator.d2t
+    if int(target_ids.max().item()) >= speculator.target_vocab_size or int(target_ids.min().item()) < 0:
+        raise ValueError("HF speculator token mapping is out of target vocab range.")
+    speculator = speculator.to(dtype=next(target.parameters()).dtype)
+    speculator.eval()
+    return speculator, spec_len
+
+
 def load_speculator(
     *,
     target: AutoModelForCausalLM,
@@ -479,6 +959,32 @@ def load_speculator(
         while spec_heads > 1 and hidden_size % spec_heads != 0:
             spec_heads -= 1
 
+    if speculator_ckpt is not None and speculator_ckpt.suffix == ".bin":
+        return _load_hf_speculator(
+            target=target,
+            speculator_dir=speculator_dir,
+            speculator_ckpt=speculator_ckpt,
+            spec_len=spec_len,
+            feature_layers=feature_layers,
+        )
+
+    if speculator_ckpt is None:
+        latest = _pick_latest_checkpoint(speculator_dir / "checkpoints")
+        if latest is None:
+            hf_ckpt = _find_hf_speculator_ckpt(speculator_dir)
+            if hf_ckpt is not None:
+                return _load_hf_speculator(
+                    target=target,
+                    speculator_dir=speculator_dir,
+                    speculator_ckpt=hf_ckpt,
+                    spec_len=spec_len,
+                    feature_layers=feature_layers,
+                )
+            raise FileNotFoundError(f"No checkpoints under {speculator_dir}/checkpoints")
+        speculator_ckpt = latest / "speculator.pt"
+    if not speculator_ckpt.is_file():
+        raise FileNotFoundError(f"Speculator checkpoint not found: {speculator_ckpt}")
+
     init_weight = target.lm_head.weight.detach().clone()
 
     feature_layers = _resolve_feature_layers(
@@ -495,14 +1001,6 @@ def load_speculator(
         init_weight=init_weight,
         head_rank=head_rank,
     )
-
-    if speculator_ckpt is None:
-        latest = _pick_latest_checkpoint(speculator_dir / "checkpoints")
-        if latest is None:
-            raise FileNotFoundError(f"No checkpoints under {speculator_dir}/checkpoints")
-        speculator_ckpt = latest / "speculator.pt"
-    if not speculator_ckpt.is_file():
-        raise FileNotFoundError(f"Speculator checkpoint not found: {speculator_ckpt}")
 
     state = torch.load(speculator_ckpt, map_location="cpu")
     speculator.load_state_dict(state, strict=True)

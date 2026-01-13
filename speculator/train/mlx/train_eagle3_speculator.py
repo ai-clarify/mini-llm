@@ -306,7 +306,7 @@ def _auto_spec_config(param_count: Optional[int]) -> Tuple[int, int]:
     if params_b <= 1.0:
         return 4, 2
     if params_b <= 3.0:
-        return 3, 2
+        return 4, 2
     if params_b <= 7.0:
         return 3, 2
     if params_b <= 13.0:

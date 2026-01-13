@@ -24,6 +24,7 @@ from speculator.infer.mlx.common import (
     speculative_decode_minillm_with_stats,
     speculative_decode_with_stats,
 )
+from speculator.infer.mlx.eagle3 import eagle3_decode_with_stats, load_eagle3_drafter
 from speculator.infer.prompt_utils import load_prompt_messages, resolve_prompts_jsonl
 
 
@@ -168,6 +169,35 @@ def _run_spec_minillm(
     return SpecBenchResult(num_input, num_output, elapsed, stats)
 
 
+def _run_eagle3_qwen3(
+    *,
+    target,
+    drafter,
+    input_ids: List[int],
+    max_new_tokens: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+    seed: int,
+) -> SpecBenchResult:
+    start = time.perf_counter()
+    output_ids, stats = eagle3_decode_with_stats(
+        target=target,
+        drafter=drafter,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=0,
+        eos_token_id=eos_token_id,
+        seed=seed,
+    )
+    elapsed = time.perf_counter() - start
+    num_input = len(input_ids)
+    num_output = max(len(output_ids) - num_input, 0)
+    return SpecBenchResult(num_input, num_output, elapsed, stats)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Benchmark EAGLE-3 speculator vs baseline (MLX backend)."
@@ -187,9 +217,9 @@ def main() -> None:
     parser.add_argument("--prompts_jsonl", type=str, default=None)
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=32)
-    parser.add_argument("--max_new_tokens", type=int, default=1024)
-    parser.add_argument("--temperature", type=float, default=0)
-    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument(
         "--spec_len",
         type=int,
@@ -212,6 +242,16 @@ def main() -> None:
     parser.add_argument("--no_chat_template", action="store_true")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1337)
+    parser.add_argument(
+        "--eagle3_dir",
+        type=str,
+        default=None,
+        help="HF snapshot dir for AngelSlim EAGLE3 draft weights (Qwen3 only).",
+    )
+    parser.add_argument("--eagle3_total_tokens", type=int, default=60)
+    parser.add_argument("--eagle3_depth", type=int, default=7)
+    parser.add_argument("--eagle3_top_k", type=int, default=10)
+    parser.add_argument("--eagle3_threshold", type=float, default=1.0)
     args = parser.parse_args()
 
     target, tokenizer = _load_target(
@@ -224,6 +264,7 @@ def main() -> None:
     )
 
     speculator = None
+    eagle3 = None
     spec_len, spec_layers = _resolve_spec_config(
         args.spec_len, args.spec_layers, param_count=_count_params_mlx(target)
     )
@@ -232,7 +273,18 @@ def main() -> None:
         if args.head_rank is not None and int(args.head_rank) > 0
         else None
     )
-    if not args.no_speculator:
+    if args.eagle3_dir:
+        if args.target_arch != "qwen3":
+            raise ValueError("--eagle3_dir is only supported for target_arch=qwen3")
+        eagle3 = load_eagle3_drafter(
+            eagle3_dir=Path(args.eagle3_dir),
+            target=target,
+            total_tokens=int(args.eagle3_total_tokens),
+            depth=int(args.eagle3_depth),
+            top_k=int(args.eagle3_top_k),
+            threshold=float(args.eagle3_threshold),
+        )
+    elif not args.no_speculator:
         speculator_dir = Path(args.speculator_dir)
         speculator_ckpt = Path(args.speculator_ckpt) if args.speculator_ckpt else None
         speculator, spec_len = load_speculator(
@@ -267,6 +319,7 @@ def main() -> None:
 
     baseline_results: List[BenchResult] = []
     spec_results: List[SpecBenchResult] = []
+    eagle3_results: List[SpecBenchResult] = []
 
     total_samples = int(args.rounds) * len(prompt_inputs)
     if total_samples <= 0:
@@ -302,7 +355,20 @@ def main() -> None:
                 )
             baseline_results.append(baseline)
 
-            if speculator is not None:
+            if eagle3 is not None:
+                mx.random.seed(seed_base)
+                spec = _run_eagle3_qwen3(
+                    target=target,
+                    drafter=eagle3,
+                    input_ids=input_ids,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    eos_token_id=tokenizer.eos_token_id,
+                    seed=seed_base,
+                )
+                eagle3_results.append(spec)
+            elif speculator is not None:
                 mx.random.seed(seed_base)
                 if args.target_arch == "minillm":
                     spec = _run_spec_minillm(
@@ -454,6 +520,65 @@ def main() -> None:
         )
         print(
             f"[bench] tokens baseline_out={base_stats['output_tokens']:.0f} "
+            f"accepted={token_stats['accepted_tokens']:.0f} "
+            f"target_generated={token_stats['target_generated']:.0f} "
+            f"draft_proposed={token_stats['draft_tokens']:.0f} "
+            f"accepted/out={accept_per_out:.2f} "
+            f"target/out={target_per_out:.2f} draft/out={draft_per_out:.2f}"
+        )
+    if eagle3_results:
+        eagle_stats = summarize(eagle3_results)
+        speedup_tok = eagle_stats["tok_per_s"] / max(base_stats["tok_per_s"], 1e-6)
+        accept_stats = summarize_acceptance(eagle3_results)
+        token_stats = summarize_tokens(eagle3_results)
+        timing_stats = summarize_timing(eagle3_results)
+        call_stats = summarize_calls(eagle3_results)
+        target_per_out = token_stats["target_generated"] / max(
+            eagle_stats["output_tokens"], 1e-6
+        )
+        accept_per_out = token_stats["accepted_tokens"] / max(
+            eagle_stats["output_tokens"], 1e-6
+        )
+        draft_per_out = token_stats["draft_tokens"] / max(
+            eagle_stats["output_tokens"], 1e-6
+        )
+        print(
+            f"[bench] eagle3 tokens={int(args.eagle3_total_tokens)} "
+            f"depth={int(args.eagle3_depth)} top_k={int(args.eagle3_top_k)} "
+            f"output_tokens={eagle_stats['output_tokens']:.0f} time_s={eagle_stats['total_time_s']:.2f} "
+            f"tok/s={eagle_stats['tok_per_s']:.2f} speedup_tok/s={speedup_tok:.2f}x"
+        )
+        print(
+            f"[bench] eagle3 acceptance mean={accept_stats['mean_accept']:.2f} "
+            f"rate={accept_stats['accept_rate'] * 100:.2f}% "
+            f"zero_accept={accept_stats['zero_rate'] * 100:.2f}%"
+        )
+        other_time = (
+            eagle_stats["total_time_s"]
+            - timing_stats["spec_time_s"]
+            - timing_stats["target_time_s"]
+        )
+        print(
+            f"[bench] eagle3 time_s baseline={base_stats['total_time_s']:.2f} "
+            f"draft={timing_stats['spec_time_s']:.2f} "
+            f"target={timing_stats['target_time_s']:.2f} other={other_time:.2f}"
+        )
+        print(
+            f"[bench] eagle3 target_time_s prefill={timing_stats['target_prefill_time_s']:.2f} "
+            f"verify={timing_stats['target_verify_time_s']:.2f} "
+            f"generate={timing_stats['target_generate_time_s']:.2f}"
+        )
+        baseline_calls = base_stats["output_tokens"]
+        if args.target_arch == "qwen3":
+            baseline_calls += len(baseline_results)
+        print(
+            f"[bench] eagle3 forward_calls baseline={baseline_calls:.0f} "
+            f"verify={call_stats['verify']:.0f} "
+            f"generate={call_stats['generate']:.0f} "
+            f"prefill={call_stats['prefill']:.0f}"
+        )
+        print(
+            f"[bench] eagle3 tokens baseline_out={base_stats['output_tokens']:.0f} "
             f"accepted={token_stats['accepted_tokens']:.0f} "
             f"target_generated={token_stats['target_generated']:.0f} "
             f"draft_proposed={token_stats['draft_tokens']:.0f} "
