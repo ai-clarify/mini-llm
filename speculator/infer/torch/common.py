@@ -241,6 +241,18 @@ def _pick_latest_checkpoint(ckpt_root: Path) -> Optional[Path]:
 def _clone_past_key_values(past):
     if past is None:
         return None
+    try:
+        from transformers.cache_utils import DynamicCache
+    except Exception:
+        DynamicCache = None
+    if DynamicCache is not None and isinstance(past, DynamicCache):
+        legacy = past.to_legacy_cache()
+        cloned = tuple((k.clone(), v.clone()) for (k, v) in legacy)
+        return DynamicCache.from_legacy_cache(cloned)
+    if hasattr(past, "to_legacy_cache") and hasattr(type(past), "from_legacy_cache"):
+        legacy = past.to_legacy_cache()
+        cloned = tuple((k.clone(), v.clone()) for (k, v) in legacy)
+        return type(past).from_legacy_cache(cloned)
     return tuple((k.clone(), v.clone()) for (k, v) in past)
 
 
