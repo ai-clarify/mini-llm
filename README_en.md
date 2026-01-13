@@ -169,7 +169,12 @@ python speculator/infer/torch/bench.py \
   --target_arch qwen3 \
   --target_model Qwen/Qwen3-1.7B \
   --eagle3_dir out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3 \
+  --temperature 0 \
   --max_samples 16
+
+# Suggested params:
+# - Speed (T=0): --temperature 0 --max_new_tokens 1024
+# - Sampling (T=0.8~1.0): --temperature 0.8 --eagle3_total_tokens 31 --eagle3_depth 4 --eagle3_top_k 6 --eagle3_verify_top_k 6
 ```
 
 > MLX inference/training requires `mlx-lm` (currently pinned to transformers==5.0.0rc1). Use a clean venv if needed.
