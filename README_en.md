@@ -130,6 +130,46 @@ python speculator/train/mlx/train_eagle3_speculator.py --hf_repo Qwen/Qwen3-0.6B
 python speculator/infer/mlx/bench.py --hf_repo Qwen/Qwen3-0.6B --max_samples 16
 ```
 
+```bash
+# Qwen3-1.7B + AngelSlim EAGLE-3 weights (MLX, no training)
+# 1) Optional: convert Qwen3-1.7B to MLX weights (avoid first-time HF conversion)
+python -m mlx_train.cli.hf_convert --hf_repo Qwen/Qwen3-1.7B --out_dir out/mlx_hf/qwen_qwen3_1_7b
+
+# 2) Download AngelSlim EAGLE-3 drafter weights
+python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="AngelSlim/Qwen3-1.7B_eagle3",
+    local_dir="out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3",
+)
+PY
+
+# 3) MLX: benchmark (baseline vs EAGLE-3 weights)
+python speculator/infer/mlx/bench.py \
+  --hf_repo Qwen/Qwen3-1.7B \
+  --model_dir out/mlx_hf/qwen_qwen3_1_7b \
+  --eagle3_dir out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3 \
+  --max_samples 16
+```
+
+```bash
+# Qwen3-1.7B + AngelSlim EAGLE-3 weights (Torch, no training)
+# 1) Download AngelSlim EAGLE-3 drafter weights
+python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="AngelSlim/Qwen3-1.7B_eagle3",
+    local_dir="out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3",
+)
+PY
+
+# 2) Torch: benchmark (baseline vs EAGLE-3 weights)
+python speculator/infer/torch/bench.py \
+  --target_model Qwen/Qwen3-1.7B \
+  --speculator_dir out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3 \
+  --max_samples 16
+```
+
 > MLX inference/training requires `mlx-lm` (currently pinned to transformers==5.0.0rc1). Use a clean venv if needed.
 
 ---

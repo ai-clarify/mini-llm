@@ -127,6 +127,48 @@ python speculator/train/mlx/train_eagle3_speculator.py --hf_repo Qwen/Qwen3-0.6B
 python speculator/infer/mlx/bench.py --hf_repo Qwen/Qwen3-0.6B --max_samples 16
 ```
 
+#### Qwen3-1.7B + AngelSlim EAGLE-3 权重（MLX，免训练）
+
+```bash
+# 1) 可选：先把 Qwen3-1.7B 转成 MLX 权重（避免首次加载从 HF 转换）
+python -m mlx_train.cli.hf_convert --hf_repo Qwen/Qwen3-1.7B --out_dir out/mlx_hf/qwen_qwen3_1_7b
+
+# 2) 下载 AngelSlim EAGLE-3 drafter 权重
+python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="AngelSlim/Qwen3-1.7B_eagle3",
+    local_dir="out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3",
+)
+PY
+
+# 3) MLX：基准对比（baseline vs EAGLE-3 weights）
+python speculator/infer/mlx/bench.py \
+  --hf_repo Qwen/Qwen3-1.7B \
+  --model_dir out/mlx_hf/qwen_qwen3_1_7b \
+  --eagle3_dir out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3 \
+  --max_samples 16
+```
+
+#### Qwen3-1.7B + AngelSlim EAGLE-3 权重（Torch，免训练）
+
+```bash
+# 1) 下载 AngelSlim EAGLE-3 drafter 权重
+python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="AngelSlim/Qwen3-1.7B_eagle3",
+    local_dir="out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3",
+)
+PY
+
+# 2) Torch：基准对比（baseline vs EAGLE-3 weights）
+python speculator/infer/torch/bench.py \
+  --target_model Qwen/Qwen3-1.7B \
+  --speculator_dir out/eagle3_speculator_hf/angelslim_qwen3_1_7b_eagle3 \
+  --max_samples 16
+```
+
 #### MiniLLM（Torch）
 
 ```bash
