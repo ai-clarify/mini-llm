@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import json
+import string
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
@@ -23,6 +26,7 @@ from speculator.infer.torch.common import (
     baseline_decode,
     load_speculator,
     speculative_decode_with_stats,
+    speculative_decode_with_trace,
 )
 
 
@@ -47,6 +51,187 @@ class SpecBenchResult:
     @property
     def tok_per_s(self) -> float:
         return self.num_output_tokens / max(self.elapsed_s, 1e-6)
+
+
+class TokenLogWriter:
+    def __init__(self, path: str, tokenizer, *, top_k: int = 50) -> None:
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self._path.open("w", encoding="utf-8")
+        self._tokenizer = tokenizer
+        self._top_k = int(top_k)
+        self._accepted = Counter()
+        self._target = Counter()
+        self._rejected = Counter()
+        self._cluster_accepted = Counter()
+        self._cluster_target = Counter()
+        self._cluster_rejected = Counter()
+        self._token_cache: Dict[int, str] = {}
+
+    def _decode_token(self, token_id: int) -> str:
+        token_id = int(token_id)
+        cached = self._token_cache.get(token_id)
+        if cached is not None:
+            return cached
+        try:
+            text = self._tokenizer.decode([token_id], skip_special_tokens=False)
+        except TypeError:
+            text = self._tokenizer.decode([token_id])
+        self._token_cache[token_id] = text
+        return text
+
+    def _contains_cjk(self, text: str) -> bool:
+        for ch in text:
+            code = ord(ch)
+            if (
+                0x3400 <= code <= 0x4DBF
+                or 0x4E00 <= code <= 0x9FFF
+                or 0x3000 <= code <= 0x303F
+                or 0xFF00 <= code <= 0xFFEF
+            ):
+                return True
+        return False
+
+    def _cluster_for(self, token: str) -> str:
+        if not token:
+            return "empty"
+        if "\n" in token or "\r" in token:
+            return "newline"
+        stripped = token.strip()
+        if not stripped:
+            return "whitespace"
+        if self._contains_cjk(stripped):
+            return "cjk"
+        if stripped.isdigit():
+            return "digits"
+        if stripped.isalpha():
+            return "latin" if stripped.isascii() else "alpha"
+        if stripped.isalnum():
+            return "alnum"
+        if all(ch in string.punctuation for ch in stripped):
+            return "punct"
+        return "mixed"
+
+    def _top_tokens(self, counter: Counter) -> List[Dict[str, Any]]:
+        top = []
+        items = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+        for token_id, count in items[: self._top_k]:
+            top.append(
+                {
+                    "token_id": int(token_id),
+                    "token": self._decode_token(token_id),
+                    "count": int(count),
+                }
+            )
+        return top
+
+    def _compare_tokens(self) -> Dict[str, List[Dict[str, Any]]]:
+        rows = []
+        for token_id in set(self._accepted) | set(self._target):
+            acc = int(self._accepted.get(token_id, 0))
+            tar = int(self._target.get(token_id, 0))
+            total = acc + tar
+            if total <= 0:
+                continue
+            acc_rate = acc / float(total)
+            rows.append((token_id, acc, tar, total, acc_rate))
+
+        high = sorted(rows, key=lambda r: (-r[4], -r[3], r[0]))
+        low = sorted(rows, key=lambda r: (r[4], -r[3], r[0]))
+
+        def build(entries: List[tuple]) -> List[Dict[str, Any]]:
+            out = []
+            for token_id, acc, tar, total, acc_rate in entries[: self._top_k]:
+                out.append(
+                    {
+                        "token_id": int(token_id),
+                        "token": self._decode_token(token_id),
+                        "accepted": int(acc),
+                        "target": int(tar),
+                        "total": int(total),
+                        "accept_rate": float(acc_rate),
+                    }
+                )
+            return out
+
+        return {
+            "accept_rate_top": build(high),
+            "accept_rate_bottom": build(low),
+        }
+
+    def _cluster_summary(self) -> List[Dict[str, Any]]:
+        clusters = sorted(
+            set(self._cluster_accepted)
+            | set(self._cluster_target)
+            | set(self._cluster_rejected)
+        )
+        rows = []
+        for name in clusters:
+            accepted = int(self._cluster_accepted.get(name, 0))
+            target = int(self._cluster_target.get(name, 0))
+            rejected = int(self._cluster_rejected.get(name, 0))
+            emitted = accepted + target
+            accept_rate = accepted / float(emitted) if emitted > 0 else 0.0
+            rows.append(
+                {
+                    "cluster": name,
+                    "accepted": accepted,
+                    "target": target,
+                    "rejected": rejected,
+                    "accept_rate": float(accept_rate),
+                    "emitted": int(emitted),
+                }
+            )
+        rows.sort(key=lambda r: (-r["emitted"], r["cluster"]))
+        return rows
+
+    def log_event(self, event: Dict[str, Any]) -> None:
+        token_id = int(event["token_id"])
+        record = dict(event)
+        record.setdefault("kind", "token")
+        record["token_id"] = token_id
+        token_text = self._decode_token(token_id)
+        record["token"] = token_text
+        record["cluster"] = self._cluster_for(token_text)
+        self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        source = record.get("source")
+        if source == "accepted":
+            self._accepted[token_id] += 1
+            self._cluster_accepted[record["cluster"]] += 1
+        elif source in ("target", "bonus", "fallback"):
+            self._target[token_id] += 1
+            self._cluster_target[record["cluster"]] += 1
+        elif source == "rejected_draft":
+            self._rejected[token_id] += 1
+            self._cluster_rejected[record["cluster"]] += 1
+
+    def trace_for(self, *, round_idx: int, prompt_idx: int) -> Callable[[Dict[str, Any]], None]:
+        def _trace(event: Dict[str, Any]) -> None:
+            payload = dict(event)
+            payload["round"] = int(round_idx)
+            payload["prompt"] = int(prompt_idx)
+            self.log_event(payload)
+
+        return _trace
+
+    def close(self) -> None:
+        accepted_total = int(sum(self._accepted.values()))
+        target_total = int(sum(self._target.values()))
+        denom = accepted_total + target_total
+        summary = {
+            "kind": "summary",
+            "accepted_total": accepted_total,
+            "target_total": target_total,
+            "accept_rate": float(accepted_total / denom) if denom > 0 else 0.0,
+            "rejected_total": int(sum(self._rejected.values())),
+            "accepted_top": self._top_tokens(self._accepted),
+            "target_top": self._top_tokens(self._target),
+            "rejected_top": self._top_tokens(self._rejected),
+            "target_compare": self._compare_tokens(),
+            "clusters": self._cluster_summary(),
+        }
+        self._fh.write(json.dumps(summary, ensure_ascii=False) + "\n")
+        self._fh.close()
 
 
 def _render_progress(current: int, total: int, *, label: str = "bench") -> None:
@@ -106,21 +291,37 @@ def _run_spec(
     eos_token_id: Optional[int],
     use_cache: bool,
     device: torch.device,
+    trace: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> SpecBenchResult:
     _sync_device(device)
     start = time.perf_counter()
-    output_ids, stats = speculative_decode_with_stats(
-        target=target,
-        speculator=speculator,
-        input_ids=input_ids,
-        max_new_tokens=max_new_tokens,
-        spec_len=spec_len,
-        temperature=temperature,
-        top_p=top_p,
-        eos_token_id=eos_token_id,
-        use_cache=use_cache,
-        optimized=True,
-    )
+    if trace is None:
+        output_ids, stats = speculative_decode_with_stats(
+            target=target,
+            speculator=speculator,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            spec_len=spec_len,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            use_cache=use_cache,
+            optimized=True,
+        )
+    else:
+        output_ids, stats = speculative_decode_with_trace(
+            target=target,
+            speculator=speculator,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            spec_len=spec_len,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            use_cache=use_cache,
+            optimized=True,
+            trace=trace,
+        )
     _sync_device(device)
     elapsed = time.perf_counter() - start
     num_input = int(input_ids.shape[1])
@@ -171,8 +372,16 @@ def main() -> None:
     parser.add_argument("--no_chat_template", action="store_true")
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
+    )
     parser.add_argument("--dtype", type=str, default="bfloat16")
+    parser.add_argument(
+        "--token_log",
+        type=str,
+        default="out/bench_token_log_torch.jsonl",
+        help="Write token-level acceptance log as JSONL (speculator only).",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(int(args.seed))
@@ -208,6 +417,15 @@ def main() -> None:
         )
         speculator = speculator.to(device)
 
+    token_logger: Optional[TokenLogWriter] = None
+    if args.token_log:
+        if speculator is None:
+            print("[warn] --token_log ignored because speculator is disabled", flush=True)
+        else:
+            token_log_path = Path(args.token_log)
+            token_logger = TokenLogWriter(str(token_log_path), tokenizer)
+            print(f"[bench] token_log={token_log_path}", flush=True)
+
     prompts_jsonl = resolve_prompts_jsonl(
         args.prompts_jsonl, speculator_dir=Path(args.speculator_dir)
     )
@@ -226,7 +444,9 @@ def main() -> None:
             prompt_text = _apply_chat_template(
                 tokenizer, messages, add_generation_prompt=True
             )
-        input_ids = tokenizer(prompt_text, add_special_tokens=False, return_tensors="pt").input_ids
+        input_ids = tokenizer(
+            prompt_text, add_special_tokens=False, return_tensors="pt"
+        ).input_ids
         prompt_inputs.append(input_ids.to(device))
 
     baseline_results: List[BenchResult] = []
@@ -240,43 +460,55 @@ def main() -> None:
     completed = 0
     use_cache = args.target_arch != "minillm"
     prompt_count = len(prompt_inputs)
-    for round_idx in range(int(args.rounds)):
-        for prompt_idx, input_ids in enumerate(prompt_inputs):
-            seed_base = int(args.seed) + (int(round_idx) * prompt_count) + int(prompt_idx)
-            torch.manual_seed(seed_base)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed_base)
-            baseline = _run_baseline(
-                target=target,
-                input_ids=input_ids,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                eos_token_id=tokenizer.eos_token_id,
-                use_cache=use_cache,
-                device=device,
-            )
-            baseline_results.append(baseline)
-
-            if speculator is not None:
+    try:
+        for round_idx in range(int(args.rounds)):
+            for prompt_idx, input_ids in enumerate(prompt_inputs):
+                seed_base = (
+                    int(args.seed) + (int(round_idx) * prompt_count) + int(prompt_idx)
+                )
                 torch.manual_seed(seed_base)
                 if torch.cuda.is_available():
                     torch.cuda.manual_seed_all(seed_base)
-                spec = _run_spec(
+                baseline = _run_baseline(
                     target=target,
-                    speculator=speculator,
                     input_ids=input_ids,
                     max_new_tokens=args.max_new_tokens,
-                    spec_len=spec_len,
                     temperature=args.temperature,
                     top_p=args.top_p,
                     eos_token_id=tokenizer.eos_token_id,
                     use_cache=use_cache,
                     device=device,
                 )
-                spec_results.append(spec)
-            completed += 1
-            _render_progress(completed, total_samples)
+                baseline_results.append(baseline)
+
+                if speculator is not None:
+                    torch.manual_seed(seed_base)
+                    if torch.cuda.is_available():
+                        torch.cuda.manual_seed_all(seed_base)
+                    trace = (
+                        token_logger.trace_for(round_idx=round_idx, prompt_idx=prompt_idx)
+                        if token_logger is not None
+                        else None
+                    )
+                    spec = _run_spec(
+                        target=target,
+                        speculator=speculator,
+                        input_ids=input_ids,
+                        max_new_tokens=args.max_new_tokens,
+                        spec_len=spec_len,
+                        temperature=args.temperature,
+                        top_p=args.top_p,
+                        eos_token_id=tokenizer.eos_token_id,
+                        use_cache=use_cache,
+                        device=device,
+                        trace=trace,
+                    )
+                    spec_results.append(spec)
+                completed += 1
+                _render_progress(completed, total_samples)
+    finally:
+        if token_logger is not None:
+            token_logger.close()
 
     def summarize(rows: List[BenchResult]) -> Dict[str, float]:
         total_out = sum(r.num_output_tokens for r in rows)
@@ -355,9 +587,15 @@ def main() -> None:
         token_stats = summarize_tokens(spec_results)
         timing_stats = summarize_timing(spec_results)
         call_stats = summarize_calls(spec_results)
-        target_per_out = token_stats["target_generated"] / max(spec_stats["output_tokens"], 1e-6)
-        accept_per_out = token_stats["accepted_tokens"] / max(spec_stats["output_tokens"], 1e-6)
-        draft_per_out = token_stats["draft_tokens"] / max(spec_stats["output_tokens"], 1e-6)
+        target_per_out = token_stats["target_generated"] / max(
+            spec_stats["output_tokens"], 1e-6
+        )
+        accept_per_out = token_stats["accepted_tokens"] / max(
+            spec_stats["output_tokens"], 1e-6
+        )
+        draft_per_out = token_stats["draft_tokens"] / max(
+            spec_stats["output_tokens"], 1e-6
+        )
         print(
             f"[bench] spec_len={spec_len} output_tokens={spec_stats['output_tokens']:.0f} "
             f"time_s={spec_stats['total_time_s']:.2f} tok/s={spec_stats['tok_per_s']:.2f} "
@@ -368,7 +606,11 @@ def main() -> None:
             f"rate={accept_stats['accept_rate'] * 100:.2f}% "
             f"zero_accept={accept_stats['zero_rate'] * 100:.2f}%"
         )
-        other_time = spec_stats["total_time_s"] - timing_stats["spec_time_s"] - timing_stats["target_time_s"]
+        other_time = (
+            spec_stats["total_time_s"]
+            - timing_stats["spec_time_s"]
+            - timing_stats["target_time_s"]
+        )
         print(
             f"[bench] time_s baseline={base_stats['total_time_s']:.2f} "
             f"draft={timing_stats['spec_time_s']:.2f} "

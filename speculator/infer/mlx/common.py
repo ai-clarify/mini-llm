@@ -5,7 +5,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -687,6 +687,7 @@ def _speculative_decode_qwen3(
     optimized: bool,
     max_consecutive_misses: int,
     collect_stats: bool,
+    trace: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[List[int], Optional[SpecStats]]:
     _, mlx_cache, _, _ = _get_qwen3_deps()
     output_ids = list(input_ids)
@@ -706,6 +707,7 @@ def _speculative_decode_qwen3(
     target_verify_calls = 0
     target_generate_calls = 0
     target_generated = 0
+    step_idx = 0
 
     cache = mlx_cache.make_prompt_cache(target.model) if use_cache else None
     prompt = mx.array([output_ids], dtype=mx.int32)
@@ -820,6 +822,34 @@ def _speculative_decode_qwen3(
             accepted_output += int(accepted_step)
             target_generated += int(len(token_sources) - accepted_step)
 
+        if not new_tokens:
+            break
+
+        if trace is not None:
+            for idx, token in enumerate(new_tokens):
+                source = "accepted" if token_sources[idx] else "target"
+                if bonus_added and not rejected and idx == len(token_sources) - 1:
+                    source = "bonus"
+                trace(
+                    {
+                        "pos": int(produced + idx),
+                        "step": int(step_idx),
+                        "token_id": int(token),
+                        "source": source,
+                        "emitted": True,
+                    }
+                )
+            if rejected and accept_len < len(token_sources):
+                trace(
+                    {
+                        "pos": int(produced + accept_len),
+                        "step": int(step_idx),
+                        "token_id": int(draft_tokens[accept_len]),
+                        "source": "rejected_draft",
+                        "emitted": False,
+                    }
+                )
+
         if accept_len == 0:
             consecutive_misses += 1
         else:
@@ -906,6 +936,7 @@ def _speculative_decode_qwen3(
 
         if optimized and consecutive_misses >= max_consecutive_misses:
             break
+        step_idx += 1
 
     if optimized and produced < int(max_new_tokens):
         t0 = time.perf_counter()
@@ -926,6 +957,19 @@ def _speculative_decode_qwen3(
         if collect_stats:
             target_generated += len(output_ids) - before_len
             target_generate_calls += len(output_ids) - before_len
+        if trace is not None:
+            new_tokens = output_ids[before_len:]
+            for idx, token in enumerate(new_tokens):
+                trace(
+                    {
+                        "pos": int(produced + idx),
+                        "step": int(step_idx),
+                        "token_id": int(token),
+                        "source": "fallback",
+                        "emitted": True,
+                    }
+                )
+            produced += len(new_tokens)
 
     stats = None
     if collect_stats:
@@ -1006,6 +1050,40 @@ def speculative_decode_with_stats(
         optimized=optimized,
         max_consecutive_misses=max_consecutive_misses,
         collect_stats=True,
+        trace=None,
+    )
+    return output_ids, stats
+
+
+def speculative_decode_with_trace(
+    *,
+    target: nn.Module,
+    speculator: nn.Module,
+    input_ids: List[int],
+    max_new_tokens: int,
+    spec_len: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+    use_cache: bool,
+    optimized: bool,
+    max_consecutive_misses: int = 2,
+    trace: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Tuple[List[int], SpecStats]:
+    output_ids, stats = _speculative_decode_qwen3(
+        target=target,
+        speculator=speculator,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        spec_len=spec_len,
+        temperature=temperature,
+        top_p=top_p,
+        eos_token_id=eos_token_id,
+        use_cache=use_cache,
+        optimized=optimized,
+        max_consecutive_misses=max_consecutive_misses,
+        collect_stats=True,
+        trace=trace,
     )
     return output_ids, stats
 
@@ -1045,6 +1123,7 @@ def _speculative_decode_minillm(
     optimized: bool,
     max_consecutive_misses: int,
     collect_stats: bool,
+    trace: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[List[int], Optional[SpecStats]]:
     output_ids = list(input_ids)
     produced = 0
@@ -1063,6 +1142,7 @@ def _speculative_decode_minillm(
     target_verify_calls = 0
     target_generate_calls = 0
     target_generated = 0
+    step_idx = 0
 
     while produced < int(max_new_tokens):
         prompt = mx.array([output_ids], dtype=mx.int32)
@@ -1158,6 +1238,34 @@ def _speculative_decode_minillm(
             accepted_output += int(accepted_step)
             target_generated += int(len(token_sources) - accepted_step)
 
+        if not new_tokens:
+            break
+
+        if trace is not None:
+            for idx, token in enumerate(new_tokens):
+                source = "accepted" if token_sources[idx] else "target"
+                if bonus_added and not rejected and idx == len(token_sources) - 1:
+                    source = "bonus"
+                trace(
+                    {
+                        "pos": int(produced + idx),
+                        "step": int(step_idx),
+                        "token_id": int(token),
+                        "source": source,
+                        "emitted": True,
+                    }
+                )
+            if rejected and accept_len < len(token_sources):
+                trace(
+                    {
+                        "pos": int(produced + accept_len),
+                        "step": int(step_idx),
+                        "token_id": int(draft_tokens[accept_len]),
+                        "source": "rejected_draft",
+                        "emitted": False,
+                    }
+                )
+
         if accept_len == 0:
             consecutive_misses += 1
         else:
@@ -1171,6 +1279,7 @@ def _speculative_decode_minillm(
 
         if optimized and consecutive_misses >= max_consecutive_misses:
             break
+        step_idx += 1
 
     if optimized and produced < int(max_new_tokens):
         t0 = time.perf_counter()
@@ -1189,6 +1298,19 @@ def _speculative_decode_minillm(
         if collect_stats:
             target_generated += len(output_ids) - before_len
             target_generate_calls += len(output_ids) - before_len
+        if trace is not None:
+            new_tokens = output_ids[before_len:]
+            for idx, token in enumerate(new_tokens):
+                trace(
+                    {
+                        "pos": int(produced + idx),
+                        "step": int(step_idx),
+                        "token_id": int(token),
+                        "source": "fallback",
+                        "emitted": True,
+                    }
+                )
+            produced += len(new_tokens)
 
     stats = None
     if collect_stats:
@@ -1265,6 +1387,38 @@ def speculative_decode_minillm_with_stats(
         optimized=optimized,
         max_consecutive_misses=max_consecutive_misses,
         collect_stats=True,
+        trace=None,
+    )
+    return output_ids, stats
+
+
+def speculative_decode_minillm_with_trace(
+    *,
+    target: nn.Module,
+    speculator: nn.Module,
+    input_ids: List[int],
+    max_new_tokens: int,
+    spec_len: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+    optimized: bool,
+    max_consecutive_misses: int = 2,
+    trace: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Tuple[List[int], SpecStats]:
+    output_ids, stats = _speculative_decode_minillm(
+        target=target,
+        speculator=speculator,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        spec_len=spec_len,
+        temperature=temperature,
+        top_p=top_p,
+        eos_token_id=eos_token_id,
+        optimized=optimized,
+        max_consecutive_misses=max_consecutive_misses,
+        collect_stats=True,
+        trace=trace,
     )
     return output_ids, stats
 
