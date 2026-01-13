@@ -179,6 +179,7 @@ def _run_eagle3_qwen3(
     top_p: float,
     eos_token_id: Optional[int],
     seed: int,
+    verify_top_k: int,
 ) -> SpecBenchResult:
     start = time.perf_counter()
     output_ids, stats = eagle3_decode_with_stats(
@@ -188,7 +189,7 @@ def _run_eagle3_qwen3(
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
-        top_k=0,
+        top_k=verify_top_k,
         eos_token_id=eos_token_id,
         seed=seed,
     )
@@ -248,10 +249,16 @@ def main() -> None:
         default=None,
         help="HF snapshot dir for AngelSlim EAGLE3 draft weights (Qwen3 only).",
     )
-    parser.add_argument("--eagle3_total_tokens", type=int, default=60)
-    parser.add_argument("--eagle3_depth", type=int, default=7)
-    parser.add_argument("--eagle3_top_k", type=int, default=10)
+    parser.add_argument("--eagle3_total_tokens", type=int, default=32)
+    parser.add_argument("--eagle3_depth", type=int, default=5)
+    parser.add_argument("--eagle3_top_k", type=int, default=6)
     parser.add_argument("--eagle3_threshold", type=float, default=1.0)
+    parser.add_argument(
+        "--eagle3_verify_top_k",
+        type=int,
+        default=128,
+        help="Top-k for posterior sampling (avoid full vocab).",
+    )
     args = parser.parse_args()
 
     target, tokenizer = _load_target(
@@ -366,6 +373,7 @@ def main() -> None:
                     top_p=args.top_p,
                     eos_token_id=tokenizer.eos_token_id,
                     seed=seed_base,
+                    verify_top_k=int(args.eagle3_verify_top_k),
                 )
                 eagle3_results.append(spec)
             elif speculator is not None:
@@ -545,6 +553,7 @@ def main() -> None:
         print(
             f"[bench] eagle3 tokens={int(args.eagle3_total_tokens)} "
             f"depth={int(args.eagle3_depth)} top_k={int(args.eagle3_top_k)} "
+            f"verify_top_k={int(args.eagle3_verify_top_k)} "
             f"output_tokens={eagle_stats['output_tokens']:.0f} time_s={eagle_stats['total_time_s']:.2f} "
             f"tok/s={eagle_stats['tok_per_s']:.2f} speedup_tok/s={speedup_tok:.2f}x"
         )

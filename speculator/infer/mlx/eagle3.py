@@ -664,7 +664,8 @@ def _topk_logits_to_distribution(
     if k <= 0:
         return [0], [1.0]
 
-    values, indices = mx.topk(logits, k=k)
+    indices = mx.argpartition(-logits, kth=k - 1, axis=-1)[..., :k]
+    values = mx.take_along_axis(logits, indices, axis=-1)
     order = mx.argsort(-values, axis=-1)
     values = mx.take_along_axis(values, order, axis=-1)
     indices = mx.take_along_axis(indices, order, axis=-1)
