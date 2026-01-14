@@ -283,6 +283,8 @@ class MiniLLMAttention(nn.Module):
             use_causal=attention_mask is None,
         )
 
+        if isinstance(mask, mx.array) and mask.dtype != q_states.dtype:
+            mask = mask.astype(q_states.dtype)
         out = mx.fast.scaled_dot_product_attention(q_states, k_states, v, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(bsz, seq_len, self.n_heads * self.v_head_dim)
         out = self.o_proj(out)
@@ -391,6 +393,8 @@ class MiniLLMAttention(nn.Module):
                     query_positions=query_positions,
                 )
 
+        if isinstance(mask, mx.array) and mask.dtype != q_states.dtype:
+            mask = mask.astype(q_states.dtype)
         out = mx.fast.scaled_dot_product_attention(q_states, k_full, v_full, scale=self.scale, mask=mask)
         out = out.transpose(0, 2, 1, 3).reshape(bsz, seq_len, self.n_heads * self.v_head_dim)
         out = self.o_proj(out)
