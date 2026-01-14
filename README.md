@@ -175,6 +175,8 @@ python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir
 ## 📚 资源与文档
 
 - [docs/README.md](./docs/README.md)：文档入口与导航
+- [docs/deepseek_v3_2_mlx_cn.md](./docs/deepseek_v3_2_mlx_cn.md)：DeepSeek-V3.2 MLX 架构说明
+- [docs/deepseek_v3_2_mlx.md](./docs/deepseek_v3_2_mlx.md)：DeepSeek-V3.2 MLX 架构说明（EN）
 - [docs/booklet_cn.md](./docs/booklet_cn.md)：完整中文小册子
 - [docs/changelog/CHANGELOG.md](./docs/changelog/CHANGELOG.md)：版本记录
 - [ModelScope: MiniMind-Reasoning](https://www.modelscope.cn/studios/gongjy/minimind-reasoning)
