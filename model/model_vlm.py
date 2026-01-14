@@ -220,7 +220,7 @@ class MiniLLMVLM(MiniLLMForCausalLM):
             ]
 
         first_past = past_key_values_list[0]
-        start_pos = first_past[0].shape[1] if first_past is not None else 0
+        start_pos = first_past[0].shape[2] if first_past is not None else 0
 
         hidden_states = self.model.dropout(self.model.embed_tokens(input_ids))
 
@@ -266,8 +266,10 @@ class MiniLLMVLM(MiniLLMForCausalLM):
 
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        mtp_logits = self._mtp_logits(hidden_states, slice_indices=slice_indices)
         self.OUT.__setitem__("last_hidden_state", hidden_states)
         self.OUT.__setitem__("logits", logits)
         self.OUT.__setitem__("aux_loss", aux_loss)
         self.OUT.__setitem__("past_key_values", presents)
+        self.OUT.__setitem__("mtp_logits", mtp_logits)
         return self.OUT

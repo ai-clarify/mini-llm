@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from model.model_minillm import MiniLLMForCausalLM
 from speculator.infer.prompt_utils import load_prompt_messages, resolve_prompts_jsonl
 from speculator.infer.torch.common import (
     SpecStats,
@@ -356,7 +357,7 @@ def _run_spec(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark EAGLE-3 speculator vs baseline (Torch backend)."
+        description="Benchmark MTP (MiniLLM) or EAGLE-3 speculator vs baseline (Torch backend)."
     )
     parser.add_argument(
         "--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3"
@@ -427,7 +428,8 @@ def main() -> None:
         if args.head_rank is not None and int(args.head_rank) > 0
         else None
     )
-    if not args.no_speculator:
+    use_mtp = isinstance(target, MiniLLMForCausalLM)
+    if not args.no_speculator and not use_mtp:
         speculator_dir = Path(args.speculator_dir)
         speculator_ckpt = Path(args.speculator_ckpt) if args.speculator_ckpt else None
         speculator, spec_len = load_speculator(

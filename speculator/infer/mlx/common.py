@@ -1110,6 +1110,169 @@ def baseline_decode_minillm(
     return output_ids
 
 
+def _mtp_speculative_decode_minillm(
+    *,
+    target: nn.Module,
+    input_ids: List[int],
+    max_new_tokens: int,
+    spec_len: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+    collect_stats: bool,
+) -> Tuple[List[int], Optional[SpecStats]]:
+    output_ids = list(input_ids)
+    produced = 0
+    total_accept = 0
+    total_draft = 0
+    accepted_output = 0
+    zero_accept = 0
+    steps = 0
+    spec_time_s = 0.0
+    target_time_s = 0.0
+    target_prefill_time_s = 0.0
+    target_verify_time_s = 0.0
+    target_generate_time_s = 0.0
+    target_prefill_calls = 0
+    target_verify_calls = 0
+    target_generate_calls = 0
+    target_generated = 0
+
+    cache_len = int(len(input_ids) + max_new_tokens + 2)
+    cache = target.allocate_kv_cache(batch_size=1, max_seq_len=cache_len)
+    prompt = mx.array([output_ids], dtype=mx.int32)
+
+    t0 = time.perf_counter()
+    hidden, cache = target.model.forward_with_cache(prompt, start_pos=0, cache=cache)
+    mx.eval(hidden)
+    prefill_s = time.perf_counter() - t0
+    target_prefill_time_s += prefill_s
+    target_prefill_calls += 1
+    target_time_s += prefill_s
+    pos = len(output_ids)
+
+    logits = hidden @ target.model.embed_tokens.weight.transpose()
+    mx.eval(logits)
+    last_logits = logits[:, -1, :]
+
+    while produced < int(max_new_tokens):
+        steps += 1
+        mtp_hidden = target._mtp_hidden(hidden)
+        next_token = sample_next_token(last_logits, temperature=temperature, top_p=top_p)
+        output_ids.append(int(next_token))
+        produced += 1
+        target_generated += 1
+        if eos_token_id is not None and int(next_token) == int(eos_token_id):
+            break
+
+        max_draft = 1 + len(mtp_hidden)
+        if spec_len and int(spec_len) > 0:
+            max_draft = min(max_draft, int(spec_len))
+        draft_tokens: List[int] = []
+        for idx in range(max_draft - 1):
+            draft_logits = mtp_hidden[idx][:, -1, :] @ target.model.embed_tokens.weight.transpose()
+            mx.eval(draft_logits)
+            draft_tokens.append(int(sample_next_token(draft_logits, temperature=temperature, top_p=top_p)))
+
+        total_draft += len(draft_tokens)
+        accepted = 0
+
+        if not draft_tokens:
+            t0 = time.perf_counter()
+            token_arr = mx.array([[next_token]], dtype=mx.int32)
+            hidden, cache = target.model.forward_with_cache(token_arr, start_pos=int(pos), cache=cache)
+            mx.eval(hidden)
+            gen_s = time.perf_counter() - t0
+            target_generate_time_s += gen_s
+            target_generate_calls += 1
+            target_time_s += gen_s
+            pos += 1
+            logits = hidden @ target.model.embed_tokens.weight.transpose()
+            mx.eval(logits)
+            last_logits = logits[:, -1, :]
+            continue
+
+        t0 = time.perf_counter()
+        token_arr = mx.array([[next_token]], dtype=mx.int32)
+        hidden, cache = target.model.forward_with_cache(token_arr, start_pos=int(pos), cache=cache)
+        mx.eval(hidden)
+        verify_s = time.perf_counter() - t0
+        target_verify_time_s += verify_s
+        target_verify_calls += 1
+        target_time_s += verify_s
+        pos += 1
+        logits = hidden @ target.model.embed_tokens.weight.transpose()
+        mx.eval(logits)
+        last_logits = logits[:, -1, :]
+
+        for draft_token in draft_tokens:
+            if produced >= int(max_new_tokens):
+                break
+            target_token = sample_next_token(last_logits, temperature=temperature, top_p=top_p)
+            if int(target_token) == int(draft_token):
+                accepted += 1
+                total_accept += 1
+                accepted_output += 1
+                output_ids.append(int(draft_token))
+                produced += 1
+                target_generated += 1
+                if eos_token_id is not None and int(draft_token) == int(eos_token_id):
+                    break
+                t0 = time.perf_counter()
+                token_arr = mx.array([[draft_token]], dtype=mx.int32)
+                hidden, cache = target.model.forward_with_cache(token_arr, start_pos=int(pos), cache=cache)
+                mx.eval(hidden)
+                verify_s = time.perf_counter() - t0
+                target_verify_time_s += verify_s
+                target_verify_calls += 1
+                target_time_s += verify_s
+                pos += 1
+                logits = hidden @ target.model.embed_tokens.weight.transpose()
+                mx.eval(logits)
+                last_logits = logits[:, -1, :]
+            else:
+                output_ids.append(int(target_token))
+                produced += 1
+                target_generated += 1
+                if eos_token_id is not None and int(target_token) == int(eos_token_id):
+                    break
+                t0 = time.perf_counter()
+                token_arr = mx.array([[target_token]], dtype=mx.int32)
+                hidden, cache = target.model.forward_with_cache(token_arr, start_pos=int(pos), cache=cache)
+                mx.eval(hidden)
+                verify_s = time.perf_counter() - t0
+                target_verify_time_s += verify_s
+                target_verify_calls += 1
+                target_time_s += verify_s
+                pos += 1
+                logits = hidden @ target.model.embed_tokens.weight.transpose()
+                mx.eval(logits)
+                last_logits = logits[:, -1, :]
+                break
+
+        if accepted == 0 and draft_tokens:
+            zero_accept += 1
+
+    stats = None
+    if collect_stats:
+        stats = SpecStats(
+            total_accept=int(total_accept),
+            total_draft=int(total_draft),
+            accepted_output=int(accepted_output),
+            zero_accept=int(zero_accept),
+            steps=int(steps),
+            spec_time_s=float(spec_time_s),
+            target_time_s=float(target_time_s),
+            target_prefill_time_s=float(target_prefill_time_s),
+            target_verify_time_s=float(target_verify_time_s),
+            target_generate_time_s=float(target_generate_time_s),
+            target_prefill_calls=int(target_prefill_calls),
+            target_verify_calls=int(target_verify_calls),
+            target_generate_calls=int(target_generate_calls),
+            target_generated=int(target_generated),
+        )
+    return output_ids, stats
+
 def _speculative_decode_minillm(
     *,
     target: nn.Module,
@@ -1336,7 +1499,7 @@ def _speculative_decode_minillm(
 def speculative_decode_minillm(
     *,
     target: nn.Module,
-    speculator: nn.Module,
+    speculator: Optional[nn.Module],
     input_ids: List[int],
     max_new_tokens: int,
     spec_len: int,
@@ -1346,26 +1509,38 @@ def speculative_decode_minillm(
     optimized: bool,
     max_consecutive_misses: int = 2,
 ) -> List[int]:
-    output_ids, _ = _speculative_decode_minillm(
-        target=target,
-        speculator=speculator,
-        input_ids=input_ids,
-        max_new_tokens=max_new_tokens,
-        spec_len=spec_len,
-        temperature=temperature,
-        top_p=top_p,
-        eos_token_id=eos_token_id,
-        optimized=optimized,
-        max_consecutive_misses=max_consecutive_misses,
-        collect_stats=False,
-    )
+    if speculator is None:
+        output_ids, _ = _mtp_speculative_decode_minillm(
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            spec_len=spec_len,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            collect_stats=False,
+        )
+    else:
+        output_ids, _ = _speculative_decode_minillm(
+            target=target,
+            speculator=speculator,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            spec_len=spec_len,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            optimized=optimized,
+            max_consecutive_misses=max_consecutive_misses,
+            collect_stats=False,
+        )
     return output_ids
 
 
 def speculative_decode_minillm_with_stats(
     *,
     target: nn.Module,
-    speculator: nn.Module,
+    speculator: Optional[nn.Module],
     input_ids: List[int],
     max_new_tokens: int,
     spec_len: int,
@@ -1375,27 +1550,39 @@ def speculative_decode_minillm_with_stats(
     optimized: bool,
     max_consecutive_misses: int = 2,
 ) -> Tuple[List[int], SpecStats]:
-    output_ids, stats = _speculative_decode_minillm(
-        target=target,
-        speculator=speculator,
-        input_ids=input_ids,
-        max_new_tokens=max_new_tokens,
-        spec_len=spec_len,
-        temperature=temperature,
-        top_p=top_p,
-        eos_token_id=eos_token_id,
-        optimized=optimized,
-        max_consecutive_misses=max_consecutive_misses,
-        collect_stats=True,
-        trace=None,
-    )
+    if speculator is None:
+        output_ids, stats = _mtp_speculative_decode_minillm(
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            spec_len=spec_len,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            collect_stats=True,
+        )
+    else:
+        output_ids, stats = _speculative_decode_minillm(
+            target=target,
+            speculator=speculator,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            spec_len=spec_len,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            optimized=optimized,
+            max_consecutive_misses=max_consecutive_misses,
+            collect_stats=True,
+            trace=None,
+        )
     return output_ids, stats
 
 
 def speculative_decode_minillm_with_trace(
     *,
     target: nn.Module,
-    speculator: nn.Module,
+    speculator: Optional[nn.Module],
     input_ids: List[int],
     max_new_tokens: int,
     spec_len: int,
@@ -1406,20 +1593,32 @@ def speculative_decode_minillm_with_trace(
     max_consecutive_misses: int = 2,
     trace: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[List[int], SpecStats]:
-    output_ids, stats = _speculative_decode_minillm(
-        target=target,
-        speculator=speculator,
-        input_ids=input_ids,
-        max_new_tokens=max_new_tokens,
-        spec_len=spec_len,
-        temperature=temperature,
-        top_p=top_p,
-        eos_token_id=eos_token_id,
-        optimized=optimized,
-        max_consecutive_misses=max_consecutive_misses,
-        collect_stats=True,
-        trace=trace,
-    )
+    if speculator is None:
+        output_ids, stats = _mtp_speculative_decode_minillm(
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            spec_len=spec_len,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            collect_stats=True,
+        )
+    else:
+        output_ids, stats = _speculative_decode_minillm(
+            target=target,
+            speculator=speculator,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            spec_len=spec_len,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            optimized=optimized,
+            max_consecutive_misses=max_consecutive_misses,
+            collect_stats=True,
+            trace=trace,
+        )
     return output_ids, stats
 
 
@@ -1454,7 +1653,7 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
 
 def run_cli() -> None:
     parser = build_arg_parser(
-        description="Speculative decoding with EAGLE-3 speculator (MLX backend)."
+        description="Speculative decoding with MTP (MiniLLM) or EAGLE-3 speculator (MLX backend)."
     )
     args = parser.parse_args()
     optimized = True
@@ -1486,7 +1685,8 @@ def run_cli() -> None:
         args.spec_len, args.spec_layers, param_count=_count_params_mlx(target)
     )
     head_rank = args.head_rank if args.head_rank is not None and int(args.head_rank) > 0 else None
-    if not args.no_speculator:
+    use_mtp = args.target_arch == "minillm"
+    if not args.no_speculator and not use_mtp:
         speculator_dir = Path(args.speculator_dir)
         speculator_ckpt = Path(args.speculator_ckpt) if args.speculator_ckpt else None
         speculator, spec_len = load_speculator(
@@ -1501,7 +1701,7 @@ def run_cli() -> None:
 
     start = time.time()
     if args.target_arch == "minillm":
-        if speculator is None:
+        if args.no_speculator:
             output_ids = baseline_decode_minillm(
                 target=target,
                 input_ids=input_ids,

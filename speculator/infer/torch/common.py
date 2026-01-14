@@ -594,6 +594,194 @@ def baseline_decode(
 
 
 @torch.inference_mode()
+def _mtp_speculative_decode_minillm(
+    *,
+    target: MiniLLMForCausalLM,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    spec_len: int,
+    temperature: float,
+    top_p: float,
+    eos_token_id: Optional[int],
+    use_cache: bool,
+    collect_stats: bool,
+) -> Tuple[torch.Tensor, Optional[SpecStats]]:
+    if not use_cache:
+        output_ids = baseline_decode(
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            use_cache=False,
+        )
+        stats = None
+        if collect_stats:
+            stats = SpecStats(
+                total_accept=0,
+                total_draft=0,
+                accepted_output=0,
+                zero_accept=0,
+                steps=int(max_new_tokens),
+                spec_time_s=0.0,
+                target_time_s=0.0,
+                target_prefill_time_s=0.0,
+                target_verify_time_s=0.0,
+                target_generate_time_s=0.0,
+                target_prefill_calls=0,
+                target_verify_calls=0,
+                target_generate_calls=0,
+                target_generated=int(output_ids.shape[1] - input_ids.shape[1]),
+            )
+        return output_ids, stats
+
+    device = input_ids.device
+    output_ids = input_ids.clone()
+    produced = 0
+    total_accept = 0
+    total_draft = 0
+    accepted_output = 0
+    zero_accept = 0
+    steps = 0
+    spec_time_s = 0.0
+    target_time_s = 0.0
+    target_prefill_time_s = 0.0
+    target_verify_time_s = 0.0
+    target_generate_time_s = 0.0
+    target_prefill_calls = 0
+    target_verify_calls = 0
+    target_generate_calls = 0
+    target_generated = 0
+
+    past = None
+    last_logits = None
+
+    while produced < int(max_new_tokens):
+        steps += 1
+        t0 = time.perf_counter()
+        if past is None:
+            out = target(input_ids=output_ids, use_cache=True, return_dict=True)
+            prefill_s = time.perf_counter() - t0
+            target_prefill_time_s += prefill_s
+            target_prefill_calls += 1
+            target_time_s += prefill_s
+        else:
+            out = target(
+                input_ids=output_ids[:, -1:],
+                past_key_values=past,
+                use_cache=True,
+                return_dict=True,
+            )
+            gen_s = time.perf_counter() - t0
+            target_generate_time_s += gen_s
+            target_generate_calls += 1
+            target_time_s += gen_s
+        last_logits = out.logits[:, -1, :]
+        past = out.past_key_values
+
+        next_token = sample_next_token(last_logits, temperature=temperature, top_p=top_p)
+        output_ids = torch.cat(
+            [output_ids, torch.tensor([[next_token]], device=device, dtype=torch.long)],
+            dim=1,
+        )
+        produced += 1
+        target_generated += 1
+        if eos_token_id is not None and int(next_token) == int(eos_token_id):
+            break
+
+        mtp_logits = getattr(out, "mtp_logits", None) or []
+        max_draft = 1 + len(mtp_logits)
+        if spec_len and int(spec_len) > 0:
+            max_draft = min(max_draft, int(spec_len))
+        draft_tokens: List[int] = []
+        for idx in range(max_draft - 1):
+            draft_logits = mtp_logits[idx][:, -1, :]
+            draft_tokens.append(sample_next_token(draft_logits, temperature=temperature, top_p=top_p))
+
+        total_draft += len(draft_tokens)
+        accepted = 0
+
+        if draft_tokens:
+            t0 = time.perf_counter()
+            out = target(
+                input_ids=torch.tensor([[next_token]], device=device, dtype=torch.long),
+                past_key_values=past,
+                use_cache=True,
+                return_dict=True,
+            )
+            verify_s = time.perf_counter() - t0
+            target_verify_time_s += verify_s
+            target_verify_calls += 1
+            target_time_s += verify_s
+            past = out.past_key_values
+            verify_logits = out.logits[:, -1, :]
+
+            for draft_token in draft_tokens:
+                if produced >= int(max_new_tokens):
+                    break
+                target_token = sample_next_token(verify_logits, temperature=temperature, top_p=top_p)
+                if int(target_token) == int(draft_token):
+                    accepted += 1
+                    total_accept += 1
+                    accepted_output += 1
+                    output_ids = torch.cat(
+                        [output_ids, torch.tensor([[draft_token]], device=device, dtype=torch.long)],
+                        dim=1,
+                    )
+                    produced += 1
+                    target_generated += 1
+                    if eos_token_id is not None and int(draft_token) == int(eos_token_id):
+                        break
+
+                    t0 = time.perf_counter()
+                    out = target(
+                        input_ids=torch.tensor([[draft_token]], device=device, dtype=torch.long),
+                        past_key_values=past,
+                        use_cache=True,
+                        return_dict=True,
+                    )
+                    verify_s = time.perf_counter() - t0
+                    target_verify_time_s += verify_s
+                    target_verify_calls += 1
+                    target_time_s += verify_s
+                    past = out.past_key_values
+                    verify_logits = out.logits[:, -1, :]
+                else:
+                    output_ids = torch.cat(
+                        [output_ids, torch.tensor([[target_token]], device=device, dtype=torch.long)],
+                        dim=1,
+                    )
+                    produced += 1
+                    target_generated += 1
+                    if eos_token_id is not None and int(target_token) == int(eos_token_id):
+                        break
+                    break
+
+        if accepted == 0 and draft_tokens:
+            zero_accept += 1
+
+    stats = None
+    if collect_stats:
+        stats = SpecStats(
+            total_accept=int(total_accept),
+            total_draft=int(total_draft),
+            accepted_output=int(accepted_output),
+            zero_accept=int(zero_accept),
+            steps=int(steps),
+            spec_time_s=float(spec_time_s),
+            target_time_s=float(target_time_s),
+            target_prefill_time_s=float(target_prefill_time_s),
+            target_verify_time_s=float(target_verify_time_s),
+            target_generate_time_s=float(target_generate_time_s),
+            target_prefill_calls=int(target_prefill_calls),
+            target_verify_calls=int(target_verify_calls),
+            target_generate_calls=int(target_generate_calls),
+            target_generated=int(target_generated),
+        )
+    return output_ids, stats
+
+@torch.inference_mode()
 def _speculative_decode_qwen3(
     *,
     target: AutoModelForCausalLM,
@@ -1187,7 +1375,7 @@ def _speculative_decode_minillm(
 def speculative_decode(
     *,
     target: AutoModelForCausalLM,
-    speculator: Eagle3Speculator,
+    speculator: Optional[Eagle3Speculator],
     input_ids: torch.Tensor,
     max_new_tokens: int,
     spec_len: int,
@@ -1198,6 +1386,16 @@ def speculative_decode(
     optimized: bool,
     max_consecutive_misses: int = 2,
 ) -> torch.Tensor:
+    if speculator is None and not isinstance(target, MiniLLMForCausalLM):
+        return baseline_decode(
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            use_cache=use_cache,
+        )
     output_ids, _ = speculative_decode_with_stats(
         target=target,
         speculator=speculator,
@@ -1218,7 +1416,7 @@ def speculative_decode(
 def speculative_decode_with_stats(
     *,
     target: AutoModelForCausalLM,
-    speculator: Eagle3Speculator,
+    speculator: Optional[Eagle3Speculator],
     input_ids: torch.Tensor,
     max_new_tokens: int,
     spec_len: int,
@@ -1229,7 +1427,19 @@ def speculative_decode_with_stats(
     optimized: bool,
     max_consecutive_misses: int = 2,
 ) -> Tuple[torch.Tensor, SpecStats]:
-    if isinstance(target, MiniLLMForCausalLM):
+    if speculator is None and isinstance(target, MiniLLMForCausalLM):
+        output_ids, stats = _mtp_speculative_decode_minillm(
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            spec_len=spec_len,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            use_cache=use_cache,
+            collect_stats=True,
+        )
+    elif isinstance(target, MiniLLMForCausalLM):
         output_ids, stats = _speculative_decode_minillm(
             target=target,
             speculator=speculator,
@@ -1269,7 +1479,7 @@ def speculative_decode_with_stats(
 def speculative_decode_with_trace(
     *,
     target: AutoModelForCausalLM,
-    speculator: Eagle3Speculator,
+    speculator: Optional[Eagle3Speculator],
     input_ids: torch.Tensor,
     max_new_tokens: int,
     spec_len: int,
@@ -1281,7 +1491,19 @@ def speculative_decode_with_trace(
     max_consecutive_misses: int = 2,
     trace: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Tuple[torch.Tensor, SpecStats]:
-    if isinstance(target, MiniLLMForCausalLM):
+    if speculator is None and isinstance(target, MiniLLMForCausalLM):
+        output_ids, stats = _mtp_speculative_decode_minillm(
+            target=target,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            spec_len=spec_len,
+            temperature=temperature,
+            top_p=top_p,
+            eos_token_id=eos_token_id,
+            use_cache=use_cache,
+            collect_stats=True,
+        )
+    elif isinstance(target, MiniLLMForCausalLM):
         output_ids, stats = _speculative_decode_minillm(
             target=target,
             speculator=speculator,
@@ -1366,7 +1588,7 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
 
 def run_cli() -> None:
     parser = build_arg_parser(
-        description="Speculative decoding with EAGLE-3 speculator (Torch backend)."
+        description="Speculative decoding with MTP (MiniLLM) or EAGLE-3 speculator (Torch backend)."
     )
     args = parser.parse_args()
     optimized = True
@@ -1399,7 +1621,8 @@ def run_cli() -> None:
         if args.head_rank is not None and int(args.head_rank) > 0
         else None
     )
-    if not args.no_speculator:
+    use_mtp = isinstance(target, MiniLLMForCausalLM)
+    if not args.no_speculator and not use_mtp:
         speculator_dir = Path(args.speculator_dir)
         speculator_ckpt = Path(args.speculator_ckpt) if args.speculator_ckpt else None
         speculator, spec_len = load_speculator(
@@ -1415,7 +1638,7 @@ def run_cli() -> None:
         speculator = speculator.to(device)
 
     start = time.time()
-    if speculator is None:
+    if args.no_speculator:
         output_ids = baseline_decode(
             target=target,
             input_ids=input_ids,

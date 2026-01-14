@@ -103,96 +103,36 @@ OLLAMA_MODEL=qwen3:0.6b DATA_JSONL=out/distill_ollama_qwen3_0.6b/synth.jsonl OUT
   bash scripts/run_mlx_distill_ollama.sh
 ```
 
-### EAGLE-3 speculator（Qwen3-0.6B / MiniLLM，纯合成数据）
+### MTP 投机解码（MiniLLM / DeepSeek-V3.2 架构）
 
-> - speculator 默认会根据目标模型大小自动设置；可用 `--spec_len`/`--spec_layers` 显式覆盖。
-> - `--head_rank` 默认自动设置（hidden_size/8，范围 32-256）；可显式指定或设为 0 关闭低秩头。
-> - MLX 训练若 `out_dir` 下存在 checkpoint 会自动继续；如需重新开始请加 `--no_resume`。
-
-#### Qwen3-0.6B（Torch）
-
-```bash
-# Torch：自动生成合成数据 + 训练 EAGLE-3 style speculator
-python speculator/train/torch/train_eagle3_speculator.py
-# Torch：基准对比（baseline vs speculator）
-python speculator/infer/torch/bench.py --max_samples 16
-```
-
-#### Qwen3-0.6B（MLX）
-
-```bash
-# MLX：自动生成合成数据 + 训练 speculator
-python speculator/train/mlx/train_eagle3_speculator.py --hf_repo Qwen/Qwen3-0.6B
-# MLX：基准对比（baseline vs speculator）
-python speculator/infer/mlx/bench.py --hf_repo Qwen/Qwen3-0.6B --max_samples 16
-```
-
-#### Qwen3 + SGLang 官方 EAGLE3 复现（推荐）
-
-官方复现方式建议直接使用 SGLang 的 EAGLE3 推理路径（不走本仓库的 drafter/bench）。示例参数来自 SGLang 官方文档，按模型与硬件调整：
-
-```bash
-# 1) 安装 sglang（建议独立环境）
-pip install sglang
-
-# 2) 下载 EAGLE3 draft 模型（示例：Qwen3-32B Eagle3）
-huggingface-cli download Qwen/Qwen3-32B-Eagle3 --local-dir out/qwen3_32b_eagle3
-
-# 3) 启动服务
-python -m sglang.launch_server \
-  --model Qwen/Qwen3-32B \
-  --speculative-algorithm EAGLE3 \
-  --speculative-draft-model-path out/qwen3_32b_eagle3 \
-  --speculative-num-steps 1 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 2
-```
-
-如果你的模型有官方 Eagle3 draft 权重，也可以直接把 Hugging Face repo 作为 `--speculative-draft-model-path`：
-
-```bash
-python -m sglang.launch_server \
-  --model Qwen/Qwen3-32B \
-  --speculative-algorithm EAGLE3 \
-  --speculative-draft-model-path Qwen/Qwen3-32B-Eagle3 \
-  --speculative-num-steps 1 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 2
-```
-
-更多参数调优可参考 SGLang 文档，并使用其 `scripts/playground/bench_speculative.py` 搜索更优配置。
+> - MTP 使用模型自带的 multi-token prediction 头，不再需要单独训练 speculator。
+> - `--spec_len` 控制最多采纳的 draft 长度（上限 = 1 + num_nextn_predict_layers）。
 
 #### MiniLLM（Torch）
 
 ```bash
-# Torch：训练（指定 MiniLLM checkpoint + tokenizer）
-python speculator/train/torch/train_eagle3_speculator.py \
-  --target_arch minillm \
-  --minillm_ckpt out/pretrain_512.pth \
-  --minillm_tokenizer ./model
-# Torch：基准对比
 python speculator/infer/torch/bench.py \
   --target_arch minillm \
   --minillm_ckpt out/pretrain_512.pth \
-  --minillm_tokenizer ./model
+  --minillm_tokenizer ./model \
+  --spec_len 2
 ```
 
 #### MiniLLM（MLX）
 
 ```bash
-# MLX：训练（使用 mlx_train 产出的 checkpoint 目录）
-python speculator/train/mlx/train_eagle3_speculator.py \
-  --target_arch minillm \
-  --minillm_ckpt_dir out/mlx/sft/checkpoints/step_00000050 \
-  --minillm_tokenizer ./model
-# MLX：基准对比
 python speculator/infer/mlx/bench.py \
   --target_arch minillm \
   --minillm_ckpt_dir out/mlx/sft/checkpoints/step_00000050 \
-  --minillm_tokenizer ./model
+  --minillm_tokenizer ./model \
+  --spec_len 2
 ```
 
 > MLX 推理/训练依赖 `mlx-lm`（当前与 transformers==5.0.0rc1 绑定），建议使用独立虚拟环境。
+
+#### 兼容：EAGLE-3 speculator（Qwen3）
+
+如需对 Qwen3 使用 EAGLE-3 draft 模型，可继续使用 `speculator/train/*` 与 `speculator/infer/*`（参数与旧版保持一致）。
 
 ### PyTorch 蒸馏训练
 
@@ -219,7 +159,7 @@ python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir
 ├── data/                # 数据缓存目录
 ├── dataset/             # 公开数据集示例与脚本
 ├── docs/                # 文档与指南
-├── speculator/          # Speculator 训练/推理入口（torch/mlx）
+├── speculator/          # Speculator/MTP 解码与推理入口（torch/mlx）
 ├── mlx_train/           # MLX 训练与推理
 ├── model/               # MiniLLM Dense/MoE 实现
 ├── pipelines/           # 一键训练/推理流水线脚本（主逻辑）

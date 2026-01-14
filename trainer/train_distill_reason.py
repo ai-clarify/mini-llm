@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
 from dataset.lm_dataset import SFTDataset
+from trainer.loss_utils import compute_mtp_loss
 
 warnings.filterwarnings('ignore')
 
@@ -63,6 +64,7 @@ def train_epoch(epoch, wandb):
             loss_mask = loss_mask.view(Y.size())
             loss = (loss * loss_mask).sum() / loss_mask_sum
             loss += res.aux_loss
+            loss += compute_mtp_loss(res.mtp_logits, Y, loss_mask, weight=lm_config.mtp_loss_weight)
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -155,6 +157,7 @@ if __name__ == "__main__":
     parser.add_argument('--max_seq_len', default=1024, type=int)
     parser.add_argument('--use_moe', default=False, type=bool)
     parser.add_argument("--data_path", type=str, default="../dataset/r1_mix_1024.jsonl")
+    parser.add_argument("--mtp_loss_weight", type=float, default=0.1, help="Weight for MTP auxiliary loss.")
 
     # Pretrained model checkpoint arguments
     parser.add_argument("--pretrained_path", type=str, default=None,
@@ -163,8 +166,12 @@ if __name__ == "__main__":
                         help="Load pretrained model from /openbayes/home/out instead of local directory")
     args = parser.parse_args()
 
-    lm_config = MiniLLMConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                               use_moe=args.use_moe)
+    lm_config = MiniLLMConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        use_moe=args.use_moe,
+        mtp_loss_weight=args.mtp_loss_weight,
+    )
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)

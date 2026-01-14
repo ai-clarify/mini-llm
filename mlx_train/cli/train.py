@@ -238,14 +238,32 @@ def loss_fn(
     *,
     logits_chunk_size: int,
 ) -> mx.array:
-    hidden = model.model(x)  # [B, T, H]
-    return chunked_ce_loss(
+    hidden, mtp_hidden = model.forward_with_mtp_hidden(x)
+    loss = chunked_ce_loss(
         hidden=hidden,
         lm_head_weight=model.model.embed_tokens.weight,
         labels=y,
         loss_mask=loss_mask,
         chunk_size=int(logits_chunk_size),
     )
+    if mtp_hidden and float(model.config.mtp_loss_weight) > 0.0:
+        mtp_loss = mx.array(0.0, dtype=mx.float32)
+        count = 0
+        for idx, mtp_h in enumerate(mtp_hidden):
+            offset = idx + 2
+            if int(y.shape[1]) <= offset:
+                continue
+            mtp_loss = mtp_loss + chunked_ce_loss(
+                hidden=mtp_h[:, :-offset, :],
+                lm_head_weight=model.model.embed_tokens.weight,
+                labels=y[:, offset:],
+                loss_mask=loss_mask[:, offset:],
+                chunk_size=int(logits_chunk_size),
+            )
+            count += 1
+        if count > 0:
+            loss = loss + (mtp_loss / float(count)) * float(model.config.mtp_loss_weight)
+    return loss
 
 
 def sparse_loss_fn(
@@ -258,7 +276,7 @@ def sparse_loss_fn(
     *,
     logits_chunk_size: int,
 ) -> mx.array:
-    hidden = model.model(x)  # [B, T, H]
+    hidden, _ = model.forward_with_mtp_hidden(x)
     return sparse_ce_loss(
         hidden=hidden,
         lm_head_weight=model.model.embed_tokens.weight,
@@ -305,6 +323,8 @@ def make_config(args, tokenizer) -> MiniLLMConfig:
     cfg.lora_alpha = float(args.lora_alpha)
     cfg.lora_dropout = float(args.lora_dropout)
     cfg.lora_targets = str(args.lora_targets)
+    cfg.num_nextn_predict_layers = int(args.mtp_layers)
+    cfg.mtp_loss_weight = float(args.mtp_loss_weight)
 
     if args.attn_gate is not None:
         cfg.use_attn_gate = bool(args.attn_gate)
@@ -440,6 +460,8 @@ def main() -> None:
     parser.add_argument("--max_position_embeddings", type=int, default=32768)
     parser.add_argument("--rope_theta", type=float, default=1_000_000.0)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--mtp_layers", type=int, default=1, help="Number of MTP predictor layers.")
+    parser.add_argument("--mtp_loss_weight", type=float, default=0.1, help="Weight for MTP auxiliary loss.")
     parser.add_argument(
         "--attn_gate",
         action=argparse.BooleanOptionalAction,

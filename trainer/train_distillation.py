@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
 from dataset.lm_dataset import SFTDataset
+from trainer.loss_utils import compute_mtp_loss
 
 warnings.filterwarnings('ignore')
 
@@ -88,6 +89,8 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
         ce_loss = torch.sum(ce_loss * loss_mask_flat) / loss_mask_flat.sum()
         if lm_config_student.use_moe:
             ce_loss += res.aux_loss
+        mtp_loss = compute_mtp_loss(res.mtp_logits, Y, loss_mask, weight=lm_config_student.mtp_loss_weight)
+        ce_loss = ce_loss + mtp_loss
 
         # 2) Distillation Loss（可选）
         if teacher is not None:
@@ -131,6 +134,7 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
                 wandb.log({
                     "loss": loss.item(),
                     "ce_loss": ce_loss.item(),
+                    "mtp_loss": mtp_loss.item() if lm_config_student.mtp_loss_weight > 0 else 0.0,
                     "distill_loss": distill_loss.item() if teacher_model is not None else 0.0,
                     "lr": optimizer.param_groups[-1]['lr'],
                     "last-time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60
@@ -205,6 +209,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument('--local_rank', type=int, default=-1)
     parser.add_argument("--data_path", type=str, default="../dataset/sft_xxx.jsonl")
+    parser.add_argument("--mtp_loss_weight", type=float, default=0.1, help="Weight for MTP auxiliary loss.")
 
     # Pretrained model checkpoint arguments
     parser.add_argument("--pretrained_path", type=str, default=None,
@@ -213,8 +218,8 @@ if __name__ == "__main__":
                         help="Load pretrained model from /openbayes/home/out instead of local directory")
     args = parser.parse_args()
     # 定义学生模型和教师模型
-    lm_config_student = MiniLLMConfig(hidden_size=512, num_hidden_layers=8)
-    lm_config_teacher = MiniLLMConfig(hidden_size=768, num_hidden_layers=16)
+    lm_config_student = MiniLLMConfig(hidden_size=512, num_hidden_layers=8, mtp_loss_weight=args.mtp_loss_weight)
+    lm_config_teacher = MiniLLMConfig(hidden_size=768, num_hidden_layers=16, mtp_loss_weight=0.0)
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)

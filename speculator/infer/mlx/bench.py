@@ -414,7 +414,7 @@ def _run_spec_minillm(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Benchmark EAGLE-3 speculator vs baseline (MLX backend)."
+        description="Benchmark MTP (MiniLLM) or EAGLE-3 speculator vs baseline (MLX backend)."
     )
     parser.add_argument(
         "--target_arch", type=str, choices=["qwen3", "minillm"], default="qwen3"
@@ -482,7 +482,8 @@ def main() -> None:
         if args.head_rank is not None and int(args.head_rank) > 0
         else None
     )
-    if not args.no_speculator:
+    use_mtp = args.target_arch == "minillm"
+    if not args.no_speculator and not use_mtp:
         speculator_dir = Path(args.speculator_dir)
         speculator_ckpt = Path(args.speculator_ckpt) if args.speculator_ckpt else None
         speculator, spec_len = load_speculator(

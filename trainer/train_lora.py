@@ -17,6 +17,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
 from dataset.lm_dataset import SFTDataset
 from model.model_lora import load_lora, save_lora, apply_lora
+from trainer.loss_utils import compute_mtp_loss
 
 warnings.filterwarnings('ignore')
 
@@ -51,6 +52,7 @@ def train_epoch(epoch, wandb):
             ).view(Y.size())
             loss = (loss * loss_mask).sum() / loss_mask.sum()
             loss += res.aux_loss
+            loss += compute_mtp_loss(res.mtp_logits, Y, loss_mask, weight=lm_config.mtp_loss_weight)
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -136,6 +138,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=False, type=bool)
     parser.add_argument("--data_path", type=str, default="../dataset/lora_identity.jsonl")
     parser.add_argument("--lora_name", type=str, default="lora_identity", help="根据任务保存成lora_(英文/医学/心理...)")
+    parser.add_argument("--mtp_loss_weight", type=float, default=0.1, help="Weight for MTP auxiliary loss.")
     # Pretrained model checkpoint arguments
     parser.add_argument("--pretrained_path", type=str, default=None,
                         help="Path to pretrained model checkpoint (supports /openbayes/home/out)")
@@ -143,8 +146,12 @@ if __name__ == "__main__":
                         help="Load pretrained model from /openbayes/home/out instead of local directory")
     args = parser.parse_args()
 
-    lm_config = MiniLLMConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                               use_moe=args.use_moe)
+    lm_config = MiniLLMConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        use_moe=args.use_moe,
+        mtp_loss_weight=args.mtp_loss_weight,
+    )
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)

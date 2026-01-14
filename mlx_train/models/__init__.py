@@ -1,7 +1,7 @@
 """MLX model components for MiniLLM."""
 
 from .minillm import (  # noqa: F401
-    Attention,
+    MiniLLMAttention as Attention,
     FeedForward,
     LayerKVCache,
     MiniLLMBlock,

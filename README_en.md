@@ -103,14 +103,36 @@ OLLAMA_MODEL=qwen3:0.6b DATA_JSONL=out/distill_ollama_qwen3_0.6b/synth.jsonl OUT
   bash scripts/run_mlx_distill_ollama.sh
 ```
 
-### PyTorch distillation training
+### MTP speculative decoding (MiniLLM / DeepSeek-V3.2 architecture)
+
+> - MTP uses the built-in multi-token prediction heads; no separate speculator training required.
+> - `--spec_len` controls the maximum draft length (cap = 1 + num_nextn_predict_layers).
+
+#### MiniLLM (Torch)
 
 ```bash
-# Expects out/full_sft_512.pth (student) and out/full_sft_768.pth (teacher) by default
-python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir out
+python speculator/infer/torch/bench.py \
+  --target_arch minillm \
+  --minillm_ckpt out/pretrain_512.pth \
+  --minillm_tokenizer ./model \
+  --spec_len 2
 ```
 
-### EAGLE-3 speculator (Qwen3-0.6B, pure synthetic data)
+#### MiniLLM (MLX)
+
+```bash
+python speculator/infer/mlx/bench.py \
+  --target_arch minillm \
+  --minillm_ckpt_dir out/mlx/sft/checkpoints/step_00000050 \
+  --minillm_tokenizer ./model \
+  --spec_len 2
+```
+
+> MLX inference/training requires `mlx-lm` (currently pinned to transformers==5.0.0rc1). Use a clean venv if needed.
+
+#### Compatibility: EAGLE-3 speculator (Qwen3-0.6B, pure synthetic data)
+
+If you need EAGLE-3 draft models for Qwen3, keep using `speculator/train/*` and `speculator/infer/*` (same arguments as before).
 
 > Speculator defaults auto-scale to target model size; override with `--spec_len`/`--spec_layers` if needed.
 > `--head_rank` defaults to hidden_size/8 (clamped to 32-256); override or set 0 to disable the low-rank head.
@@ -164,7 +186,12 @@ python -m sglang.launch_server \
 
 For tuning, follow SGLang docs and use `scripts/playground/bench_speculative.py`.
 
-> MLX inference/training requires `mlx-lm` (currently pinned to transformers==5.0.0rc1). Use a clean venv if needed.
+### PyTorch distillation training
+
+```bash
+# Expects out/full_sft_512.pth (student) and out/full_sft_768.pth (teacher) by default
+python trainer/train_distillation.py --data_path dataset/sft_xxx.jsonl --out_dir out
+```
 
 ---
 
@@ -184,7 +211,7 @@ For tuning, follow SGLang docs and use `scripts/playground/bench_speculative.py`
 ├── data/                # Data cache
 ├── dataset/             # Public dataset examples
 ├── docs/                # Documentation
-├── speculator/          # Speculator training/inference entrypoints (torch/mlx)
+├── speculator/          # Speculator/MTP decoding entrypoints (torch/mlx)
 ├── mlx_train/           # MLX training and inference
 ├── model/               # MiniLLM Dense/MoE implementations
 ├── pipelines/           # One-click pipeline scripts (main logic)

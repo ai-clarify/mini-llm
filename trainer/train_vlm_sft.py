@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from dataset.vlm_dataset import VLMDataset
 from model.model_vlm import VLMConfig
+from trainer.loss_utils import compute_mtp_loss
 from trainer.trainer_utils import (
     SkipBatchSampler,
     get_lr,
@@ -54,7 +55,9 @@ def train_epoch(args, vlm_config, model, optimizer, scaler, autocast_ctx, loader
             ).view(Y.size())
 
             loss = (loss * loss_mask).sum() / loss_mask.sum()
-            loss = (loss + res.aux_loss) / args.accumulation_steps
+            loss = loss + res.aux_loss
+            loss += compute_mtp_loss(res.mtp_logits, Y, loss_mask, weight=vlm_config.mtp_loss_weight)
+            loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
 
@@ -122,6 +125,7 @@ def main():
     parser.add_argument('--from_resume', type=int, default=0, choices=[0, 1], help='是否自动检测续训')
     parser.add_argument('--use_wandb', action='store_true', help='是否启用SwanLab/W&B日志')
     parser.add_argument('--wandb_project', type=str, default='MiniLLM-V-SFT', help='SwanLab项目名')
+    parser.add_argument('--mtp_loss_weight', type=float, default=0.1, help='Weight for MTP auxiliary loss.')
     args = parser.parse_args()
 
     local_rank = init_distributed_mode()
@@ -135,6 +139,7 @@ def main():
         num_hidden_layers=args.num_hidden_layers,
         max_seq_len=args.max_seq_len,
         use_moe=bool(args.use_moe),
+        mtp_loss_weight=args.mtp_loss_weight,
     )
     ckp_data = vlm_checkpoint(vlm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume == 1 else None
 

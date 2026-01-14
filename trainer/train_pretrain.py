@@ -23,6 +23,7 @@ from transformers import AutoTokenizer
 from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
 from dataset.lm_dataset import PretrainDataset
 from checkpoint_loader import CheckpointLoader
+from trainer.loss_utils import compute_mtp_loss
 
 warnings.filterwarnings('ignore')
 
@@ -64,6 +65,7 @@ def train_epoch(epoch, wandb):
             ).view(Y.size())
             loss = (loss * loss_mask).sum() / loss_mask.sum()
             loss += res.aux_loss
+            loss += compute_mtp_loss(res.mtp_logits, Y, loss_mask, weight=lm_config.mtp_loss_weight)
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -187,6 +189,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl")
     parser.add_argument("--tensorboard_dir", type=str, default=None)
     parser.add_argument("--max_steps", type=int, default=None, help="Limit total training iterations (for smoke tests)")
+    parser.add_argument("--mtp_loss_weight", type=float, default=0.1, help="Weight for MTP auxiliary loss.")
 
     # Pretrained model checkpoint arguments
     parser.add_argument("--pretrained_path", type=str, default=None,
@@ -198,8 +201,12 @@ if __name__ == "__main__":
     if args.max_steps is not None and args.max_steps <= 0:
         args.max_steps = None
 
-    lm_config = MiniLLMConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                               use_moe=args.use_moe)
+    lm_config = MiniLLMConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        use_moe=args.use_moe,
+        mtp_loss_weight=args.mtp_loss_weight,
+    )
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
