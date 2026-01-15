@@ -8,7 +8,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -290,6 +290,31 @@ def _render_progress(current: int, total: int, *, label: str = "bench") -> None:
         sys.stdout.write("\n")
 
 
+def _decode_generated(tokenizer, output_ids: Sequence[int], prompt_len: int) -> str:
+    gen_ids = list(output_ids[int(prompt_len) :])
+    if not gen_ids:
+        return ""
+    try:
+        text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+    except TypeError:
+        text = tokenizer.decode(gen_ids)
+    return text.strip()
+
+
+class OutputLogWriter:
+    def __init__(self, path: str) -> None:
+        self._path = Path(path)
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = self._path.open("w", encoding="utf-8")
+
+    def write(self, payload: Dict[str, Any]) -> None:
+        self._fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        self._fh.flush()
+
+    def close(self) -> None:
+        self._fh.close()
+
+
 def _sync_device(device: torch.device) -> None:
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -305,7 +330,7 @@ def _run_baseline(
     eos_token_id: Optional[int],
     use_cache: bool,
     device: torch.device,
-) -> BenchResult:
+) -> Tuple[BenchResult, torch.Tensor]:
     _sync_device(device)
     start = time.perf_counter()
     output_ids = baseline_decode(
@@ -321,7 +346,7 @@ def _run_baseline(
     elapsed = time.perf_counter() - start
     num_input = int(input_ids.shape[1])
     num_output = max(int(output_ids.shape[1]) - num_input, 0)
-    return BenchResult(num_input, num_output, elapsed)
+    return BenchResult(num_input, num_output, elapsed), output_ids
 
 
 def _run_spec(
@@ -337,7 +362,7 @@ def _run_spec(
     use_cache: bool,
     device: torch.device,
     trace: Optional[Callable[[Dict[str, Any]], None]] = None,
-) -> SpecBenchResult:
+) -> Tuple[SpecBenchResult, torch.Tensor]:
     _sync_device(device)
     start = time.perf_counter()
     if trace is None:
@@ -371,7 +396,7 @@ def _run_spec(
     elapsed = time.perf_counter() - start
     num_input = int(input_ids.shape[1])
     num_output = max(int(output_ids.shape[1]) - num_input, 0)
-    return SpecBenchResult(num_input, num_output, elapsed, stats)
+    return SpecBenchResult(num_input, num_output, elapsed, stats), output_ids
 
 
 def main() -> None:
@@ -432,6 +457,12 @@ def main() -> None:
         type=str,
         default="out/bench_token_log_torch.jsonl",
         help="Write token-level acceptance log as JSONL (speculator only).",
+    )
+    parser.add_argument(
+        "--output_log",
+        type=str,
+        default=None,
+        help="Write prompt + generated outputs as JSONL.",
     )
     args = parser.parse_args()
 
@@ -505,6 +536,7 @@ def main() -> None:
     )
 
     prompt_inputs: List[torch.Tensor] = []
+    prompt_texts: List[str] = []
     for messages in prompt_messages:
         if args.no_chat_template:
             prompt_text = messages[-1]["content"]
@@ -516,6 +548,7 @@ def main() -> None:
             prompt_text, add_special_tokens=False, return_tensors="pt"
         ).input_ids
         prompt_inputs.append(input_ids.to(device))
+        prompt_texts.append(prompt_text)
 
     baseline_results: List[BenchResult] = []
     spec_results: List[SpecBenchResult] = []
@@ -528,6 +561,7 @@ def main() -> None:
     completed = 0
     use_cache = True
     prompt_count = len(prompt_inputs)
+    output_logger = OutputLogWriter(args.output_log) if args.output_log else None
     try:
         for round_idx in range(int(args.rounds)):
             for prompt_idx, input_ids in enumerate(prompt_inputs):
@@ -537,7 +571,7 @@ def main() -> None:
                 torch.manual_seed(seed_base)
                 if torch.cuda.is_available():
                     torch.cuda.manual_seed_all(seed_base)
-                baseline = _run_baseline(
+                baseline, baseline_ids = _run_baseline(
                     target=target,
                     input_ids=input_ids,
                     max_new_tokens=args.max_new_tokens,
@@ -558,7 +592,7 @@ def main() -> None:
                         if token_logger is not None
                         else None
                     )
-                    spec = _run_spec(
+                    spec, spec_ids = _run_spec(
                         target=target,
                         speculator=speculator,
                         input_ids=input_ids,
@@ -572,11 +606,36 @@ def main() -> None:
                         trace=trace,
                     )
                     spec_results.append(spec)
+                else:
+                    spec_ids = None
+
+                if output_logger is not None:
+                    prompt_len = int(input_ids.shape[1])
+                    base_text = _decode_generated(
+                        tokenizer, baseline_ids[0].tolist(), prompt_len
+                    )
+                    spec_text = (
+                        _decode_generated(tokenizer, spec_ids[0].tolist(), prompt_len)
+                        if spec_ids is not None
+                        else ""
+                    )
+                    output_logger.write(
+                        {
+                            "round": int(round_idx),
+                            "prompt_index": int(prompt_idx),
+                            "seed": int(seed_base),
+                            "prompt_text": prompt_texts[prompt_idx],
+                            "baseline_text": base_text,
+                            "spec_text": spec_text,
+                        }
+                    )
                 completed += 1
                 _render_progress(completed, total_samples)
     finally:
         if token_logger is not None:
             token_logger.close()
+        if output_logger is not None:
+            output_logger.close()
 
     def summarize(rows: List[BenchResult]) -> Dict[str, float]:
         total_out = sum(r.num_output_tokens for r in rows)
