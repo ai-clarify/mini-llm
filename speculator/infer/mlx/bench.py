@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import string
 import sys
 import time
@@ -30,6 +31,7 @@ from speculator.infer.mlx.common import (
     speculative_decode_with_trace,
 )
 from speculator.infer.prompt_utils import load_prompt_messages, resolve_prompts_jsonl
+from mlx_train.stats import _find_latest_checkpoint as _find_latest_checkpoint_impl
 
 
 @dataclass(frozen=True)
@@ -135,6 +137,40 @@ class TokenLogWriter:
         if all(ch in string.punctuation for ch in stripped):
             return "punct"
         return "mixed"
+
+
+def _resolve_minillm_ckpt_dir(path: Optional[str], *, out_dir: Optional[str]) -> Path:
+    if path:
+        p = Path(path)
+        if p.is_file() and p.name.endswith(".safetensors"):
+            p = p.parent
+        if not p.exists():
+            raise FileNotFoundError(p)
+        return p
+    base = Path(out_dir or os.environ.get("OUT") or "out/mlx")
+    latest = _find_latest_checkpoint_impl(base)
+    if latest is None:
+        raise FileNotFoundError(
+            f"No MiniLLM checkpoint found under {base} (set --minillm_ckpt_dir)."
+        )
+    return latest
+
+
+def _resolve_minillm_tokenizer(tokenizer_path: Optional[str], ckpt_dir: Path) -> str:
+    if tokenizer_path:
+        return tokenizer_path
+    state_path = ckpt_dir / "state.json"
+    if state_path.is_file():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            args = state.get("args")
+            if isinstance(args, dict):
+                tok = args.get("tokenizer_path")
+                if tok:
+                    return str(tok)
+        except Exception:
+            pass
+    return "./model"
 
     def _top_tokens(self, counter: Counter) -> List[Dict[str, Any]]:
         top = []
@@ -423,7 +459,18 @@ def main() -> None:
     parser.add_argument("--model_dir", type=str, default=None)
     parser.add_argument("--revision", type=str, default=None)
     parser.add_argument("--minillm_ckpt_dir", type=str, default=None)
-    parser.add_argument("--minillm_tokenizer", type=str, default="./model")
+    parser.add_argument(
+        "--minillm_out_dir",
+        type=str,
+        default=None,
+        help="Auto-find MiniLLM checkpoints under this dir (default: $OUT or out/mlx).",
+    )
+    parser.add_argument(
+        "--minillm_tokenizer",
+        type=str,
+        default=None,
+        help="Tokenizer path for MiniLLM (default: from checkpoint state.json or ./model).",
+    )
     parser.add_argument(
         "--speculator_dir", type=str, default="out/eagle3_speculator_mlx/qwen3_0.6b"
     )
@@ -464,13 +511,30 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    minillm_ckpt_dir = args.minillm_ckpt_dir
+    minillm_tokenizer = args.minillm_tokenizer
+    if args.target_arch == "minillm":
+        resolved_ckpt = _resolve_minillm_ckpt_dir(
+            args.minillm_ckpt_dir,
+            out_dir=args.minillm_out_dir,
+        )
+        minillm_ckpt_dir = str(resolved_ckpt)
+        minillm_tokenizer = _resolve_minillm_tokenizer(
+            args.minillm_tokenizer,
+            resolved_ckpt,
+        )
+        print(
+            f"[bench] minillm_ckpt_dir={minillm_ckpt_dir} minillm_tokenizer={minillm_tokenizer}",
+            flush=True,
+        )
+
     target, tokenizer = _load_target(
         target_arch=args.target_arch,
         model_dir=args.model_dir,
         hf_repo=args.hf_repo,
         revision=args.revision,
-        minillm_ckpt_dir=args.minillm_ckpt_dir,
-        minillm_tokenizer=args.minillm_tokenizer,
+        minillm_ckpt_dir=minillm_ckpt_dir,
+        minillm_tokenizer=minillm_tokenizer or "./model",
     )
 
     speculator = None

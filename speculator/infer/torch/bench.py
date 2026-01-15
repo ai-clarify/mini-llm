@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import string
 import sys
 import time
@@ -260,6 +261,24 @@ class TokenLogWriter:
             json.dump(summary, f, ensure_ascii=False, indent=2)
 
 
+def _auto_find_minillm_ckpt(out_dir: Optional[str]) -> Optional[Path]:
+    base = Path(out_dir or os.environ.get("OUT") or "out")
+    if not base.exists():
+        return None
+    patterns = [
+        "full_sft_*.pth",
+        "pretrain_*.pth",
+        "rlhf_*.pth",
+        "*.pth",
+    ]
+    for pattern in patterns:
+        candidates = list(base.glob(pattern))
+        if candidates:
+            candidates.sort(key=lambda p: p.stat().st_mtime)
+            return candidates[-1]
+    return None
+
+
 def _render_progress(current: int, total: int, *, label: str = "bench") -> None:
     width = 28
     filled = int(width * current / total)
@@ -364,6 +383,12 @@ def main() -> None:
     )
     parser.add_argument("--target_model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--minillm_ckpt", type=str, default=None)
+    parser.add_argument(
+        "--minillm_out_dir",
+        type=str,
+        default=None,
+        help="Auto-find MiniLLM checkpoints under this dir (default: $OUT or out).",
+    )
     parser.add_argument("--minillm_config", type=str, default=None)
     parser.add_argument("--minillm_tokenizer", type=str, default="./model")
     parser.add_argument(
@@ -416,6 +441,15 @@ def main() -> None:
 
     device = torch.device(args.device)
     dtype = _resolve_dtype(args.dtype)
+
+    if args.target_arch == "minillm" and not args.minillm_ckpt:
+        auto_ckpt = _auto_find_minillm_ckpt(args.minillm_out_dir)
+        if auto_ckpt is None:
+            raise FileNotFoundError(
+                "No MiniLLM checkpoint found (set --minillm_ckpt or --minillm_out_dir)."
+            )
+        args.minillm_ckpt = str(auto_ckpt)
+        print(f"[bench] minillm_ckpt={args.minillm_ckpt}", flush=True)
 
     target, tokenizer = _load_target_and_tokenizer(args, device, dtype)
 
