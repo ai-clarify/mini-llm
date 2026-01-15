@@ -326,6 +326,10 @@ def resolve_data_path_spec(
                 piece = "minimind:pretrain_hq.jsonl"
             elif task == "sft":
                 piece = "minimind:sft_mini_512.jsonl"
+            elif task == "dpo":
+                piece = "minimind:dpo.jsonl"
+            elif task == "r1":
+                piece = "minimind:r1_mix_1024.jsonl"
             else:
                 raise ValueError(f"Unsupported task for minimind:auto: {task}")
         elif piece == "minimind:small":

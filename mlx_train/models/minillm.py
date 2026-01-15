@@ -702,6 +702,13 @@ class MiniLLMModel(nn.Module):
                 h = layer(h, start_pos=start_pos, attention_mask=attention_mask, cos=cos, sin=sin)
         return self.norm(h)
 
+    def aux_loss(self) -> mx.array:
+        aux = mx.array(0.0, dtype=mx.float32)
+        for layer in self.layers:
+            if isinstance(layer.mlp, MoEFeedForward):
+                aux = aux + layer.mlp.aux_loss.astype(mx.float32)
+        return aux
+
     def forward_with_cache(
         self,
         input_ids: mx.array,
@@ -784,9 +791,10 @@ class MiniLLMForCausalLM(nn.Module):
 
     def forward_with_mtp_hidden(
         self, input_ids: mx.array, *, attention_mask: Optional[mx.array] = None
-    ) -> Tuple[mx.array, List[mx.array]]:
+    ) -> Tuple[mx.array, List[mx.array], mx.array]:
         h = self.model(input_ids, attention_mask=attention_mask)
-        return h, self._mtp_hidden(h)
+        aux_loss = self.model.aux_loss()
+        return h, self._mtp_hidden(h), aux_loss
 
     def forward_with_cache(
         self,

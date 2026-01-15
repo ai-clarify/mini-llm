@@ -185,3 +185,78 @@ def sparse_ce_loss(
     )
     denom = mx.maximum(tokens, mx.array(1.0, dtype=mx.float32))
     return loss_sum / denom
+
+
+def sequence_logprobs(
+    *,
+    hidden: mx.array,
+    lm_head_weight: mx.array,
+    labels: mx.array,
+    loss_mask: mx.array,
+    chunk_size: int,
+) -> mx.array:
+    """
+    Compute per-sequence average log-probabilities.
+
+    Complexity: O(B * T * V) time without chunking (or O(B * T * V) in chunks),
+    O(B * T) space for temporary logits (or O(B * chunk * V) per chunk),
+    where B=batch, T=seq_len, V=vocab size.
+    """
+    if hidden.ndim != 3:
+        raise ValueError(f"hidden must be [B, T, H], got shape={hidden.shape}")
+    if labels.shape != hidden.shape[:2]:
+        raise ValueError(f"labels shape {labels.shape} != hidden[:2] {hidden.shape[:2]}")
+    if loss_mask.shape != hidden.shape[:2]:
+        raise ValueError(f"loss_mask shape {loss_mask.shape} != hidden[:2] {hidden.shape[:2]}")
+    if lm_head_weight.ndim != 2 or lm_head_weight.shape[1] != hidden.shape[2]:
+        raise ValueError(
+            f"lm_head_weight must be [V, H] with H={hidden.shape[2]}, got {lm_head_weight.shape}"
+        )
+
+    bsz, seq_len, _ = hidden.shape
+    mask = loss_mask.astype(mx.float32)
+    seq_lengths = mx.maximum(mx.sum(mask, axis=1), mx.array(1.0, dtype=mx.float32))
+
+    if chunk_size <= 0 or int(chunk_size) >= int(seq_len):
+        logits = hidden @ lm_head_weight.transpose()
+        log_probs = nn.log_softmax(logits, axis=-1)
+        token_logp = mx.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
+        seq_logp = mx.sum(token_logp * mask, axis=1)
+        return seq_logp / seq_lengths
+
+    chunk = int(chunk_size)
+    logp_sum = mx.zeros((int(bsz),), dtype=mx.float32)
+    for start in range(0, int(seq_len), chunk):
+        h = hidden[:, start : start + chunk, :]
+        y = labels[:, start : start + chunk]
+        m = mask[:, start : start + chunk]
+        logits = h @ lm_head_weight.transpose()
+        log_probs = nn.log_softmax(logits, axis=-1)
+        token_logp = mx.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
+        logp_sum = logp_sum + mx.sum(token_logp * m, axis=1)
+    return logp_sum / seq_lengths
+
+
+def dpo_loss(
+    policy_logp: mx.array,
+    ref_logp: mx.array,
+    *,
+    beta: float,
+) -> mx.array:
+    """
+    Compute DPO loss from per-sequence log-probabilities.
+
+    Complexity: O(B) time, O(B) space for batch size B.
+    """
+    if policy_logp.shape != ref_logp.shape:
+        raise ValueError(
+            f"policy_logp shape {policy_logp.shape} != ref_logp shape {ref_logp.shape}"
+        )
+    if int(policy_logp.shape[0]) % 2 != 0:
+        raise ValueError("DPO expects an even batch size (chosen/rejected pairs).")
+
+    half = int(policy_logp.shape[0] // 2)
+    pi_logratios = policy_logp[:half] - policy_logp[half:]
+    ref_logratios = ref_logp[:half] - ref_logp[half:]
+    logits = pi_logratios - ref_logratios
+    return mx.mean(-nn.log_sigmoid(float(beta) * logits))

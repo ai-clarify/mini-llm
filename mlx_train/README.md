@@ -380,5 +380,7 @@ python3 -m mlx_train.train \
 
 ## 说明
 
-- 当前 MLX 路径 **未实现 MoE**（`use_moe=True` 会报错）。
+- MLX 已支持 MoE：使用 `--use_moe` 或 `--preset 200mb` 启用，并可通过 `--n_routed_experts` 等参数调节。
+- Gated attention 默认关闭：使用 `--attn_gate` 或设置 `GATE=1` 开启。
+- Indexer 可通过 `--index_n_heads` / `--index_topk` 启用与调节。
 - 200MB 预设指 **≈200M 参数量**（fp16/bf16 权重大约 400MB 级别；训练时显存/内存还会包含优化器状态与激活）。

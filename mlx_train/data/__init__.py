@@ -72,7 +72,7 @@ def _encode_sample(obj: Dict[str, Any], *, tokenizer, task: str) -> List[int]:
             text = json.dumps(obj, ensure_ascii=False)
         return tokenizer.encode(text, add_special_tokens=False)
 
-    if task == "sft":
+    if task in ("sft", "r1"):
         if "conversations" not in obj:
             raise ValueError("SFT task expects JSONL lines with a `conversations` field.")
         prompt = tokenizer.apply_chat_template(
@@ -83,6 +83,27 @@ def _encode_sample(obj: Dict[str, Any], *, tokenizer, task: str) -> List[int]:
         return tokenizer.encode(prompt, add_special_tokens=False)
 
     raise ValueError(f"Unknown task: {task}")
+
+
+def _encode_dpo_pair(obj: Dict[str, Any], *, tokenizer) -> Tuple[List[int], List[int]]:
+    if "chosen_ids" in obj and "rejected_ids" in obj:
+        chosen_ids = [int(t) for t in cast(Sequence[Any], obj["chosen_ids"])]
+        rejected_ids = [int(t) for t in cast(Sequence[Any], obj["rejected_ids"])]
+        return chosen_ids, rejected_ids
+
+    if "chosen" not in obj or "rejected" not in obj:
+        raise ValueError("DPO task expects JSONL lines with `chosen` and `rejected` fields.")
+    chosen = cast(Sequence[Dict[str, Any]], obj["chosen"])
+    rejected = cast(Sequence[Dict[str, Any]], obj["rejected"])
+    chosen_prompt = tokenizer.apply_chat_template(
+        chosen, tokenize=False, add_generation_prompt=False
+    )
+    rejected_prompt = tokenizer.apply_chat_template(
+        rejected, tokenize=False, add_generation_prompt=False
+    )
+    chosen_ids = tokenizer.encode(chosen_prompt, add_special_tokens=False)
+    rejected_ids = tokenizer.encode(rejected_prompt, add_special_tokens=False)
+    return chosen_ids, rejected_ids
 
 
 def _pad_or_truncate(ids: List[int], *, length: int, pad_id: int) -> List[int]:
@@ -220,7 +241,7 @@ def make_batch_iterator(
 
     bos_id: Optional[List[int]] = None
     eos_id: Optional[List[int]] = None
-    if task == "sft":
+    if task in ("sft", "r1"):
         bos_id = tokenizer.encode(f"{tokenizer.bos_token}assistant", add_special_tokens=False)
         eos_id = tokenizer.encode(f"{tokenizer.eos_token}", add_special_tokens=False)
 
@@ -235,7 +256,7 @@ def make_batch_iterator(
         ids = _encode_sample(obj, tokenizer=tokenizer, task=task)
         if task == "pretrain":
             x, y, m = tokenize_pretrain_from_ids(ids=ids, seq_len=seq_len, pad_id=pad_id)
-        elif task == "sft":
+        elif task in ("sft", "r1"):
             x, y, m = tokenize_sft_from_ids(
                 ids=ids,
                 seq_len=seq_len,
@@ -326,7 +347,7 @@ def make_microbatch_iterator(
 
     bos_id: Optional[List[int]] = None
     eos_id: Optional[List[int]] = None
-    if task == "sft":
+    if task in ("sft", "r1"):
         bos_id = tokenizer.encode(f"{tokenizer.bos_token}assistant", add_special_tokens=False)
         eos_id = tokenizer.encode(f"{tokenizer.eos_token}", add_special_tokens=False)
 
@@ -390,7 +411,7 @@ def make_microbatch_iterator(
 
         if task == "pretrain":
             x, y, m = tokenize_pretrain_from_ids(ids=ids, seq_len=int(b), pad_id=pad_id)
-        elif task == "sft":
+        elif task in ("sft", "r1"):
             x, y, m = tokenize_sft_from_ids(
                 ids=ids,
                 seq_len=int(b),
@@ -487,3 +508,153 @@ def pretokenize_jsonl(
         ids = _encode_sample(obj, tokenizer=tokenizer, task=task)
         cache.append({"ids": ids})
     return cache
+
+
+def pretokenize_dpo_jsonl(
+    *,
+    paths: Sequence[str],
+    tokenizer,
+) -> List[Dict[str, Any]]:
+    """
+    Pre-tokenize a DPO JSONL dataset once to avoid repeated text->ids work.
+
+    Returns a list of {"chosen_ids": [...], "rejected_ids": [...]} items.
+
+    Complexity: O(N * L) time, O(N * L) space for N samples with average length L.
+    """
+    cache: List[Dict[str, Any]] = []
+    for obj in iter_jsonl(paths):
+        chosen_ids, rejected_ids = _encode_dpo_pair(obj, tokenizer=tokenizer)
+        cache.append({"chosen_ids": chosen_ids, "rejected_ids": rejected_ids})
+    return cache
+
+
+def make_dpo_microbatch_iterator(
+    *,
+    paths: Sequence[str],
+    tokenizer,
+    seq_len: int,
+    batch_size: int,
+    accum_steps: int,
+    shuffle_buffer: int,
+    seed: int,
+    bucket_sizes: Optional[Sequence[int]] = None,
+    pretokenized: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Iterator[MicroBatchGroup]:
+    """
+    Yield DPO micro-batches as concatenated chosen/rejected samples.
+
+    Each micro-batch contains `batch_size` pairs, flattened into `2 * batch_size`
+    sequences with the chosen samples first and rejected samples second.
+
+    Complexity: O(N * L) time, O(B * L) space for N samples, sequence length L,
+    and micro-batch size B (not counting cached dataset storage).
+    """
+    if accum_steps <= 0:
+        raise ValueError("accum_steps must be > 0")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+
+    max_seq_len = int(seq_len)
+    if max_seq_len <= 0:
+        raise ValueError("seq_len must be > 0")
+
+    buckets = sorted({int(b) for b in (bucket_sizes or [max_seq_len]) if int(b) > 0})
+    if not buckets:
+        buckets = [max_seq_len]
+    if buckets[-1] > max_seq_len:
+        raise ValueError(f"bucket_sizes max {buckets[-1]} exceeds seq_len {max_seq_len}")
+    if buckets[-1] != max_seq_len:
+        buckets.append(max_seq_len)
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        raise ValueError("Tokenizer must have pad_token_id set.")
+
+    bos_id = tokenizer.encode(f"{tokenizer.bos_token}assistant", add_special_tokens=False)
+    eos_id = tokenizer.encode(f"{tokenizer.eos_token}", add_special_tokens=False)
+
+    stream: Iterable[Dict[str, Any]] = pretokenized if pretokenized is not None else iter_jsonl(paths)
+    stream = shuffle_stream(stream, buffer_size=shuffle_buffer, seed=seed)
+
+    buffers: Dict[int, List[Tuple[List[int], List[int], List[int], List[int], List[int], List[int]]]] = {
+        b: [] for b in buckets
+    }
+    need = int(batch_size) * int(accum_steps)
+
+    def maybe_yield_from_bucket(b: int) -> Optional[MicroBatchGroup]:
+        buf = buffers[b]
+        if len(buf) < need:
+            return None
+        items = buf[:need]
+        del buf[:need]
+        xs: List[List[List[int]]] = []
+        ys: List[List[List[int]]] = []
+        ms: List[List[List[int]]] = []
+        for i in range(int(accum_steps)):
+            chunk = items[i * int(batch_size) : (i + 1) * int(batch_size)]
+            x_micro: List[List[int]] = []
+            y_micro: List[List[int]] = []
+            m_micro: List[List[int]] = []
+            for x_c, y_c, m_c, x_r, y_r, m_r in chunk:
+                x_micro.append(x_c)
+                y_micro.append(y_c)
+                m_micro.append(m_c)
+                x_micro.append(x_r)
+                y_micro.append(y_r)
+                m_micro.append(m_r)
+            xs.append(x_micro)
+            ys.append(y_micro)
+            ms.append(m_micro)
+        return MicroBatchGroup(seq_len=int(b), micro_batches=int(accum_steps), x=xs, y=ys, loss_mask=ms)
+
+    for obj in stream:
+        chosen_ids, rejected_ids = _encode_dpo_pair(obj, tokenizer=tokenizer)
+        max_len = max(len(chosen_ids), len(rejected_ids))
+        b = _pick_bucket(max(1, max_len - 1), buckets)
+        x_c, y_c, m_c = tokenize_sft_from_ids(
+            ids=chosen_ids,
+            seq_len=int(b),
+            pad_id=pad_id,
+            bos_id=bos_id,
+            eos_id=eos_id,
+        )
+        x_r, y_r, m_r = tokenize_sft_from_ids(
+            ids=rejected_ids,
+            seq_len=int(b),
+            pad_id=pad_id,
+            bos_id=bos_id,
+            eos_id=eos_id,
+        )
+        buffers[int(b)].append((x_c, y_c, m_c, x_r, y_r, m_r))
+        out = maybe_yield_from_bucket(int(b))
+        if out is not None:
+            yield out
+
+    for b in buckets:
+        buf = buffers[int(b)]
+        full = len(buf) // int(batch_size)
+        if full <= 0:
+            continue
+        micro_batches = min(int(accum_steps), int(full))
+        take = micro_batches * int(batch_size)
+        items = buf[:take]
+        xs: List[List[List[int]]] = []
+        ys: List[List[List[int]]] = []
+        ms: List[List[List[int]]] = []
+        for i in range(int(micro_batches)):
+            chunk = items[i * int(batch_size) : (i + 1) * int(batch_size)]
+            x_micro: List[List[int]] = []
+            y_micro: List[List[int]] = []
+            m_micro: List[List[int]] = []
+            for x_c, y_c, m_c, x_r, y_r, m_r in chunk:
+                x_micro.append(x_c)
+                y_micro.append(y_c)
+                m_micro.append(m_c)
+                x_micro.append(x_r)
+                y_micro.append(y_r)
+                m_micro.append(m_r)
+            xs.append(x_micro)
+            ys.append(y_micro)
+            ms.append(m_micro)
+        yield MicroBatchGroup(seq_len=int(b), micro_batches=int(micro_batches), x=xs, y=ys, loss_mask=ms)

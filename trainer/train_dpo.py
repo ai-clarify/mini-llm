@@ -101,7 +101,7 @@ def train_epoch(epoch, wandb):
             logits = outputs.logits
             probs = logits_to_probs(logits, y)
             probs = probs * mask
-            loss = dpo_loss(ref_probs, probs, mask, beta=0.1)
+            loss = dpo_loss(ref_probs, probs, mask, beta=args.dpo_beta)
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
@@ -160,12 +160,29 @@ def init_model(lm_config):
     tokenizer = AutoTokenizer.from_pretrained('./model/')
     model = MiniLLMForCausalLM(lm_config)
     moe_path = '_moe' if lm_config.use_moe else ''
-    ckp = f'{args.save_dir}/full_sft_{lm_config.hidden_size}{moe_path}.pth'
-    state_dict = torch.load(ckp, map_location=args.device)
+    ckp_path = CheckpointLoader.resolve_checkpoint_path(
+        explicit_path=args.pretrained_path,
+        stage='sft' if not args.load_from_remote else None,
+        hidden_size=args.hidden_size if not args.load_from_remote else None,
+        use_moe=lm_config.use_moe,
+        env_var='MINILLM_PRETRAINED_PATH',
+        local_dir=args.save_dir,
+        remote_dir='/openbayes/home/out',
+        logger=Logger,
+    )
+    fallback_path = f'{args.save_dir}/full_sft_{lm_config.hidden_size}{moe_path}.pth'
+    if ckp_path is None and os.path.exists(fallback_path):
+        ckp_path = fallback_path
+        Logger(f'Using fallback checkpoint: {ckp_path}')
+    if ckp_path is None:
+        raise FileNotFoundError('No pretrained checkpoint found for DPO (use --pretrained_path or ensure full_sft exists).')
+    state_dict = torch.load(ckp_path, map_location=args.device)
     model.load_state_dict(state_dict, strict=False)
     # 初始化参考模型
     ref_model = MiniLLMForCausalLM(lm_config)
-    ref_model.load_state_dict(state_dict, strict=False)
+    ref_path = args.ref_path or ckp_path
+    ref_state = torch.load(ref_path, map_location=args.device)
+    ref_model.load_state_dict(ref_state, strict=False)
     ref_model.eval()
     ref_model.requires_grad_(False)
 
@@ -206,6 +223,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_iters", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--save_interval", type=int, default=100)
+    parser.add_argument("--dpo_beta", type=float, default=0.1, help="DPO temperature beta.")
     parser.add_argument('--local_rank', type=int, default=-1)
     parser.add_argument('--hidden_size', default=512, type=int)
     parser.add_argument('--num_hidden_layers', default=8, type=int)
@@ -214,6 +232,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="../dataset/dpo.jsonl")
     parser.add_argument("--tensorboard_dir", type=str, default=None)
     parser.add_argument("--max_steps", type=int, default=None, help="Limit total training iterations (for smoke tests)")
+    parser.add_argument("--ref_path", type=str, default=None, help="Reference checkpoint path (defaults to policy init).")
 
     # Pretrained model checkpoint arguments
     parser.add_argument("--pretrained_path", type=str, default=None,
@@ -224,6 +243,8 @@ if __name__ == "__main__":
 
     if args.max_steps is not None and args.max_steps <= 0:
         args.max_steps = None
+    if args.dpo_beta <= 0:
+        raise ValueError("--dpo_beta must be > 0")
 
     lm_config = MiniLLMConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
                                use_moe=args.use_moe)

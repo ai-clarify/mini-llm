@@ -25,6 +25,7 @@ Options:
   --skip-pretrain    Skip pretrain stage (requires existing checkpoint or SFT_FROM).
   --skip-sft         Skip SFT stage.
   --skip-infer       Skip final inference.
+  --run-dpo          Run DPO after SFT using dpo.jsonl.
   --run-r1           Run R1 reasoning SFT after SFT using r1_mix_1024.jsonl.
   --                Forward remaining args to mlx_train.train (pretrain & sft).
   -h, --help         Show this help message and exit.
@@ -48,9 +49,20 @@ Environment overrides:
   HF_EP             Optional HuggingFace mirror endpoint (only when MINIMIND_DATA_SOURCE=hf)
   DL_MAX            Per-file download guard in MB (default: 2048; set 0 to disable).
                     When PRE_DATA is large and DL_MAX is not set, defaults to 0.
-  DPO_DL            Download DPO dataset too (default: 0; MLX DPO training not implemented)
+  DPO_DL            Download DPO dataset too (default: 0).
   KEEP_LAST         Keep last N checkpoints per stage (default: 3)
   SMOKE_CLEAN       Auto-delete smoke-test outputs (default: 1)
+  DPO               Enable DPO stage (default: 0)
+  DPO_DATA          Dataset spec for DPO stage (default: minimind:dpo.jsonl)
+  DPO_OUT           Output dir for DPO stage (default: OUT/dpo)
+  DPO_FROM          Checkpoint to init DPO policy (default: latest SFT checkpoint)
+  DPO_REF           Reference checkpoint for DPO (default: DPO_FROM)
+  DPO_LEN           Sequence length for DPO stage (default: 512; smoke: 256)
+  DPO_BS            Batch size for DPO pairs (default: 1; smoke: 2)
+  DPO_ACCUM         Grad accumulation steps for DPO stage (default: 8; smoke: 1)
+  DPO_EPOCH         Epochs for DPO stage (default: 1)
+  DPO_MAX           Optional max steps for DPO stage
+  DPO_BETA          DPO beta (default: 0.1)
   R1                Enable R1 reasoning stage (default: 0)
   R1_OUT            Output dir for R1 stage (default: OUT/r1)
   R1_FROM           Checkpoint to init R1 stage (default: latest SFT checkpoint)
@@ -59,6 +71,8 @@ Environment overrides:
   R1_ACCUM          Grad accumulation steps for R1 stage (default: 8; smoke: 1)
   R1_EPOCH          Epochs for R1 stage (default: 1)
   R1_MAX            Optional max steps for R1 stage
+  R1_TOKEN_WEIGHT   Loss weight multiplier for reasoning special tokens (default: 10)
+  R1_TOKENS         Comma-separated R1 special tokens (default: <think>,</think>,<answer>,</answer>)
 
 Model/training overrides:
   PRESET             Model preset: 200mb|tiny|custom (default: custom)
@@ -92,6 +106,7 @@ SKIP_PRETRAIN=0
 SKIP_SFT=0
 SKIP_INFER=0
 RUN_R1=${R1:-0}
+RUN_DPO=${DPO:-0}
 OUT_DIR_WAS_SET=0
 if [ -n "${OUT+x}" ]; then
   OUT_DIR_WAS_SET=1
@@ -118,6 +133,7 @@ while (($#)); do
     --skip-pretrain) SKIP_PRETRAIN=1; shift ;;
     --skip-sft) SKIP_SFT=1; shift ;;
     --skip-infer) SKIP_INFER=1; shift ;;
+    --run-dpo) RUN_DPO=1; shift ;;
     --run-r1) RUN_R1=1; shift ;;
     --) shift; TRAIN_EXTRA_ARGS+=("$@"); break ;;
     -h|--help) usage; exit 0 ;;
@@ -168,6 +184,9 @@ else
 fi
 R1_OUT_DIR=${R1_OUT:-}
 R1_INIT_FROM=${R1_FROM:-}
+DPO_OUT_DIR=${DPO_OUT:-}
+DPO_INIT_FROM=${DPO_FROM:-}
+DPO_REF_FROM=${DPO_REF:-}
 if [ "$SMOKE_TEST" -eq 1 ]; then
   OUT_DIR=${OUT:-out/mlx_smoke}
   PRESET=${PRESET:-tiny}
@@ -428,6 +447,7 @@ mkdir -p "$DATA_DIR"
 if [ "$SMOKE_TEST" -eq 1 ]; then
   PRETRAIN_DATA_SPEC=${PRE_DATA:-minimind:smoke}
   SFT_DATA_SPEC=${SFT_DATA:-minimind:smoke}
+  DPO_DATA_SPEC=${DPO_DATA:-minimind:dpo.jsonl}
   R1_DATA_SPEC=${R1_DATA:-minimind:smoke}
 else
   PRETRAIN_DATA_SPEC=${PRE_DATA:-minimind:auto}
@@ -436,6 +456,7 @@ else
   else
     SFT_DATA_SPEC=${SFT_DATA:-minimind:sft_512.jsonl}
   fi
+  DPO_DATA_SPEC=${DPO_DATA:-minimind:dpo.jsonl}
   R1_DATA_SPEC=${R1_DATA:-minimind:r1_mix_1024.jsonl}
 fi
 
@@ -465,11 +486,11 @@ else
   if [ "$SKIP_SFT" -eq 0 ]; then
     download_minimind "$SFT_DATA_SPEC" "sft"
   fi
-  if [ "$DOWNLOAD_DPO" = "1" ]; then
-    download_minimind "minimind:dpo.jsonl" "sft"
+  if [ "$RUN_DPO" -eq 1 ] || [ "$DOWNLOAD_DPO" = "1" ]; then
+    download_minimind "$DPO_DATA_SPEC" "dpo"
   fi
   if [ "$RUN_R1" -eq 1 ]; then
-    download_minimind "$R1_DATA_SPEC" "sft"
+    download_minimind "$R1_DATA_SPEC" "r1"
   fi
 fi
 
@@ -555,6 +576,7 @@ run_stage() {
 
 PRETRAIN_OUT="$OUT_DIR/pretrain"
 SFT_OUT="$OUT_DIR/sft"
+DPO_OUT=${DPO_OUT_DIR:-"$OUT_DIR/dpo"}
 R1_OUT=${R1_OUT_DIR:-"$OUT_DIR/r1"}
 
 if [ "$SMOKE_TEST" -eq 1 ]; then
@@ -570,6 +592,12 @@ if [ "$SMOKE_TEST" -eq 1 ]; then
   SFT_EPOCHS=${SFT_EPOCH:-1}
   SFT_MAX_STEPS=${SFT_MAX:-5}
 
+  DPO_SEQ_LEN=${DPO_LEN:-256}
+  DPO_BATCH_SIZE=${DPO_BS:-2}
+  DPO_ACCUM_STEPS=${DPO_ACCUM:-1}
+  DPO_EPOCHS=${DPO_EPOCH:-1}
+  DPO_MAX_STEPS=${DPO_MAX:-5}
+
   LOG_INTERVAL=${LOG_INTERVAL:-1}
   SAVE_INTERVAL=${SAVE_INTERVAL:-2}
 else
@@ -584,6 +612,12 @@ else
   SFT_ACCUM_STEPS=${SFT_ACCUM:-8}
   SFT_EPOCHS=${SFT_EPOCH:-1}
   SFT_MAX_STEPS=${SFT_MAX:-}
+
+  DPO_SEQ_LEN=${DPO_LEN:-512}
+  DPO_BATCH_SIZE=${DPO_BS:-1}
+  DPO_ACCUM_STEPS=${DPO_ACCUM:-8}
+  DPO_EPOCHS=${DPO_EPOCH:-1}
+  DPO_MAX_STEPS=${DPO_MAX:-}
 
   LOG_INTERVAL=${LOG_INTERVAL:-10}
   SAVE_INTERVAL=${SAVE_INTERVAL:-200}
@@ -701,6 +735,66 @@ if [ "$SKIP_SFT" -eq 0 ]; then
   run_stage "sft" "${SFT_ARGS[@]}"
 fi
 
+if [ "$RUN_DPO" -eq 1 ]; then
+  DPO_RESUME=$(latest_ckpt "$DPO_OUT")
+  DPO_INIT_FROM=${DPO_INIT_FROM:-}
+  if [ -z "$DPO_INIT_FROM" ]; then
+    DPO_INIT_FROM=$(latest_ckpt "$SFT_OUT")
+  fi
+  if [ -z "$DPO_RESUME" ] && [ -z "$DPO_INIT_FROM" ]; then
+    echo "[error] DPO requires a SFT checkpoint (set DPO_FROM or run SFT first)" >&2
+    exit 1
+  fi
+
+  DPO_REF_FROM=${DPO_REF_FROM:-}
+  if [ -z "$DPO_REF_FROM" ] && [ -z "$DPO_RESUME" ]; then
+    DPO_REF_FROM="$DPO_INIT_FROM"
+  fi
+  if [ -z "$DPO_REF_FROM" ] && [ -z "$DPO_RESUME" ]; then
+    echo "[error] DPO requires a reference checkpoint (set DPO_REF or DPO_FROM)" >&2
+    exit 1
+  fi
+
+  DPO_ARGS=(
+    --task dpo
+    --preset "$PRESET"
+    --dtype "$DTYPE"
+    --data_path "$DPO_DATA_SPEC"
+    --data_dir "$DATA_DIR"
+    --max_download_mb "$MAX_DOWNLOAD_MB"
+    --out_dir "$DPO_OUT"
+    --keep_last_checkpoints "$KEEP_LAST_CHECKPOINTS"
+    --seq_len "$DPO_SEQ_LEN"
+    --batch_size "$DPO_BATCH_SIZE"
+    --accum_steps "$DPO_ACCUM_STEPS"
+    --epochs "$DPO_EPOCHS"
+    --log_interval "$LOG_INTERVAL"
+    --save_interval "$SAVE_INTERVAL"
+  )
+  if [ -n "${HF_ENDPOINT:-}" ]; then
+    DPO_ARGS+=(--hf_endpoint "$HF_ENDPOINT")
+  fi
+  if [ -n "${DPO_BETA:-}" ]; then
+    DPO_ARGS+=(--dpo_beta "$DPO_BETA")
+  fi
+  if [ -n "$DPO_MAX_STEPS" ]; then
+    DPO_ARGS+=(--max_steps "$DPO_MAX_STEPS")
+  fi
+  if [ -n "$DPO_RESUME" ]; then
+    DPO_ARGS+=(--resume "$DPO_RESUME")
+  else
+    DPO_ARGS+=(--init_from "$DPO_INIT_FROM")
+  fi
+  if [ -n "$DPO_REF_FROM" ]; then
+    DPO_ARGS+=(--dpo_ref_from "$DPO_REF_FROM")
+  fi
+
+  if [ "${#TRAIN_EXTRA_ARGS[@]}" -gt 0 ]; then
+    DPO_ARGS+=("${TRAIN_EXTRA_ARGS[@]}")
+  fi
+  run_stage "dpo" "${DPO_ARGS[@]}"
+fi
+
 if [ "$RUN_R1" -eq 1 ]; then
   if [ "$SMOKE_TEST" -eq 1 ]; then
     R1_SEQ_LEN=${R1_LEN:-256}
@@ -719,10 +813,15 @@ if [ "$RUN_R1" -eq 1 ]; then
   R1_RESUME=$(latest_ckpt "$R1_OUT")
   R1_INIT_FROM=${R1_INIT_FROM:-}
   if [ -z "$R1_INIT_FROM" ]; then
+    if [ "$RUN_DPO" -eq 1 ]; then
+      R1_INIT_FROM=$(latest_ckpt "$DPO_OUT")
+    fi
+  fi
+  if [ -z "$R1_INIT_FROM" ]; then
     R1_INIT_FROM=$(latest_ckpt "$SFT_OUT")
   fi
   if [ -z "$R1_RESUME" ] && [ -z "$R1_INIT_FROM" ]; then
-    echo "[error] R1 requires a SFT checkpoint (set R1_INIT_FROM or run SFT first)" >&2
+    echo "[error] R1 requires a SFT/DPO checkpoint (set R1_FROM or run SFT/DPO first)" >&2
     exit 1
   fi
 
@@ -735,7 +834,7 @@ if [ "$RUN_R1" -eq 1 ]; then
   fi
 
   R1_ARGS=(
-    --task sft
+    --task r1
     --preset "$PRESET"
     --dtype "$DTYPE"
     --data_path "$R1_DATA_SPEC"
@@ -752,6 +851,12 @@ if [ "$RUN_R1" -eq 1 ]; then
   )
   if [ -n "${HF_ENDPOINT:-}" ]; then
     R1_ARGS+=(--hf_endpoint "$HF_ENDPOINT")
+  fi
+  if [ -n "${R1_TOKEN_WEIGHT:-}" ]; then
+    R1_ARGS+=(--r1_token_weight "$R1_TOKEN_WEIGHT")
+  fi
+  if [ -n "${R1_TOKENS:-}" ]; then
+    R1_ARGS+=(--r1_tokens "$R1_TOKENS")
   fi
   if [ -n "$R1_MAX_STEPS" ]; then
     R1_ARGS+=(--max_steps "$R1_MAX_STEPS")
@@ -793,6 +898,9 @@ if [ "$SKIP_INFER" -eq 0 ]; then
       INFER_CKPT=$(latest_ckpt "$OUT_DIR")
       if [ -z "$INFER_CKPT" ] && [ -d "$R1_OUT" ]; then
         INFER_CKPT=$(latest_ckpt "$R1_OUT")
+      fi
+      if [ -z "$INFER_CKPT" ] && [ -d "$DPO_OUT" ]; then
+        INFER_CKPT=$(latest_ckpt "$DPO_OUT")
       fi
       if [ -z "$INFER_CKPT" ]; then
         INFER_CKPT=$(latest_ckpt "$SFT_OUT")
@@ -849,4 +957,3 @@ fi
 
 echo
 echo "[done] MLX pipeline finished."
-echo "[note] DPO training is not implemented in mlx_train yet; set DPO_DL=1 if you still want to download dpo.jsonl."

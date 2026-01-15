@@ -7,7 +7,7 @@ import os
 import re
 import shutil
 import time
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -15,11 +15,23 @@ import mlx.optimizers as optim
 import mlx.utils as mlx_utils
 
 from ..config import MiniLLMConfig, minillm_200mb
-from ..data import make_microbatch_iterator, pretokenize_jsonl, resolve_jsonl_paths
+from ..data import (
+    make_dpo_microbatch_iterator,
+    make_microbatch_iterator,
+    pretokenize_dpo_jsonl,
+    pretokenize_jsonl,
+    resolve_jsonl_paths,
+)
 from ..download import resolve_data_path_spec
 from ..models import MiniLLMForCausalLM, count_parameters, parameters_bytes
 from ..optim import make_optimizer
-from ..ops.loss import chunked_ce_loss, sparse_ce_loss
+from ..ops.loss import (
+    chunked_ce_loss,
+    chunked_ce_loss_sum_and_tokens,
+    dpo_loss,
+    sequence_logprobs,
+    sparse_ce_loss,
+)
 
 
 def set_seed(seed: int) -> None:
@@ -41,6 +53,42 @@ def cosine_lr(
     progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
     cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
     return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
+
+
+def count_jsonl_samples(paths: Sequence[str]) -> int:
+    """
+    Count non-empty JSONL lines across paths.
+
+    Complexity: O(N) time, O(1) space for N lines (best/avg/worst).
+    """
+    if not paths:
+        raise ValueError("paths must be non-empty to count JSONL samples.")
+    total = 0
+    for path in paths:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    total += 1
+    return total
+
+
+def estimate_steps_per_epoch(num_samples: int, batch_size: int, accum_steps: int) -> int:
+    """
+    Estimate optimizer steps per epoch from sample count.
+
+    Complexity: O(1) time, O(1) space (best/avg/worst).
+    """
+    if num_samples <= 0:
+        return 0
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+    if accum_steps <= 0:
+        raise ValueError("accum_steps must be > 0")
+    per_step = int(batch_size) * int(accum_steps)
+    steps = num_samples // per_step
+    if num_samples % per_step >= int(batch_size):
+        steps += 1
+    return int(steps)
 
 
 def save_optimizer_state(optimizer: optim.Optimizer, path: str) -> None:
@@ -238,7 +286,7 @@ def loss_fn(
     *,
     logits_chunk_size: int,
 ) -> mx.array:
-    hidden, mtp_hidden = model.forward_with_mtp_hidden(x)
+    hidden, mtp_hidden, aux_loss = model.forward_with_mtp_hidden(x)
     loss = chunked_ce_loss(
         hidden=hidden,
         lm_head_weight=model.model.embed_tokens.weight,
@@ -263,7 +311,7 @@ def loss_fn(
             count += 1
         if count > 0:
             loss = loss + (mtp_loss / float(count)) * float(model.config.mtp_loss_weight)
-    return loss
+    return loss + aux_loss
 
 
 def sparse_loss_fn(
@@ -276,8 +324,8 @@ def sparse_loss_fn(
     *,
     logits_chunk_size: int,
 ) -> mx.array:
-    hidden, _ = model.forward_with_mtp_hidden(x)
-    return sparse_ce_loss(
+    hidden, _, aux_loss = model.forward_with_mtp_hidden(x)
+    loss = sparse_ce_loss(
         hidden=hidden,
         lm_head_weight=model.model.embed_tokens.weight,
         labels=y,
@@ -285,6 +333,97 @@ def sparse_loss_fn(
         label_pos_mask=label_pos_mask,
         chunk_size=int(logits_chunk_size),
     )
+    return loss + aux_loss
+
+
+def _r1_weighted_mask(
+    labels: mx.array,
+    loss_mask: mx.array,
+    *,
+    special_ids: Optional[mx.array],
+    token_weight: float,
+) -> Tuple[mx.array, mx.array]:
+    base_mask = loss_mask.astype(mx.float32)
+    if special_ids is None or int(special_ids.size) == 0 or float(token_weight) == 1.0:
+        return base_mask, base_mask
+    matches = mx.equal(labels[..., None], special_ids)
+    special_mask = mx.any(matches, axis=-1).astype(mx.float32)
+    weighted = base_mask + (float(token_weight) - 1.0) * base_mask * special_mask
+    return base_mask, weighted
+
+
+def r1_loss_fn(
+    model: MiniLLMForCausalLM,
+    x: mx.array,
+    y: mx.array,
+    loss_mask: mx.array,
+    *,
+    logits_chunk_size: int,
+    r1_special_ids: Optional[mx.array],
+    r1_token_weight: float,
+) -> mx.array:
+    hidden, mtp_hidden, aux_loss = model.forward_with_mtp_hidden(x)
+    base_mask, weighted_mask = _r1_weighted_mask(
+        y, loss_mask, special_ids=r1_special_ids, token_weight=r1_token_weight
+    )
+    loss_sum, _ = chunked_ce_loss_sum_and_tokens(
+        hidden=hidden,
+        lm_head_weight=model.model.embed_tokens.weight,
+        labels=y,
+        loss_mask=weighted_mask,
+        chunk_size=int(logits_chunk_size),
+    )
+    base_tokens = mx.sum(base_mask)
+    denom = mx.maximum(base_tokens, mx.array(1.0, dtype=mx.float32))
+    loss = loss_sum / denom
+    if mtp_hidden and float(model.config.mtp_loss_weight) > 0.0:
+        mtp_loss = mx.array(0.0, dtype=mx.float32)
+        count = 0
+        for idx, mtp_h in enumerate(mtp_hidden):
+            offset = idx + 2
+            if int(y.shape[1]) <= offset:
+                continue
+            mtp_loss = mtp_loss + chunked_ce_loss(
+                hidden=mtp_h[:, :-offset, :],
+                lm_head_weight=model.model.embed_tokens.weight,
+                labels=y[:, offset:],
+                loss_mask=weighted_mask[:, offset:],
+                chunk_size=int(logits_chunk_size),
+            )
+            count += 1
+        if count > 0:
+            loss = loss + (mtp_loss / float(count)) * float(model.config.mtp_loss_weight)
+    return loss + aux_loss
+
+
+def dpo_loss_fn(
+    model: MiniLLMForCausalLM,
+    ref_model: MiniLLMForCausalLM,
+    x: mx.array,
+    y: mx.array,
+    loss_mask: mx.array,
+    *,
+    logits_chunk_size: int,
+    beta: float,
+) -> mx.array:
+    hidden, _, _ = model.forward_with_mtp_hidden(x)
+    policy_logp = sequence_logprobs(
+        hidden=hidden,
+        lm_head_weight=model.model.embed_tokens.weight,
+        labels=y,
+        loss_mask=loss_mask,
+        chunk_size=int(logits_chunk_size),
+    )
+    ref_hidden, _, _ = ref_model.forward_with_mtp_hidden(x)
+    ref_hidden = mx.stop_gradient(ref_hidden)
+    ref_logp = sequence_logprobs(
+        hidden=ref_hidden,
+        lm_head_weight=ref_model.model.embed_tokens.weight,
+        labels=y,
+        loss_mask=loss_mask,
+        chunk_size=int(logits_chunk_size),
+    )
+    return dpo_loss(policy_logp=policy_logp, ref_logp=ref_logp, beta=float(beta))
 
 
 def make_config(args, tokenizer) -> MiniLLMConfig:
@@ -326,12 +465,63 @@ def make_config(args, tokenizer) -> MiniLLMConfig:
     cfg.num_nextn_predict_layers = int(args.mtp_layers)
     cfg.mtp_loss_weight = float(args.mtp_loss_weight)
 
+    moe_args = [
+        args.n_routed_experts,
+        args.num_experts_per_tok,
+        args.n_shared_experts,
+        args.n_group,
+        args.topk_group,
+        args.scoring_func,
+        args.norm_topk_prob,
+        args.routed_scaling_factor,
+        args.aux_loss_alpha,
+        args.seq_aux,
+        args.moe_layer_freq,
+        args.first_k_dense_replace,
+        args.moe_intermediate_size,
+    ]
+    if args.use_moe is not None:
+        cfg.use_moe = bool(args.use_moe)
+    elif any(v is not None for v in moe_args):
+        cfg.use_moe = True
+
+    if args.n_routed_experts is not None:
+        cfg.n_routed_experts = int(args.n_routed_experts)
+    if args.num_experts_per_tok is not None:
+        cfg.num_experts_per_tok = int(args.num_experts_per_tok)
+    if args.n_shared_experts is not None:
+        cfg.n_shared_experts = int(args.n_shared_experts)
+    if args.n_group is not None:
+        cfg.n_group = int(args.n_group)
+    if args.topk_group is not None:
+        cfg.topk_group = int(args.topk_group)
+    if args.scoring_func is not None:
+        cfg.scoring_func = str(args.scoring_func)
+    if args.norm_topk_prob is not None:
+        cfg.norm_topk_prob = bool(args.norm_topk_prob)
+    if args.routed_scaling_factor is not None:
+        cfg.routed_scaling_factor = float(args.routed_scaling_factor)
+    if args.aux_loss_alpha is not None:
+        cfg.aux_loss_alpha = float(args.aux_loss_alpha)
+    if args.seq_aux is not None:
+        cfg.seq_aux = bool(args.seq_aux)
+    if args.moe_layer_freq is not None:
+        cfg.moe_layer_freq = int(args.moe_layer_freq)
+    if args.first_k_dense_replace is not None:
+        cfg.first_k_dense_replace = int(args.first_k_dense_replace)
+    if args.moe_intermediate_size is not None:
+        cfg.moe_intermediate_size = int(args.moe_intermediate_size)
+
+    cfg.index_n_heads = int(args.index_n_heads)
+    cfg.index_head_dim = int(args.index_head_dim)
+    cfg.index_topk = int(args.index_topk)
+
     if args.attn_gate is not None:
         cfg.use_attn_gate = bool(args.attn_gate)
     if bool(cfg.use_attn_gate):
         cfg.attn_gate_init = float(args.attn_gate_init)
 
-    return cfg
+    return cfg.finalize()
 
 
 def prune_checkpoints(ckpt_dir: str, *, keep_last: int) -> None:
@@ -446,7 +636,7 @@ def main() -> None:
         help="Safety guard for remote dataset downloads (MB); set 0 to disable.",
     )
     parser.add_argument(
-        "--task", type=str, choices=["pretrain", "sft"], default="pretrain"
+        "--task", type=str, choices=["pretrain", "sft", "r1", "dpo"], default="pretrain"
     )
 
     parser.add_argument(
@@ -473,6 +663,69 @@ def main() -> None:
         type=float,
         default=4.0,
         help="Initial logit for attention gate when enabled (sigmoid(init) is the initial multiplier).",
+    )
+    parser.add_argument(
+        "--use_moe",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable MoE MLP blocks (default: preset).",
+    )
+    parser.add_argument("--n_routed_experts", type=int, default=None, help="Number of routed MoE experts.")
+    parser.add_argument("--num_experts_per_tok", type=int, default=None, help="Top-k experts per token.")
+    parser.add_argument("--n_shared_experts", type=int, default=None, help="Number of shared experts.")
+    parser.add_argument("--n_group", type=int, default=None, help="Number of expert groups for routing.")
+    parser.add_argument("--topk_group", type=int, default=None, help="Top-k groups to consider for routing.")
+    parser.add_argument(
+        "--scoring_func",
+        type=str,
+        default=None,
+        choices=["softmax", "sigmoid"],
+        help="MoE gate scoring function.",
+    )
+    parser.add_argument(
+        "--norm_topk_prob",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Normalize top-k routing probabilities.",
+    )
+    parser.add_argument("--routed_scaling_factor", type=float, default=None, help="MoE routed scaling factor.")
+    parser.add_argument("--aux_loss_alpha", type=float, default=None, help="MoE auxiliary loss weight.")
+    parser.add_argument(
+        "--seq_aux",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use sequence-level MoE auxiliary loss (else token-level).",
+    )
+    parser.add_argument("--moe_layer_freq", type=int, default=None, help="Use MoE every N layers.")
+    parser.add_argument(
+        "--first_k_dense_replace",
+        type=int,
+        default=None,
+        help="Keep the first K layers dense before enabling MoE.",
+    )
+    parser.add_argument(
+        "--moe_intermediate_size",
+        type=int,
+        default=None,
+        help="Intermediate size for MoE expert MLP.",
+    )
+    parser.add_argument(
+        "--index_n_heads",
+        type=int,
+        default=0,
+        help="Enable indexer with N heads (0 = disable).",
+    )
+    parser.add_argument(
+        "--index_head_dim",
+        type=int,
+        default=32,
+        help="Indexer head dimension.",
+    )
+    parser.add_argument(
+        "--index_topk",
+        type=int,
+        default=0,
+        help="Indexer top-k keys per query (0 = disable).",
     )
 
     parser.add_argument("--seq_len", type=int, default=512)
@@ -551,6 +804,30 @@ def main() -> None:
             "Optional comma-separated buckets for number of loss tokens when --sparse_loss is enabled. "
             "Defaults to --bucket_sizes; if both unset, uses powers-of-2 buckets up to seq_len."
         ),
+    )
+    parser.add_argument(
+        "--dpo_beta",
+        type=float,
+        default=0.1,
+        help="DPO temperature beta (only used when --task dpo).",
+    )
+    parser.add_argument(
+        "--dpo_ref_from",
+        type=str,
+        default=None,
+        help="Reference checkpoint dir or model.safetensors for DPO (defaults to --init_from).",
+    )
+    parser.add_argument(
+        "--r1_token_weight",
+        type=float,
+        default=10.0,
+        help="Loss weight multiplier for reasoning special tokens (only used when --task r1).",
+    )
+    parser.add_argument(
+        "--r1_tokens",
+        type=str,
+        default="<think>,</think>,<answer>,</answer>",
+        help="Comma-separated tokens to upweight for R1 training.",
     )
     parser.add_argument("--lora_r", type=int, default=0, help="Enable LoRA with rank r (0 = disable).")
     parser.add_argument("--lora_alpha", type=float, default=16.0)
@@ -636,6 +913,17 @@ def main() -> None:
     if args.init_from and args.resume:
         raise ValueError("`--init_from` and `--resume` are mutually exclusive.")
 
+    is_dpo = str(args.task) == "dpo"
+    is_r1 = str(args.task) == "r1"
+    if is_dpo and bool(args.sparse_loss):
+        raise ValueError("--sparse_loss is not supported for DPO.")
+    if is_r1 and bool(args.sparse_loss):
+        raise ValueError("--sparse_loss is not supported for R1.")
+    if is_dpo and float(args.dpo_beta) <= 0.0:
+        raise ValueError("--dpo_beta must be > 0 for DPO training.")
+    if is_r1 and float(args.r1_token_weight) <= 0.0:
+        raise ValueError("--r1_token_weight must be > 0 for R1 training.")
+
     os.makedirs(args.out_dir, exist_ok=True)
     ckpt_dir = os.path.join(args.out_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -654,6 +942,22 @@ def main() -> None:
     if tokenizer.pad_token_id is None:
         raise ValueError("Tokenizer must define pad_token_id.")
 
+    r1_special_ids: Optional[mx.array] = None
+    if is_r1:
+        token_specs = [t.strip() for t in str(args.r1_tokens).split(",") if t.strip()]
+        token_ids: List[int] = []
+        for tok in token_specs:
+            token_ids.extend(int(t) for t in tokenizer.encode(tok, add_special_tokens=False))
+        token_ids = sorted({int(t) for t in token_ids})
+        if token_ids:
+            r1_special_ids = mx.array(token_ids, dtype=mx.int32)
+            print(
+                f"[r1] token_weight={float(args.r1_token_weight):.2f} "
+                f"special_ids={len(token_ids)} tokens={','.join(token_specs)}"
+            )
+        else:
+            print("[r1] No special token ids found; using base loss mask only.")
+
     data_spec = resolve_data_path_spec(
         args.data_path,
         task=args.task,
@@ -670,8 +974,24 @@ def main() -> None:
     paths = resolve_jsonl_paths(data_spec)
     cached_dataset = None
     if args.cache_tokenized:
-        cached_dataset = pretokenize_jsonl(paths=paths, tokenizer=tokenizer, task=args.task)
+        if is_dpo:
+            cached_dataset = pretokenize_dpo_jsonl(paths=paths, tokenizer=tokenizer)
+        else:
+            cached_dataset = pretokenize_jsonl(paths=paths, tokenizer=tokenizer, task=args.task)
         print(f"[data] cached {len(cached_dataset)} tokenized samples for reuse")
+
+    estimated_samples: Optional[int] = None
+    estimated_steps_per_epoch: Optional[int] = None
+    if args.max_steps is None:
+        if cached_dataset is not None:
+            estimated_samples = len(cached_dataset)
+        else:
+            estimated_samples = count_jsonl_samples(paths)
+        estimated_steps_per_epoch = estimate_steps_per_epoch(
+            num_samples=int(estimated_samples),
+            batch_size=int(args.batch_size),
+            accum_steps=int(args.accum_steps),
+        )
 
     cfg = (
         load_config_from_checkpoint(args.resume)
@@ -741,9 +1061,52 @@ def main() -> None:
                 raise
         print(f"[init] loaded weights from {init_path}")
 
+    ref_model: Optional[MiniLLMForCausalLM] = None
+    dpo_ref_from: Optional[str] = None
+    if is_dpo:
+        dpo_ref_from = args.dpo_ref_from
+        if resume_args is not None:
+            prev_ref = resume_args.get("dpo_ref_from") or resume_args.get("init_from")
+            if dpo_ref_from is None:
+                dpo_ref_from = prev_ref
+            elif prev_ref and str(dpo_ref_from) != str(prev_ref):
+                raise ValueError(
+                    "DPO reference mismatch for --resume checkpoint.\n"
+                    f"- checkpoint: dpo_ref_from={prev_ref}\n"
+                    f"- current:    dpo_ref_from={dpo_ref_from}\n"
+                    "Use the same --dpo_ref_from as the original run."
+                )
+        if dpo_ref_from is None:
+            dpo_ref_from = args.init_from
+        if dpo_ref_from is None:
+            raise ValueError(
+                "DPO training requires --dpo_ref_from (or --init_from) to load a reference model."
+            )
+        args.dpo_ref_from = dpo_ref_from
+        ref_path = dpo_ref_from
+        if os.path.isdir(ref_path):
+            ref_path = os.path.join(ref_path, "model.safetensors")
+        if not os.path.isfile(ref_path):
+            raise FileNotFoundError(ref_path)
+        ref_model = MiniLLMForCausalLM(cfg)
+        try:
+            ref_model.load_weights(ref_path)
+        except Exception as e:
+            if int(cfg.lora_r) > 0:
+                print(f"[dpo] strict load failed (LoRA enabled), trying base->LoRA key remap: {e}")
+                weights = dict(mx.load(ref_path))
+                weights = _remap_base_weights_for_lora(weights, lora_targets=cfg.lora_targets)
+                ref_model.load_weights(list(weights.items()), strict=False)
+            else:
+                raise
+        ref_model.eval()
+        print(f"[dpo] reference loaded from {ref_path}")
+
     # Dtype casting for memory/throughput.
     dtype_map = {"float16": mx.float16, "bfloat16": mx.bfloat16, "float32": mx.float32}
     model.apply(lambda p: p.astype(dtype_map[args.dtype]))
+    if ref_model is not None:
+        ref_model.apply(lambda p: p.astype(dtype_map[args.dtype]))
 
     params = model.parameters()
     trainable = model.trainable_parameters()
@@ -776,13 +1139,44 @@ def main() -> None:
         load_optimizer_state(optimizer, resume_optimizer_path)
 
     # Estimate total steps for lr scheduling (best-effort).
-    total_steps = (
-        args.max_steps if args.max_steps is not None else (args.epochs * 10**9)
-    )
+    if args.max_steps is not None:
+        total_steps = int(args.max_steps)
+    elif estimated_steps_per_epoch is not None:
+        total_steps = int(estimated_steps_per_epoch) * int(args.epochs)
+        if estimated_samples is not None:
+            print(
+                f"[data] samples={estimated_samples} estimated_steps_per_epoch={estimated_steps_per_epoch} "
+                f"total_steps={total_steps}"
+            )
+    else:
+        total_steps = 50_000
 
     model.train()
-    use_sparse_loss = bool(args.sparse_loss)
-    if use_sparse_loss:
+    effective_batch_size = int(args.batch_size) * (2 if is_dpo else 1)
+    use_sparse_loss = bool(args.sparse_loss) if not (is_dpo or is_r1) else False
+    if is_dpo:
+        if ref_model is None:
+            raise RuntimeError("DPO reference model was not initialized.")
+        loss_fn_wrapped = lambda x, y, m: dpo_loss_fn(
+            model,
+            ref_model,
+            x,
+            y,
+            m,
+            logits_chunk_size=int(args.logits_chunk_size),
+            beta=float(args.dpo_beta),
+        )
+    elif is_r1:
+        loss_fn_wrapped = lambda x, y, m: r1_loss_fn(
+            model,
+            x,
+            y,
+            m,
+            logits_chunk_size=int(args.logits_chunk_size),
+            r1_special_ids=r1_special_ids,
+            r1_token_weight=float(args.r1_token_weight),
+        )
+    elif use_sparse_loss:
         loss_fn_wrapped = lambda x, y, m, p, pm: sparse_loss_fn(
             model,
             x,
@@ -809,7 +1203,7 @@ def main() -> None:
                 model=model,
                 optimizer=optimizer,
                 value_and_grad=raw_value_and_grad,
-                batch_size=int(args.batch_size),
+                batch_size=int(effective_batch_size),
                 seq_len=int(seq_len),
                 label_len=int(label_len),
                 accum_steps=int(args.accum_steps),
@@ -824,7 +1218,7 @@ def main() -> None:
             compiled_value_and_grads[key] = compile_value_and_grad(
                 raw_value_and_grad,
                 model=model,
-                batch_size=int(args.batch_size),
+                batch_size=int(effective_batch_size),
                 seq_len=int(seq_len),
                 label_len=int(label_len),
                 sparse_loss=bool(use_sparse_loss),
@@ -920,22 +1314,37 @@ def main() -> None:
 
     try:
         for epoch in range(args.epochs):
-            micro_iter = iter(
-                make_microbatch_iterator(
-                    paths=paths,
-                    tokenizer=tokenizer,
-                    task=args.task,
-                    seq_len=int(args.seq_len),
-                    batch_size=int(args.batch_size),
-                    accum_steps=int(args.accum_steps),
-                    shuffle_buffer=int(args.shuffle_buffer),
-                    seed=int(args.seed) + int(epoch),
-                    bucket_sizes=bucket_sizes,
-                    return_label_positions=bool(use_sparse_loss),
-                    label_bucket_sizes=label_bucket_sizes,
-                    pretokenized=cached_dataset,
+            if is_dpo:
+                micro_iter = iter(
+                    make_dpo_microbatch_iterator(
+                        paths=paths,
+                        tokenizer=tokenizer,
+                        seq_len=int(args.seq_len),
+                        batch_size=int(args.batch_size),
+                        accum_steps=int(args.accum_steps),
+                        shuffle_buffer=int(args.shuffle_buffer),
+                        seed=int(args.seed) + int(epoch),
+                        bucket_sizes=bucket_sizes,
+                        pretokenized=cached_dataset,
+                    )
                 )
-            )
+            else:
+                micro_iter = iter(
+                    make_microbatch_iterator(
+                        paths=paths,
+                        tokenizer=tokenizer,
+                        task=args.task,
+                        seq_len=int(args.seq_len),
+                        batch_size=int(args.batch_size),
+                        accum_steps=int(args.accum_steps),
+                        shuffle_buffer=int(args.shuffle_buffer),
+                        seed=int(args.seed) + int(epoch),
+                        bucket_sizes=bucket_sizes,
+                        return_label_positions=bool(use_sparse_loss),
+                        label_bucket_sizes=label_bucket_sizes,
+                        pretokenized=cached_dataset,
+                    )
+                )
 
             while True:
                 if args.max_steps is not None and global_step >= args.max_steps:
@@ -991,7 +1400,7 @@ def main() -> None:
                 optimizer.learning_rate = lr
                 to_mx_t0 = time.perf_counter() if profile_timing else 0.0
                 if micro_batches < int(args.accum_steps) and micro_batches > 0:
-                    pad_m = [[0] * int(step_seq_len) for _ in range(int(args.batch_size))]
+                    pad_m = [[0] * int(step_seq_len) for _ in range(int(effective_batch_size))]
                     last_x = xs[micro_batches - 1]
                     last_y = ys[micro_batches - 1]
                     while len(xs) < int(args.accum_steps):
@@ -1000,8 +1409,8 @@ def main() -> None:
                         ms.append(pad_m)
 
                     if use_sparse_loss:
-                        pad_p = [[0] * int(step_label_len) for _ in range(int(args.batch_size))]
-                        pad_pm = [[0] * int(step_label_len) for _ in range(int(args.batch_size))]
+                        pad_p = [[0] * int(step_label_len) for _ in range(int(effective_batch_size))]
+                        pad_pm = [[0] * int(step_label_len) for _ in range(int(effective_batch_size))]
                         last_p = ps[micro_batches - 1] if ps else pad_p
                         while len(ps) < int(args.accum_steps):
                             ps.append(last_p)
@@ -1077,7 +1486,7 @@ def main() -> None:
                     timing_opt_s += time.perf_counter() - opt_t0
 
                 global_step += 1
-                seen_tokens += int(args.batch_size) * int(step_seq_len) * micro_batches
+                seen_tokens += int(effective_batch_size) * int(step_seq_len) * micro_batches
                 if profile_timing:
                     timing_total_s += time.perf_counter() - step_t0
                     if global_step > start_step + max(0, int(args.profile_warmup_steps)):

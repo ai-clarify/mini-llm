@@ -31,6 +31,18 @@ def _encode_sft_sample(tokenizer, obj: Dict[str, Any]) -> str:
     )
 
 
+def _encode_dpo_pair(tokenizer, obj: Dict[str, Any]) -> tuple[list[int], list[int]]:
+    if "chosen" not in obj or "rejected" not in obj:
+        raise ValueError("DPO task expects JSONL lines with `chosen` and `rejected` fields.")
+    chosen = cast(Sequence[Dict[str, Any]], obj["chosen"])
+    rejected = cast(Sequence[Dict[str, Any]], obj["rejected"])
+    chosen_prompt = tokenizer.apply_chat_template(chosen, tokenize=False, add_generation_prompt=False)
+    rejected_prompt = tokenizer.apply_chat_template(rejected, tokenize=False, add_generation_prompt=False)
+    chosen_ids = tokenizer.encode(chosen_prompt, add_special_tokens=False)
+    rejected_ids = tokenizer.encode(rejected_prompt, add_special_tokens=False)
+    return chosen_ids, rejected_ids
+
+
 def _as_ids(obj: Dict[str, Any]) -> list[int] | None:
     if "ids" not in obj:
         return None
@@ -88,7 +100,7 @@ def main() -> None:
         default=2048,
         help="Safety guard for remote dataset downloads (MB); set 0 to disable.",
     )
-    parser.add_argument("--task", type=str, choices=["pretrain", "sft"], default="pretrain")
+    parser.add_argument("--task", type=str, choices=["pretrain", "sft", "r1", "dpo"], default="pretrain")
     parser.add_argument(
         "--seq_len",
         type=int,
@@ -152,22 +164,36 @@ def main() -> None:
             if not bool(args.retokenize):
                 ids = _as_ids(obj)
 
-            if ids is None:
-                if args.task == "pretrain":
-                    text = _encode_pretrain_sample(tokenizer, obj)
-                else:
-                    text = _encode_sft_sample(tokenizer, obj)
-                ids = tokenizer.encode(text, add_special_tokens=False)
-
-            if int(args.seq_len) > 0:
-                ids = ids[: int(args.seq_len) + 1]
-
             out_obj: Dict[str, Any]
-            if bool(args.keep_fields):
-                out_obj = dict(obj)
-                out_obj["ids"] = ids
+            if args.task == "dpo":
+                if ids is not None:
+                    raise ValueError("DPO pretokenize expects raw `chosen`/`rejected` fields, not `ids`.")
+                chosen_ids, rejected_ids = _encode_dpo_pair(tokenizer, obj)
+                if int(args.seq_len) > 0:
+                    chosen_ids = chosen_ids[: int(args.seq_len) + 1]
+                    rejected_ids = rejected_ids[: int(args.seq_len) + 1]
+                if bool(args.keep_fields):
+                    out_obj = dict(obj)
+                    out_obj["chosen_ids"] = chosen_ids
+                    out_obj["rejected_ids"] = rejected_ids
+                else:
+                    out_obj = {"chosen_ids": chosen_ids, "rejected_ids": rejected_ids}
             else:
-                out_obj = {"ids": ids}
+                if ids is None:
+                    if args.task == "pretrain":
+                        text = _encode_pretrain_sample(tokenizer, obj)
+                    else:
+                        text = _encode_sft_sample(tokenizer, obj)
+                    ids = tokenizer.encode(text, add_special_tokens=False)
+
+                if int(args.seq_len) > 0:
+                    ids = ids[: int(args.seq_len) + 1]
+
+                if bool(args.keep_fields):
+                    out_obj = dict(obj)
+                    out_obj["ids"] = ids
+                else:
+                    out_obj = {"ids": ids}
 
             out.write(json.dumps(out_obj, ensure_ascii=False) + "\n")
             n += 1

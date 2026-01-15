@@ -21,6 +21,8 @@ from trainer.loss_utils import compute_mtp_loss
 
 warnings.filterwarnings('ignore')
 
+R1_SPECIAL_IDS = None
+
 
 def Logger(content):
     if not ddp or dist.get_rank() == 0:
@@ -32,17 +34,12 @@ def get_lr(current_step, total_steps, lr):
 
 
 def train_epoch(epoch, wandb):
-    # 思考标签占位符
-    start_of_think_ids = tokenizer('<think>').input_ids
-    end_of_think_ids = tokenizer('</think>').input_ids
-    start_of_answer_ids = tokenizer('<answer>').input_ids
-    end_of_answer_ids = tokenizer('</answer>').input_ids
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(train_loader):
         X = X.to(args.device)
         Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
+        loss_mask = loss_mask.to(args.device).float()
         lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -53,14 +50,12 @@ def train_epoch(epoch, wandb):
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
             ).view(Y.size())
-            sp_ids = torch.isin(Y.view(-1),
-                                torch.tensor(start_of_think_ids + end_of_think_ids
-                                             + start_of_answer_ids + end_of_answer_ids
-                                             ).to(args.device))
             # 在 sp_ids 对应的位置增加额外的惩罚
             loss_mask = loss_mask.view(-1)
-            loss_mask_sum = loss_mask.sum()
-            loss_mask[sp_ids] = 10
+            loss_mask_sum = loss_mask.sum().clamp(min=1)
+            if R1_SPECIAL_IDS is not None:
+                sp_ids = torch.isin(Y.view(-1), R1_SPECIAL_IDS)
+                loss_mask[sp_ids] = args.r1_token_weight
             loss_mask = loss_mask.view(Y.size())
             loss = (loss * loss_mask).sum() / loss_mask_sum
             loss += res.aux_loss
@@ -151,6 +146,8 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_iters", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=1)
     parser.add_argument("--save_interval", type=int, default=50)
+    parser.add_argument("--r1_token_weight", type=float, default=10.0, help="Loss weight multiplier for reasoning tokens.")
+    parser.add_argument("--r1_tokens", type=str, default="<think>,</think>,<answer>,</answer>", help="Comma-separated reasoning tokens.")
     parser.add_argument('--local_rank', type=int, default=-1)
     parser.add_argument('--hidden_size', default=512, type=int)
     parser.add_argument('--num_hidden_layers', default=8, type=int)
@@ -203,6 +200,17 @@ if __name__ == "__main__":
         wandb = None
 
     model, tokenizer = init_model(lm_config)
+    global R1_SPECIAL_IDS
+    token_specs = [t.strip() for t in str(args.r1_tokens).split(",") if t.strip()]
+    token_ids = []
+    for tok in token_specs:
+        token_ids.extend(tokenizer.encode(tok, add_special_tokens=False))
+    token_ids = sorted({int(t) for t in token_ids})
+    if token_ids:
+        R1_SPECIAL_IDS = torch.tensor(token_ids, device=args.device)
+        Logger(f"[r1] token_weight={args.r1_token_weight} special_ids={len(token_ids)} tokens={','.join(token_specs)}")
+    else:
+        Logger("[r1] No special token ids found; using base loss mask only.")
 
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if ddp else None
