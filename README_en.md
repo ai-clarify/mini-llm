@@ -2,7 +2,7 @@
   <img src="assets/minillm-icon.svg" alt="MiniLLM logo" width="96" height="96"/>
 </p>
 <h1 align="center">MiniLLM</h1>
-<p align="center">Lightweight LLM training, alignment, and deployment from scratch.</p>
+<p align="center">Lightweight LLM training, alignment, and deployment with a DeepSeek-V3.2-style architecture reproduction.</p>
 <p align="center">
   <a href="./README.md">中文</a> ·
   <a href="./docs/README.md">Docs</a> ·
@@ -20,6 +20,7 @@
 
 ## ✨ Highlights
 
+- DeepSeek-V3.2 architecture reproduction: MLA + MoE + MTP + DSA (MLX/Torch parity)
 - End-to-end pipeline: Pretrain → SFT → Preference alignment (DPO/GRPO/PPO/SPO) → Distillation
 - Training & inference: native PyTorch + DeepSpeed + MLX (Apple Silicon)
 - Data tooling: cleaning, deduplication, quality scoring, RustBPE tokenization

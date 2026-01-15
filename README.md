@@ -2,7 +2,7 @@
   <img src="assets/minillm-icon.svg" alt="MiniLLM logo" width="96" height="96"/>
 </p>
 <h1 align="center">MiniLLM</h1>
-<p align="center">轻量级 LLM 训练、对齐、部署一体化项目，面向从 0 到 1 的学习与复现。</p>
+<p align="center">轻量级 LLM 训练、对齐、部署一体化项目，面向从 0 到 1 的学习与 DeepSeek-V3.2 架构复现。</p>
 <p align="center">
   <a href="./README_en.md">English</a> ·
   <a href="./docs/README.md">Docs</a> ·
@@ -20,6 +20,7 @@
 
 ## ✨ 特性
 
+- DeepSeek-V3.2 架构复现：MLA + MoE + MTP + DSA（MLX/Torch 对照实现）
 - 端到端训练链路：预训练 → SFT → 偏好对齐（DPO/GRPO/PPO/SPO）→ 蒸馏
 - 训练与推理：原生 PyTorch + DeepSpeed + MLX（Apple Silicon）
 - 数据管线：清洗、去重、质量评估、RustBPE 分词
