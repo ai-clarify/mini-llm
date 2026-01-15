@@ -526,7 +526,7 @@ def main() -> None:
             "No prompts to benchmark; check --max_samples or prompts file."
         )
     completed = 0
-    use_cache = args.target_arch != "minillm"
+    use_cache = True
     prompt_count = len(prompt_inputs)
     try:
         for round_idx in range(int(args.rounds)):

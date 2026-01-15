@@ -1098,15 +1098,28 @@ def baseline_decode_minillm(
     eos_token_id: Optional[int],
 ) -> List[int]:
     output_ids = list(input_ids)
+    cache_len = int(len(output_ids) + max_new_tokens + 2)
+    cache = target.allocate_kv_cache(batch_size=1, max_seq_len=cache_len)
+    prompt = mx.array([output_ids], dtype=mx.int32)
+    hidden, cache = target.model.forward_with_cache(prompt, start_pos=0, cache=cache)
+    mx.eval(hidden)
+    logits = _project_logits_minillm(target, hidden)
+    mx.eval(logits)
+    last_logits = logits[:, -1, :]
+    pos = len(output_ids)
+
     for _ in range(int(max_new_tokens)):
-        prompt = mx.array([output_ids], dtype=mx.int32)
-        hidden = target.model(prompt)
-        logits = _project_logits_minillm(target, hidden)[:, -1, :]
-        mx.eval(logits)
-        token = sample_next_token(logits, temperature=temperature, top_p=top_p)
+        token = sample_next_token(last_logits, temperature=temperature, top_p=top_p)
         output_ids.append(int(token))
         if eos_token_id is not None and int(token) == int(eos_token_id):
             break
+        token_arr = mx.array([[int(token)]], dtype=mx.int32)
+        hidden, cache = target.model.forward_with_cache(token_arr, start_pos=int(pos), cache=cache)
+        mx.eval(hidden)
+        pos += 1
+        logits = _project_logits_minillm(target, hidden)
+        mx.eval(logits)
+        last_logits = logits[:, -1, :]
     return output_ids
 
 
