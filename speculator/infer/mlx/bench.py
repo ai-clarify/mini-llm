@@ -343,7 +343,6 @@ def _run_baseline_qwen3(
     temperature: float,
     top_p: float,
     eos_token_id: Optional[int],
-    *,
     return_output_ids: bool = False,
 ) -> Tuple[BenchResult, Optional[List[int]]]:
     start = time.perf_counter()
@@ -372,7 +371,6 @@ def _run_spec_qwen3(
     top_p: float,
     eos_token_id: Optional[int],
     trace: Optional[Callable[[Dict[str, Any]], None]] = None,
-    *,
     return_output_ids: bool = False,
 ) -> Tuple[SpecBenchResult, Optional[List[int]]]:
     start = time.perf_counter()
@@ -419,7 +417,6 @@ def _run_baseline_minillm(
     temperature: float,
     top_p: float,
     eos_token_id: Optional[int],
-    *,
     return_output_ids: bool = False,
 ) -> Tuple[BenchResult, Optional[List[int]]]:
     start = time.perf_counter()
@@ -448,7 +445,6 @@ def _run_spec_minillm(
     top_p: float,
     eos_token_id: Optional[int],
     trace: Optional[Callable[[Dict[str, Any]], None]] = None,
-    *,
     return_output_ids: bool = False,
 ) -> Tuple[SpecBenchResult, Optional[List[int]]]:
     start = time.perf_counter()
