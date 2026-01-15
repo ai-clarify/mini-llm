@@ -560,11 +560,19 @@ def main() -> None:
             head_rank=head_rank,
         )
 
+    run_spec = (not args.no_speculator) and (speculator is not None or use_mtp)
+
     token_logger: Optional[TokenLogWriter] = None
     if args.token_log:
-        if speculator is None:
+        if speculator is None and use_mtp:
             print(
-                "[warn] --token_log ignored because speculator is disabled", flush=True
+                "[warn] --token_log ignored for MTP (no external speculator)",
+                flush=True,
+            )
+        elif speculator is None:
+            print(
+                "[warn] --token_log ignored because speculator is disabled",
+                flush=True,
             )
         else:
             token_log_path = Path(args.token_log)
@@ -632,7 +640,7 @@ def main() -> None:
                     )
                 baseline_results.append(baseline)
 
-                if speculator is not None:
+                if run_spec:
                     mx.random.seed(seed_base)
                     trace = (
                         token_logger.trace_for(
