@@ -1272,9 +1272,10 @@ def main() -> None:
     if metal_capture_path is not None and not metal_capture_path.endswith(".gputrace"):
         raise ValueError("--metal_capture must end with .gputrace")
 
-    if args.max_steps is not None and start_step >= int(args.max_steps):
+    stop_steps = int(total_steps) if int(total_steps) > 0 else None
+    if stop_steps is not None and start_step >= stop_steps:
         print(
-            f"[warn] start_step={start_step} >= max_steps={args.max_steps}; "
+            f"[warn] start_step={start_step} >= total_steps={stop_steps}; "
             "no training steps will run (use a fresh --out_dir or increase --max_steps)."
         )
 
@@ -1347,7 +1348,7 @@ def main() -> None:
                 )
 
             while True:
-                if args.max_steps is not None and global_step >= args.max_steps:
+                if stop_steps is not None and global_step >= stop_steps:
                     break
 
                 if (
@@ -1531,7 +1532,7 @@ def main() -> None:
                     path = save_checkpoint(global_step)
                     print(f"[ckpt] saved {path}")
 
-            if args.max_steps is not None and global_step >= args.max_steps:
+            if stop_steps is not None and global_step >= stop_steps:
                 break
 
     except KeyboardInterrupt:
