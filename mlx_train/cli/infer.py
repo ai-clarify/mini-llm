@@ -150,7 +150,7 @@ def main() -> None:
         help="Checkpoint directory produced by mlx_train/train.py (contains model.safetensors + config.json).",
     )
     parser.add_argument("--prompt", type=str, default="hi")
-    parser.add_argument("--max_new_tokens", type=int, default=64)
+    parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--min_new_tokens", type=int, default=0, help="Force at least N new tokens before EOS stop.")
     parser.add_argument("--temperature", type=float, default=0.0, help="0 for greedy; >0 for sampling.")
     parser.add_argument("--top_p", type=float, default=1.0, help="Nucleus sampling threshold (only if temperature>0).")

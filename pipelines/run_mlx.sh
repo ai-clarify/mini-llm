@@ -84,7 +84,7 @@ Model/training overrides:
 Advanced:
   SFT_FROM           Checkpoint dir or model.safetensors to init SFT from (overrides auto-detect).
   INF_PROMPT         Prompt used by non-demo inference (default: hi)
-  INF_MAX_NEW        Max new tokens for smoke-test inference (default: 64)
+  INF_MAX_NEW        Max new tokens for inference (default: 512; smoke-test: 64)
   INF_MIN_NEW        Force at least N new tokens (default: 1)
   INF_TEMP           0 for greedy; >0 for sampling (default: 0)
   INF_TOP_P          Nucleus sampling threshold (default: 1.0)
@@ -914,7 +914,11 @@ if [ "$SKIP_INFER" -eq 0 ]; then
 
   if [ -n "$INFER_CKPT" ]; then
     INFER_PROMPT=${INF_PROMPT:-hi}
-    INFER_MAX_NEW_TOKENS=${INF_MAX_NEW:-64}
+    if [ "$SMOKE_TEST" -eq 1 ]; then
+      INFER_MAX_NEW_TOKENS=${INF_MAX_NEW:-64}
+    else
+      INFER_MAX_NEW_TOKENS=${INF_MAX_NEW:-512}
+    fi
     INFER_MIN_NEW_TOKENS=${INF_MIN_NEW:-1}
     INFER_TEMPERATURE=${INF_TEMP:-0}
     INFER_TOP_P=${INF_TOP_P:-1.0}

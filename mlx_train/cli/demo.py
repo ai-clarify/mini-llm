@@ -302,7 +302,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--tokenizer_path", type=str, default="./model")
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--max_new_tokens", type=int, default=32)
+    parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument(
         "--max_seq_len",
         type=int,
