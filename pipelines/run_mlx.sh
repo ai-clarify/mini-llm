@@ -88,7 +88,7 @@ Advanced:
   INF_MIN_NEW        Force at least N new tokens (default: 1)
   INF_TEMP           0 for greedy; >0 for sampling (default: 0)
   INF_TOP_P          Nucleus sampling threshold (default: 1.0)
-  INF_MAX_SEQ        Max total tokens (prompt + generation) for infer (default: demo=512, infer=unset)
+  INF_MAX_SEQ        Max total tokens (prompt + generation) for infer (default: use checkpoint seq_len if available)
   INF_MODE           Demo mode for --infer-only (default: knowledge; other: bench)
   INF_SUITES         [bench mode] Suites (default: copy,json,sort,math_mcq,logic,qa,knowledge)
   INF_N              [bench mode] Examples per suite (default: 2)
@@ -919,6 +919,33 @@ if [ "$SKIP_INFER" -eq 0 ]; then
     INFER_TEMPERATURE=${INF_TEMP:-0}
     INFER_TOP_P=${INF_TOP_P:-1.0}
     INFER_MAX_SEQ_LEN=${INF_MAX_SEQ:-}
+    if [ -z "$INFER_MAX_SEQ_LEN" ]; then
+      STATE_JSON="$INFER_CKPT/state.json"
+      if [ -f "$STATE_JSON" ]; then
+        INFER_MAX_SEQ_LEN=$("$PY" - "$STATE_JSON" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+
+args = data.get("args") if isinstance(data, dict) else None
+if isinstance(args, dict):
+    seq_len = args.get("seq_len")
+    try:
+        seq_len = int(seq_len)
+    except Exception:
+        seq_len = None
+    if seq_len and seq_len > 0:
+        print(seq_len)
+PY
+)
+      fi
+    fi
     echo
     echo "[stage] infer"
     if [ "$INFER_DEMO" -eq 1 ]; then

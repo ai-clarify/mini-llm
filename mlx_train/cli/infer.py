@@ -25,6 +25,30 @@ def load_config(checkpoint_dir: Path) -> MiniLLMConfig:
     return MiniLLMConfig.from_dict(data)
 
 
+def load_state_seq_len(checkpoint_dir: Path) -> Optional[int]:
+    state_path = checkpoint_dir / "state.json"
+    if not state_path.exists():
+        return None
+    try:
+        with open(state_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    args = data.get("args")
+    if not isinstance(args, dict):
+        return None
+    seq_len = args.get("seq_len")
+    if seq_len is None:
+        return None
+    try:
+        seq_len = int(seq_len)
+    except Exception:
+        return None
+    return seq_len if seq_len > 0 else None
+
+
 def sample_next_token(
     logits: mx.array,
     *,
@@ -131,7 +155,12 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0, help="0 for greedy; >0 for sampling.")
     parser.add_argument("--top_p", type=float, default=1.0, help="Nucleus sampling threshold (only if temperature>0).")
     parser.add_argument("--seed", type=int, default=1337)
-    parser.add_argument("--max_seq_len", type=int, default=None)
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=None,
+        help="Max total tokens (prompt + generation). Defaults to checkpoint seq_len when available.",
+    )
     parser.add_argument(
         "--trace_out",
         type=str,
@@ -191,6 +220,8 @@ def main() -> None:
     prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     prompt_ids: List[int] = tokenizer.encode(prompt_text, add_special_tokens=False)
     max_seq_len = args.max_seq_len
+    if max_seq_len is None:
+        max_seq_len = load_state_seq_len(ckpt)
     if max_seq_len is not None:
         max_seq_len = min(int(max_seq_len), int(cfg.max_position_embeddings))
 

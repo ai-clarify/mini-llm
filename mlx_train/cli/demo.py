@@ -24,7 +24,7 @@ from .bench import (
     extract_choice,
     score_example,
 )
-from .infer import generate
+from .infer import generate, load_state_seq_len
 from ..config import MiniLLMConfig
 from ..models import MiniLLMForCausalLM
 from ..nn.lora import merge_lora
@@ -306,8 +306,11 @@ def main() -> None:
     parser.add_argument(
         "--max_seq_len",
         type=int,
-        default=512,
-        help="Max total tokens (prompt + generation). Defaults to 512 for demo safety.",
+        default=None,
+        help=(
+            "Max total tokens (prompt + generation). "
+            "Defaults to checkpoint seq_len when available; otherwise 512."
+        ),
     )
     parser.add_argument(
         "--mode",
@@ -348,9 +351,13 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
 
     seed = int(args.seed)
-    max_seq_len: Optional[int] = None
-    if args.max_seq_len is not None:
-        max_seq_len = min(int(args.max_seq_len), int(cfg.max_position_embeddings))
+    max_seq_len: Optional[int] = args.max_seq_len
+    if max_seq_len is None:
+        max_seq_len = load_state_seq_len(ckpt)
+        if max_seq_len is None:
+            max_seq_len = 512
+    if max_seq_len is not None:
+        max_seq_len = min(int(max_seq_len), int(cfg.max_position_embeddings))
 
     print(_fmt_sep("=", 72))
     print("MiniLLM Infer Demo (MLX)")
