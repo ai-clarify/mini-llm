@@ -190,6 +190,9 @@ def main() -> None:
     messages = [{"role": "user", "content": args.prompt}]
     prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     prompt_ids: List[int] = tokenizer.encode(prompt_text, add_special_tokens=False)
+    max_seq_len = args.max_seq_len
+    if max_seq_len is not None:
+        max_seq_len = min(int(max_seq_len), int(cfg.max_position_embeddings))
 
     tracer: Optional[ActivationTracer] = None
     if args.trace_out:
@@ -214,7 +217,7 @@ def main() -> None:
         banned_token_ids=list(tokenizer.all_special_ids),
         temperature=args.temperature,
         top_p=args.top_p,
-        max_seq_len=args.max_seq_len,
+        max_seq_len=max_seq_len,
         trace=tracer,
     )
 

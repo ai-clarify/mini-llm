@@ -48,6 +48,7 @@ def _chat_generate(
     system: str,
     user: str,
     max_new_tokens: int,
+    max_seq_len: Optional[int],
     seed: int,
 ) -> str:
     mx.random.seed(int(seed))
@@ -63,7 +64,7 @@ def _chat_generate(
         banned_token_ids=list(tokenizer.all_special_ids),
         temperature=0.0,
         top_p=1.0,
-        max_seq_len=None,
+        max_seq_len=max_seq_len,
     )
     resp_ids = out_ids[len(prompt_ids) :]
     return tokenizer.decode(resp_ids, skip_special_tokens=True).strip()
@@ -75,6 +76,7 @@ def _print_scored_example(
     tokenizer: Any,
     ex: Example,
     max_new_tokens: int,
+    max_seq_len: Optional[int],
     seed: int,
 ) -> None:
     system = _system_prompt_for(ex)
@@ -85,6 +87,7 @@ def _print_scored_example(
         system=system,
         user=ex.prompt,
         max_new_tokens=max_new_tokens,
+        max_seq_len=max_seq_len,
         seed=seed,
     )
     t1 = time.perf_counter()
@@ -153,6 +156,7 @@ def _print_open_ended(
     tokenizer: Any,
     demo: DemoExample,
     max_new_tokens: int,
+    max_seq_len: Optional[int],
     seed: int,
 ) -> None:
     system = "你是一个乐于助人的助手。"
@@ -163,6 +167,7 @@ def _print_open_ended(
         system=system,
         user=demo.prompt,
         max_new_tokens=max_new_tokens,
+        max_seq_len=max_seq_len,
         seed=seed,
     )
     t1 = time.perf_counter()
@@ -256,6 +261,7 @@ def _print_knowledge_demo(
     tokenizer: Any,
     prompts: Iterable[DemoExample],
     max_new_tokens: int,
+    max_seq_len: Optional[int],
     seed: int,
 ) -> None:
     system = "你是一个知识问答助手。尽量简洁、直接回答问题。"
@@ -267,6 +273,7 @@ def _print_knowledge_demo(
             system=system,
             user=demo.prompt,
             max_new_tokens=max_new_tokens,
+            max_seq_len=max_seq_len,
             seed=seed + i,
         )
         t1 = time.perf_counter()
@@ -296,6 +303,12 @@ def main() -> None:
     parser.add_argument("--tokenizer_path", type=str, default="./model")
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--max_new_tokens", type=int, default=32)
+    parser.add_argument(
+        "--max_seq_len",
+        type=int,
+        default=512,
+        help="Max total tokens (prompt + generation). Defaults to 512 for demo safety.",
+    )
     parser.add_argument(
         "--mode",
         type=str,
@@ -335,12 +348,18 @@ def main() -> None:
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
 
     seed = int(args.seed)
+    max_seq_len: Optional[int] = None
+    if args.max_seq_len is not None:
+        max_seq_len = min(int(args.max_seq_len), int(cfg.max_position_embeddings))
 
     print(_fmt_sep("=", 72))
     print("MiniLLM Infer Demo (MLX)")
     print(_fmt_sep("=", 72))
     print(f"ckpt: {ckpt}")
-    print(f"mode: {args.mode}  max_new_tokens={int(args.max_new_tokens)}")
+    print(
+        f"mode: {args.mode}  max_new_tokens={int(args.max_new_tokens)}  "
+        f"max_seq_len={max_seq_len if max_seq_len is not None else 'none'}"
+    )
     print()
 
     if str(args.mode) == "knowledge":
@@ -350,6 +369,7 @@ def main() -> None:
             tokenizer=tokenizer,
             prompts=prompts,
             max_new_tokens=int(args.max_new_tokens),
+            max_seq_len=max_seq_len,
             seed=seed,
         )
         return
@@ -387,6 +407,7 @@ def main() -> None:
                 prompt="用 5 条要点解释什么是 Transformer 的 attention。每条不超过 20 个字。",
             ),
             max_new_tokens=int(args.max_new_tokens),
+            max_seq_len=max_seq_len,
             seed=seed,
         )
         print()
@@ -397,6 +418,7 @@ def main() -> None:
             tokenizer=tokenizer,
             ex=ex,
             max_new_tokens=int(args.max_new_tokens),
+            max_seq_len=max_seq_len,
             seed=seed,
         )
         print()
