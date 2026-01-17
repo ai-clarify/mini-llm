@@ -89,6 +89,7 @@ Advanced:
   INF_TEMP           0 for greedy; >0 for sampling (default: 0)
   INF_TOP_P          Nucleus sampling threshold (default: 1.0)
   INF_MAX_SEQ        Max total tokens (prompt + generation) for infer (default: use checkpoint seq_len if available)
+  TF_DIR             TensorBoard log root for MLX training (default: out/logs/<out_dir_basename>; set empty to disable)
   INF_MODE           Demo mode for --infer-only (default: knowledge; other: bench)
   INF_SUITES         [bench mode] Suites (default: copy,json,sort,math_mcq,logic,qa,knowledge)
   INF_N              [bench mode] Examples per suite (default: 2)
@@ -111,6 +112,10 @@ RUN_DPO=${DPO:-0}
 OUT_DIR_WAS_SET=0
 if [ -n "${OUT+x}" ]; then
   OUT_DIR_WAS_SET=1
+fi
+TF_DIR_WAS_SET=0
+if [ -n "${TF_DIR+x}" ]; then
+  TF_DIR_WAS_SET=1
 fi
 
 TRAIN_EXTRA_ARGS=()
@@ -441,6 +446,10 @@ if [ "$SMOKE_TEST" -eq 1 ] && [ "$CLEANUP_SMOKE" = "1" ] && [ "$OUT_DIR_WAS_SET"
     echo "[cleanup] Removing previous smoke outputs: $OUT_DIR"
     safe_rm_rf "$OUT_DIR"
   fi
+  if [ -n "${TF_DIR:-}" ] && [ "$TF_DIR_WAS_SET" -eq 0 ] && [ -d "$TF_DIR" ]; then
+    echo "[cleanup] Removing previous smoke logs: $TF_DIR"
+    safe_rm_rf "$TF_DIR"
+  fi
 fi
 
 mkdir -p "$DATA_DIR"
@@ -501,6 +510,17 @@ if [ "$DOWNLOAD_ONLY" -eq 1 ]; then
 fi
 
 mkdir -p "$OUT_DIR"
+
+if [ -z "${TF_DIR+x}" ]; then
+  TF_DIR="out/logs/$(basename "$OUT_DIR")"
+fi
+if [ -n "$TF_DIR" ]; then
+  TB_PRETRAIN_DIR="$TF_DIR/pretrain"
+  TB_SFT_DIR="$TF_DIR/sft"
+  TB_DPO_DIR="$TF_DIR/dpo"
+  TB_R1_DIR="$TF_DIR/r1"
+  mkdir -p "$TB_PRETRAIN_DIR" "$TB_SFT_DIR" "$TB_DPO_DIR" "$TB_R1_DIR"
+fi
 
 latest_ckpt() {
   local stage_dir=$1
@@ -648,6 +668,9 @@ if [ "$SKIP_PRETRAIN" -eq 0 ]; then
     --log_interval "$LOG_INTERVAL"
     --save_interval "$SAVE_INTERVAL"
   )
+  if [ -n "${TB_PRETRAIN_DIR:-}" ]; then
+    PRETRAIN_ARGS+=(--tensorboard_dir "$TB_PRETRAIN_DIR")
+  fi
   if [ -n "${HF_ENDPOINT:-}" ]; then
     PRETRAIN_ARGS+=(--hf_endpoint "$HF_ENDPOINT")
   fi
@@ -701,6 +724,9 @@ if [ "$SKIP_SFT" -eq 0 ]; then
     --log_interval "$LOG_INTERVAL"
     --save_interval "$SAVE_INTERVAL"
   )
+  if [ -n "${TB_SFT_DIR:-}" ]; then
+    SFT_ARGS+=(--tensorboard_dir "$TB_SFT_DIR")
+  fi
   if [ -n "${HF_ENDPOINT:-}" ]; then
     SFT_ARGS+=(--hf_endpoint "$HF_ENDPOINT")
   fi
@@ -772,6 +798,9 @@ if [ "$RUN_DPO" -eq 1 ]; then
     --log_interval "$LOG_INTERVAL"
     --save_interval "$SAVE_INTERVAL"
   )
+  if [ -n "${TB_DPO_DIR:-}" ]; then
+    DPO_ARGS+=(--tensorboard_dir "$TB_DPO_DIR")
+  fi
   if [ -n "${HF_ENDPOINT:-}" ]; then
     DPO_ARGS+=(--hf_endpoint "$HF_ENDPOINT")
   fi
@@ -850,6 +879,9 @@ if [ "$RUN_R1" -eq 1 ]; then
     --log_interval "$LOG_INTERVAL"
     --save_interval "$SAVE_INTERVAL"
   )
+  if [ -n "${TB_R1_DIR:-}" ]; then
+    R1_ARGS+=(--tensorboard_dir "$TB_R1_DIR")
+  fi
   if [ -n "${HF_ENDPOINT:-}" ]; then
     R1_ARGS+=(--hf_endpoint "$HF_ENDPOINT")
   fi
@@ -994,6 +1026,10 @@ if [ "$SMOKE_TEST" -eq 1 ] && [ "$CLEANUP_SMOKE" = "1" ] && [ "$OUT_DIR_WAS_SET"
   echo
   echo "[cleanup] Removing smoke outputs: $OUT_DIR"
   safe_rm_rf "$OUT_DIR"
+  if [ -n "${TF_DIR:-}" ] && [ "$TF_DIR_WAS_SET" -eq 0 ] && [ -d "$TF_DIR" ]; then
+    echo "[cleanup] Removing smoke logs: $TF_DIR"
+    safe_rm_rf "$TF_DIR"
+  fi
 fi
 
 echo

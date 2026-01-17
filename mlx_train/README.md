@@ -27,6 +27,31 @@ bash scripts/run_mlx.sh --smoke-test
 
 > `--smoke-test` 默认会自动删除输出目录（`out/mlx_smoke`），如需保留可设置 `SMOKE_CLEAN=0`。
 
+## TensorBoard 训练曲线
+
+默认会把训练曲线写到 `out/logs/<out_dir_basename>/<stage>`，例如：
+
+```bash
+# 训练时自动写日志
+bash scripts/run_mlx.sh
+
+# 另开一个终端查看曲线
+tensorboard --logdir out/logs/mlx
+```
+
+可用 `TF_DIR` 自定义日志目录，或者设置为空关闭：
+
+```bash
+TF_DIR=out/logs/custom_mlx bash scripts/run_mlx.sh
+TF_DIR= bash scripts/run_mlx.sh  # 禁用
+```
+
+如提示缺少 TensorBoard，请先安装：
+
+```bash
+python3 -m pip install tensorboard
+```
+
 ## 快速 Smoke（推荐先跑通）
 
 使用仓库自带的 `data/chinese/identity_conversations.jsonl` 做 SFT 形式的 mask，跑几步验证：

@@ -91,6 +91,45 @@ def estimate_steps_per_epoch(num_samples: int, batch_size: int, accum_steps: int
     return int(steps)
 
 
+def _create_tensorboard_writer(log_dir: str) -> Optional[Any]:
+    try:
+        from torch.utils.tensorboard import SummaryWriter  # type: ignore[import]
+
+        return SummaryWriter(log_dir=log_dir)
+    except Exception:
+        pass
+
+    try:
+        from tensorboard.compat.proto.event_pb2 import Event  # type: ignore[import]
+        from tensorboard.compat.proto.summary_pb2 import Summary  # type: ignore[import]
+        from tensorboard.summary.writer.event_file_writer import (  # type: ignore[import]
+            EventFileWriter,
+        )
+    except Exception:
+        print(
+            "[warn] TensorBoard logging requested but tensorboard is not installed. "
+            "Install via `pip install tensorboard` (or install torch) to enable it."
+        )
+        return None
+
+    class _SimpleTBWriter:
+        def __init__(self, path: str) -> None:
+            self._writer = EventFileWriter(path)
+
+        def add_scalar(self, tag: str, value: float, step: int) -> None:
+            summary = Summary(value=[Summary.Value(tag=tag, simple_value=float(value))])
+            event = Event(wall_time=time.time(), step=int(step), summary=summary)
+            self._writer.add_event(event)
+
+        def flush(self) -> None:
+            self._writer.flush()
+
+        def close(self) -> None:
+            self._writer.close()
+
+    return _SimpleTBWriter(log_dir)
+
+
 def save_optimizer_state(optimizer: optim.Optimizer, path: str) -> None:
     flat: Dict[str, Any] = {}
     mlx_utils.tree_flatten(optimizer.state, destination=flat)
@@ -780,6 +819,12 @@ def main() -> None:
     parser.add_argument("--out_dir", type=str, default="./out/mlx")
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=200)
+    parser.add_argument(
+        "--tensorboard_dir",
+        type=str,
+        default=None,
+        help="Optional TensorBoard log dir (requires tensorboard or torch installed).",
+    )
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument(
         "--logits_chunk_size",
@@ -1150,6 +1195,13 @@ def main() -> None:
             )
     else:
         total_steps = 50_000
+
+    tb_writer = None
+    if args.tensorboard_dir:
+        os.makedirs(args.tensorboard_dir, exist_ok=True)
+        tb_writer = _create_tensorboard_writer(args.tensorboard_dir)
+        if tb_writer is not None:
+            print(f"[tb] logging to {args.tensorboard_dir}")
 
     model.train()
     effective_batch_size = int(args.batch_size) * (2 if is_dpo else 1)
@@ -1527,6 +1579,14 @@ def main() -> None:
                         f"[train] step={global_step} epoch={epoch + 1}/{args.epochs} "
                         f"loss={avg_loss:.4f} lr={lr:.2e} tok/s={tok_s:.0f}{timing_msg}"
                     )
+                    if tb_writer is not None:
+                        tb_writer.add_scalar("train/loss", avg_loss, global_step)
+                        tb_writer.add_scalar("train/lr", lr, global_step)
+                        tb_writer.add_scalar("train/tok_s", tok_s, global_step)
+                        tb_writer.add_scalar("train/epoch", epoch + 1, global_step)
+                        tb_writer.add_scalar("train/seen_tokens", seen_tokens, global_step)
+                        tb_writer.add_scalar("train/grad_norm", float(grad_norm.item()), global_step)
+                        tb_writer.flush()
 
                 if global_step % args.save_interval == 0:
                     path = save_checkpoint(global_step)
@@ -1540,6 +1600,8 @@ def main() -> None:
     finally:
         path = save_checkpoint(global_step)
         print(f"[ckpt] saved {path}")
+        if tb_writer is not None:
+            tb_writer.close()
 
 
 if __name__ == "__main__":
