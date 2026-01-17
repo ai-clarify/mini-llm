@@ -4,3 +4,4 @@ huggingface_hub>=0.34.0,<1.0
 modelscope>=1.16.1
 requests
 jinja2
+tensorboard>=2.17.1
