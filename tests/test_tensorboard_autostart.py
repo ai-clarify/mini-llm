@@ -15,10 +15,12 @@ def assert_contains(path: str, needle: str) -> None:
 def main() -> None:
     assert_contains("pipelines/run_mlx.sh", "# [tb] auto-start")
     assert_contains("pipelines/run_mlx.sh", "TB_AUTO")
-    assert_contains("pipelines/run_mlx.sh", "tensorboard --logdir")
+    assert_contains("pipelines/run_mlx.sh", "TB_BIN")
+    assert_contains("pipelines/run_mlx.sh", "--logdir")
     assert_contains("pipelines/run_mlx_distill_ollama.sh", "# [tb] auto-start")
     assert_contains("pipelines/run_mlx_distill_ollama.sh", "--tensorboard_dir")
     assert_contains("pipelines/run_mlx_distill_ollama.sh", "TB_AUTO")
+    assert_contains("pipelines/run_mlx_distill_ollama.sh", "TB_BIN")
 
 
 if __name__ == "__main__":

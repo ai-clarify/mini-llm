@@ -529,6 +529,10 @@ fi
 TB_AUTO=${TB_AUTO:-1}
 TB_PORT=${TB_PORT:-6006}
 TB_HOST=${TB_HOST:-127.0.0.1}
+TB_BIN="$(dirname "$PY")/tensorboard"
+if [ ! -x "$TB_BIN" ]; then
+  TB_BIN="$(command -v tensorboard || true)"
+fi
 
 WILL_TRAIN=0
 if [ "$SKIP_PRETRAIN" -eq 0 ] || [ "$SKIP_SFT" -eq 0 ] || [ "$RUN_DPO" -eq 1 ] || [ "$RUN_R1" -eq 1 ]; then
@@ -536,7 +540,7 @@ if [ "$SKIP_PRETRAIN" -eq 0 ] || [ "$SKIP_SFT" -eq 0 ] || [ "$RUN_DPO" -eq 1 ] |
 fi
 
 if [ -n "${TF_DIR:-}" ] && [ "$TB_AUTO" != "0" ] && [ "$WILL_TRAIN" -eq 1 ]; then
-  if "$PY" -m tensorboard --version >/dev/null 2>&1; then
+  if [ -n "$TB_BIN" ] && [ -x "$TB_BIN" ] && "$TB_BIN" --version >/dev/null 2>&1; then
     TB_PORT_IN_USE=$("$PY" - "$TB_HOST" "$TB_PORT" <<'PY'
 import socket
 import sys
@@ -568,7 +572,7 @@ print(port)
 PY
 )
     fi
-    "$PY" -m tensorboard --logdir "$TF_DIR" --host "$TB_HOST" --port "$TB_PORT" >/dev/null 2>&1 &
+    "$TB_BIN" --logdir "$TF_DIR" --host "$TB_HOST" --port "$TB_PORT" >/dev/null 2>&1 &
     echo "[tensorboard] http://$TB_HOST:$TB_PORT (pid=$!)"
   else
     echo "[warn] TensorBoard not available; install tensorboard to enable TB_AUTO" >&2

@@ -32,6 +32,10 @@ fi
 TB_AUTO=${TB_AUTO:-1}
 TB_PORT=${TB_PORT:-6006}
 TB_HOST=${TB_HOST:-127.0.0.1}
+TB_BIN="$(dirname "$PY")/tensorboard"
+if [ ! -x "$TB_BIN" ]; then
+  TB_BIN="$(command -v tensorboard || true)"
+fi
 
 find_tensorboard_dir() {
   local tb_dir=""
@@ -52,7 +56,7 @@ find_tensorboard_dir() {
 
 TB_LOGDIR=$(find_tensorboard_dir "$@")
 if [ -n "$TB_LOGDIR" ] && [ "$TB_AUTO" != "0" ]; then
-  if "$PY" -m tensorboard --version >/dev/null 2>&1; then
+  if [ -n "$TB_BIN" ] && [ -x "$TB_BIN" ] && "$TB_BIN" --version >/dev/null 2>&1; then
     mkdir -p "$TB_LOGDIR"
     TB_PORT_IN_USE=$("$PY" - "$TB_HOST" "$TB_PORT" <<'PY'
 import socket
@@ -85,7 +89,7 @@ print(port)
 PY
 )
     fi
-    "$PY" -m tensorboard --logdir "$TB_LOGDIR" --host "$TB_HOST" --port "$TB_PORT" >/dev/null 2>&1 &
+    "$TB_BIN" --logdir "$TB_LOGDIR" --host "$TB_HOST" --port "$TB_PORT" >/dev/null 2>&1 &
     echo "[tensorboard] http://$TB_HOST:$TB_PORT (pid=$!)"
   else
     echo "[warn] TensorBoard not available; install tensorboard to enable TB_AUTO" >&2
