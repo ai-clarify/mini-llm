@@ -198,6 +198,52 @@ OUT_DIR=/path/to/output scripts/run.sh
 TF_DIR=/path/to/tensorboard scripts/run.sh
 ```
 
+### Checkpoint 与恢复
+
+默认输出布局对齐 MLX：
+
+```
+out/
+  pretrain/
+    checkpoints/step_00000010/
+    pretrain_512.pth
+  sft/
+    checkpoints/step_00000010/
+    full_sft_512.pth
+  dpo/
+    checkpoints/step_00000010/
+    rlhf_512.pth
+  r1/
+    checkpoints/step_00000010/
+    reason_512.pth
+```
+
+兼容文件仍会链接到根目录（如 `out/pretrain_512.pth`），便于旧脚本使用。
+当存在 step checkpoint 时，脚本会自动断点续训（恢复 optimizer/step/seed）。
+
+可选环境变量：
+
+```bash
+# 每阶段保存间隔（默认 200）
+SAVE_INTERVAL=200
+
+# 每阶段保留最近 N 个 step checkpoints（默认 3）
+KEEP_LAST=3
+```
+
+### TensorBoard 自动启动
+
+默认启用自动启动 TensorBoard（可关闭）：
+
+```bash
+# 关闭自动启动
+TB_AUTO=0
+
+# 自定义 host/port
+TB_HOST=127.0.0.1
+TB_PORT=6006
+```
+
 ### Pretrain Checkpoint
 
 ```bash

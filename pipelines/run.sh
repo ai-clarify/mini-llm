@@ -142,6 +142,8 @@ MINIMIND_DATA_DIR=${MINIMIND_DATA_DIR:-dataset/minimind}
 RESULTS_FILE=${RESULTS_FILE:-"$TF_DIR/eval_results.jsonl"}
 MAX_DOWNLOAD_MB=${MAX_DOWNLOAD_MB:-0}
 AUTO_DOWNLOAD=${AUTO_DOWNLOAD:-1}
+KEEP_LAST=${KEEP_LAST:-3}
+SAVE_INTERVAL=${SAVE_INTERVAL:-200}
 
 USE_UV=0
 
@@ -634,21 +636,33 @@ else
   TRAIN_CMD_PREFIX="python"
 fi
 
-CHECKPOINT_PRETRAIN="$OUT_DIR/pretrain_${MODEL_HIDDEN_SIZE}.pth"
-CHECKPOINT_SFT="$OUT_DIR/full_sft_${MODEL_HIDDEN_SIZE}.pth"
-CHECKPOINT_DPO="$OUT_DIR/rlhf_${MODEL_HIDDEN_SIZE}.pth"
-CHECKPOINT_R1="$OUT_DIR/reason_${MODEL_HIDDEN_SIZE}.pth"
+MOE_SUFFIX=""
+if [ "$USE_MOE" = "true" ]; then
+  MOE_SUFFIX="_moe"
+fi
+
+PRETRAIN_OUT="$OUT_DIR/pretrain"
+SFT_OUT="$OUT_DIR/sft"
+DPO_OUT="$OUT_DIR/dpo"
+R1_OUT="$OUT_DIR/r1"
+
+CHECKPOINT_PRETRAIN="$PRETRAIN_OUT/pretrain_${MODEL_HIDDEN_SIZE}${MOE_SUFFIX}.pth"
+CHECKPOINT_SFT="$SFT_OUT/full_sft_${MODEL_HIDDEN_SIZE}${MOE_SUFFIX}.pth"
+CHECKPOINT_DPO="$DPO_OUT/rlhf_${MODEL_HIDDEN_SIZE}${MOE_SUFFIX}.pth"
+CHECKPOINT_R1="$R1_OUT/reason_${MODEL_HIDDEN_SIZE}${MOE_SUFFIX}.pth"
+
+LEGACY_PRETRAIN="$OUT_DIR/pretrain_${MODEL_HIDDEN_SIZE}${MOE_SUFFIX}.pth"
+LEGACY_SFT="$OUT_DIR/full_sft_${MODEL_HIDDEN_SIZE}${MOE_SUFFIX}.pth"
+LEGACY_DPO="$OUT_DIR/rlhf_${MODEL_HIDDEN_SIZE}${MOE_SUFFIX}.pth"
+LEGACY_R1="$OUT_DIR/reason_${MODEL_HIDDEN_SIZE}${MOE_SUFFIX}.pth"
 
 # Auto-load pretrained checkpoints from /openbayes/home/out or environment
 PRETRAINED_PATH=""
 find_pretrained_checkpoint() {
   local stage=$1
   local model_size=$2
-  local moe_suffix=""
-
-  if [ "$USE_MOE" = "true" ]; then
-    moe_suffix="_moe"
-  fi
+  local moe_suffix="$MOE_SUFFIX"
+  local stage_dir=""
 
   # Check environment variable first
   if [ -n "${MINILLM_PRETRAINED_PATH:-}" ] && [ -f "$MINILLM_PRETRAINED_PATH" ]; then
@@ -663,6 +677,22 @@ find_pretrained_checkpoint() {
     return 0
   fi
 
+  case "$stage" in
+    pretrain) stage_dir="$PRETRAIN_OUT" ;;
+    full_sft) stage_dir="$SFT_OUT" ;;
+    rlhf) stage_dir="$DPO_OUT" ;;
+    reason) stage_dir="$R1_OUT" ;;
+    *) stage_dir="" ;;
+  esac
+
+  if [ -n "$stage_dir" ]; then
+    local stage_path="$stage_dir/${stage}_${model_size}${moe_suffix}.pth"
+    if [ -f "$stage_path" ]; then
+      echo "$stage_path"
+      return 0
+    fi
+  fi
+
   # Check local out directory
   local local_path="$OUT_DIR/${stage}_${model_size}${moe_suffix}.pth"
   if [ -f "$local_path" ]; then
@@ -671,6 +701,37 @@ find_pretrained_checkpoint() {
   fi
 
   return 1
+}
+
+is_valid_ckpt() {
+  local ckpt_path=$1
+  [ -s "$ckpt_path/model.pth" ] || return 1
+  [ -s "$ckpt_path/optimizer.pt" ] || return 1
+  [ -s "$ckpt_path/state.json" ] || return 1
+  [ -s "$ckpt_path/rng_state.pt" ] || return 1
+  return 0
+}
+
+latest_ckpt() {
+  local stage_dir=$1
+  local ckpt
+  while IFS= read -r ckpt; do
+    [ -z "$ckpt" ] && continue
+    if is_valid_ckpt "$ckpt"; then
+      echo "$ckpt"
+      return 0
+    fi
+    echo "[warn] Skipping invalid checkpoint: $ckpt" >&2
+  done < <(ls -dt "$stage_dir"/checkpoints/step_* 2>/dev/null || true)
+  return 0
+}
+
+link_legacy_checkpoint() {
+  local src=$1
+  local dest=$2
+  if [ -f "$src" ] && [ "$src" != "$dest" ]; then
+    ln -sf "$src" "$dest" || cp "$src" "$dest"
+  fi
 }
 
 # Initialize PRETRAINED_PATH if available
@@ -686,6 +747,50 @@ TB_DPO_DIR="$TF_DIR/dpo"
 TB_EVAL_DIR="$TF_DIR/eval"
 
 mkdir -p "$TB_PRETRAIN_DIR" "$TB_SFT_DIR" "$TB_DPO_DIR" "$TB_EVAL_DIR"
+mkdir -p "$PRETRAIN_OUT" "$SFT_OUT" "$DPO_OUT" "$R1_OUT"
+
+TB_AUTO=${TB_AUTO:-1}
+TB_PORT=${TB_PORT:-6006}
+TB_HOST=${TB_HOST:-127.0.0.1}
+if [ -n "$TF_DIR" ] && [ "$TB_AUTO" != "0" ]; then
+  if python -m tensorboard --version >/dev/null 2>&1; then
+    TB_PORT_IN_USE=$(python - "$TB_HOST" "$TB_PORT" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+sock = socket.socket()
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    sock.bind((host, port))
+    print("0")
+except OSError:
+    print("1")
+finally:
+    sock.close()
+PY
+)
+    if [ "$TB_PORT_IN_USE" = "1" ]; then
+      TB_PORT=$(python - "$TB_HOST" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+sock = socket.socket()
+sock.bind((host, 0))
+port = sock.getsockname()[1]
+sock.close()
+print(port)
+PY
+)
+    fi
+    python -m tensorboard --logdir "$TF_DIR" --host "$TB_HOST" --port "$TB_PORT" >/dev/null 2>&1 &
+    echo "[tensorboard] http://$TB_HOST:$TB_PORT (pid=$!)"
+  else
+    echo "[warn] TensorBoard not available; install tensorboard to enable TB_AUTO" >&2
+  fi
+fi
 
 EVAL_CMD_BASE=(python scripts/evaluate_stage.py --hidden-size "$MODEL_HIDDEN_SIZE" --num-hidden-layers "$MODEL_NUM_LAYERS" --results-file "$RESULTS_FILE")
 
@@ -697,7 +802,7 @@ DPO_EVAL_MAX_SAMPLES=64
 DPO_EVAL_BATCH=2
 
 if [ "$SMOKE_TEST" -eq 1 ]; then
-  EXTRA_PRETRAIN_ARGS+=(--device cpu --dtype float32 --batch_size "${SMOKE_PRETRAIN_BATCH:-2}" --max_steps "${SMOKE_PRETRAIN_STEPS:-4}" --num_workers 0 --log_interval 1 --save_interval "${SMOKE_PRETRAIN_STEPS:-4}")
+  EXTRA_PRETRAIN_ARGS+=(--device cpu --dtype float32 --batch_size "${SMOKE_PRETRAIN_BATCH:-2}" --accumulation_steps 1 --max_steps "${SMOKE_PRETRAIN_STEPS:-4}" --num_workers 0 --log_interval 1 --save_interval "${SMOKE_PRETRAIN_STEPS:-4}")
   EXTRA_SFT_ARGS+=(--device cpu --dtype float32 --batch_size "${SMOKE_SFT_BATCH:-2}" --max_steps "${SMOKE_SFT_STEPS:-4}" --num_workers 0 --log_interval 1 --save_interval "${SMOKE_SFT_STEPS:-4}")
   EXTRA_DPO_ARGS+=(--device cpu --dtype float32 --batch_size "${SMOKE_DPO_BATCH:-2}" --max_steps "${SMOKE_DPO_STEPS:-4}" --num_workers 0 --log_interval 1 --save_interval "${SMOKE_DPO_STEPS:-4}")
   EXTRA_R1_ARGS+=(--device cpu --dtype float32 --batch_size "${SMOKE_R1_BATCH:-2}" --epochs "${SMOKE_R1_EPOCHS:-1}" --num_workers 0 --log_interval 1 --save_interval "${SMOKE_R1_SAVE_INTERVAL:-2}" --max_seq_len "${SMOKE_R1_SEQ_LEN:-256}")
@@ -710,7 +815,17 @@ if [ "$SMOKE_TEST" -eq 1 ]; then
   DPO_EVAL_BATCH=${SMOKE_DPO_EVAL_BATCH:-1}
 
   EVAL_CMD_BASE+=(--device cpu)
+else
+  EXTRA_PRETRAIN_ARGS+=(--save_interval "$SAVE_INTERVAL")
+  EXTRA_SFT_ARGS+=(--save_interval "$SAVE_INTERVAL")
+  EXTRA_DPO_ARGS+=(--save_interval "$SAVE_INTERVAL")
+  EXTRA_R1_ARGS+=(--save_interval "$SAVE_INTERVAL")
 fi
+
+EXTRA_PRETRAIN_ARGS+=(--keep_last_checkpoints "$KEEP_LAST")
+EXTRA_SFT_ARGS+=(--keep_last_checkpoints "$KEEP_LAST")
+EXTRA_DPO_ARGS+=(--keep_last_checkpoints "$KEEP_LAST")
+EXTRA_R1_ARGS+=(--keep_last_checkpoints "$KEEP_LAST")
 
 # Check if we should skip pretrain stage
 SHOULD_SKIP_PRETRAIN=0
@@ -719,41 +834,53 @@ if [ "$FORCE_PRETRAIN" -eq 1 ]; then
   echo "[stage] Force pretrain mode enabled, will train from scratch"
   SHOULD_SKIP_PRETRAIN=0
 elif [ "$SKIP_PRETRAIN" -eq 1 ]; then
-  # Check if pretrain checkpoint exists
-  EXISTING_PRETRAIN=$(find_pretrained_checkpoint "pretrain" "$MODEL_HIDDEN_SIZE" 2>/dev/null || true)
+  PRETRAIN_RESUME=$(latest_ckpt "$PRETRAIN_OUT")
+  if [ -n "$PRETRAIN_RESUME" ]; then
+    echo "[stage] Found pretrain step checkpoint: $PRETRAIN_RESUME"
+    SHOULD_SKIP_PRETRAIN=1
+  else
+    # Check if pretrain checkpoint exists
+    EXISTING_PRETRAIN=$(find_pretrained_checkpoint "pretrain" "$MODEL_HIDDEN_SIZE" 2>/dev/null || true)
 
-  if [ -n "$EXISTING_PRETRAIN" ] && [ -f "$EXISTING_PRETRAIN" ]; then
-    echo "[stage] Found existing pretrain checkpoint: $EXISTING_PRETRAIN"
-    echo "[stage] Checking checkpoint quality..."
+    if [ -n "$EXISTING_PRETRAIN" ] && [ -f "$EXISTING_PRETRAIN" ]; then
+      echo "[stage] Found existing pretrain checkpoint: $EXISTING_PRETRAIN"
+      echo "[stage] Checking checkpoint quality..."
 
-    # Quick quality check: verify checkpoint file is not corrupted and has reasonable size
-    CHECKPOINT_SIZE=$(stat -f%z "$EXISTING_PRETRAIN" 2>/dev/null || stat -c%s "$EXISTING_PRETRAIN" 2>/dev/null || echo "0")
-    MIN_SIZE=$((1024 * 100))  # At least 100KB
+      # Quick quality check: verify checkpoint file is not corrupted and has reasonable size
+      CHECKPOINT_SIZE=$(stat -f%z "$EXISTING_PRETRAIN" 2>/dev/null || stat -c%s "$EXISTING_PRETRAIN" 2>/dev/null || echo "0")
+      MIN_SIZE=$((1024 * 100))  # At least 100KB
 
-    if [ "$CHECKPOINT_SIZE" -gt "$MIN_SIZE" ]; then
-      echo "[stage] Checkpoint looks valid (size: $((CHECKPOINT_SIZE / 1024))KB)"
-      echo "[stage] Skipping pretrain stage, will use existing checkpoint for SFT"
-      SHOULD_SKIP_PRETRAIN=1
-      # Make sure the checkpoint is available for later stages
-      if [ "$EXISTING_PRETRAIN" != "$CHECKPOINT_PRETRAIN" ] && [ ! -f "$CHECKPOINT_PRETRAIN" ]; then
-        echo "[stage] Linking checkpoint to expected location"
-        ln -sf "$EXISTING_PRETRAIN" "$CHECKPOINT_PRETRAIN" || cp "$EXISTING_PRETRAIN" "$CHECKPOINT_PRETRAIN"
+      if [ "$CHECKPOINT_SIZE" -gt "$MIN_SIZE" ]; then
+        echo "[stage] Checkpoint looks valid (size: $((CHECKPOINT_SIZE / 1024))KB)"
+        echo "[stage] Skipping pretrain stage, will use existing checkpoint for SFT"
+        SHOULD_SKIP_PRETRAIN=1
+        if [ "$EXISTING_PRETRAIN" != "$CHECKPOINT_PRETRAIN" ] && [ ! -f "$CHECKPOINT_PRETRAIN" ]; then
+          echo "[stage] Linking checkpoint to stage output"
+          link_legacy_checkpoint "$EXISTING_PRETRAIN" "$CHECKPOINT_PRETRAIN"
+        fi
+      else
+        echo "[stage] Checkpoint appears corrupted or too small, will retrain"
+        SHOULD_SKIP_PRETRAIN=0
       fi
     else
-      echo "[stage] Checkpoint appears corrupted or too small, will retrain"
+      echo "[stage] No pretrain checkpoint found, will train from scratch"
       SHOULD_SKIP_PRETRAIN=0
     fi
-  else
-    echo "[stage] No pretrain checkpoint found, will train from scratch"
-    SHOULD_SKIP_PRETRAIN=0
   fi
 fi
 
 if [ "$SHOULD_SKIP_PRETRAIN" -eq 0 ]; then
   echo "[stage] Starting pretrain (2 epochs)"
-  $TRAIN_CMD_PREFIX trainer/train_pretrain.py --data_path "$PRETRAIN_JSON" --hidden_size "$MODEL_HIDDEN_SIZE" --num_hidden_layers "$MODEL_NUM_LAYERS" --epochs 2 --out_dir "$OUT_DIR" --tensorboard_dir "$TB_PRETRAIN_DIR" ${EXTRA_PRETRAIN_ARGS[@]+"${EXTRA_PRETRAIN_ARGS[@]}"}
+  PRETRAIN_RESUME=$(latest_ckpt "$PRETRAIN_OUT")
+  PRETRAIN_ARGS_WITH_RESUME=("${EXTRA_PRETRAIN_ARGS[@]}")
+  if [ -n "$PRETRAIN_RESUME" ]; then
+    PRETRAIN_ARGS_WITH_RESUME+=(--resume "$PRETRAIN_RESUME")
+  fi
+  PRETRAIN_ARGS_WITH_RESUME+=(--ckpt_dir "$PRETRAIN_OUT/checkpoints")
+  $TRAIN_CMD_PREFIX trainer/train_pretrain.py --data_path "$PRETRAIN_JSON" --hidden_size "$MODEL_HIDDEN_SIZE" --num_hidden_layers "$MODEL_NUM_LAYERS" --epochs 2 --out_dir "$PRETRAIN_OUT" --tensorboard_dir "$TB_PRETRAIN_DIR" ${PRETRAIN_ARGS_WITH_RESUME[@]+"${PRETRAIN_ARGS_WITH_RESUME[@]}"}
 
   if [ -f "$CHECKPOINT_PRETRAIN" ]; then
+    link_legacy_checkpoint "$CHECKPOINT_PRETRAIN" "$LEGACY_PRETRAIN"
     echo "[eval] Pretrain evaluation"
     "${EVAL_CMD_BASE[@]}" --stage pretrain --checkpoint "$CHECKPOINT_PRETRAIN" --data-path "$PRETRAIN_JSON" --max-seq-len 512 --max-samples "$PRETRAIN_EVAL_MAX_SAMPLES" --batch-size "$PRETRAIN_EVAL_BATCH" --tensorboard-dir "$TB_EVAL_DIR/pretrain"
   else
@@ -762,6 +889,7 @@ if [ "$SHOULD_SKIP_PRETRAIN" -eq 0 ]; then
 else
   echo "[stage] Pretrain stage skipped"
   if [ -f "$CHECKPOINT_PRETRAIN" ]; then
+    link_legacy_checkpoint "$CHECKPOINT_PRETRAIN" "$LEGACY_PRETRAIN"
     echo "[eval] Running quick evaluation on existing pretrain checkpoint"
     "${EVAL_CMD_BASE[@]}" --stage pretrain --checkpoint "$CHECKPOINT_PRETRAIN" --data-path "$PRETRAIN_JSON" --max-seq-len 512 --max-samples "$PRETRAIN_EVAL_MAX_SAMPLES" --batch-size "$PRETRAIN_EVAL_BATCH" --tensorboard-dir "$TB_EVAL_DIR/pretrain" || echo "[warn] Pretrain evaluation failed, but continuing"
   fi
@@ -780,9 +908,15 @@ if [ -n "$SFT_PRETRAINED_PATH" ]; then
   echo "[checkpoint] Using pretrained model for SFT: $SFT_PRETRAINED_PATH"
   SFT_ARGS_WITH_PRETRAIN+=(--pretrained_path "$SFT_PRETRAINED_PATH")
 fi
-$TRAIN_CMD_PREFIX trainer/train_full_sft.py --data_path "$SFT_JSON" --hidden_size "$MODEL_HIDDEN_SIZE" --num_hidden_layers "$MODEL_NUM_LAYERS" --out_dir "$OUT_DIR" --tensorboard_dir "$TB_SFT_DIR" ${SFT_ARGS_WITH_PRETRAIN[@]+"${SFT_ARGS_WITH_PRETRAIN[@]}"}
+SFT_RESUME=$(latest_ckpt "$SFT_OUT")
+if [ -n "$SFT_RESUME" ]; then
+  SFT_ARGS_WITH_PRETRAIN+=(--resume "$SFT_RESUME")
+fi
+SFT_ARGS_WITH_PRETRAIN+=(--ckpt_dir "$SFT_OUT/checkpoints")
+$TRAIN_CMD_PREFIX trainer/train_full_sft.py --data_path "$SFT_JSON" --hidden_size "$MODEL_HIDDEN_SIZE" --num_hidden_layers "$MODEL_NUM_LAYERS" --out_dir "$SFT_OUT" --tensorboard_dir "$TB_SFT_DIR" ${SFT_ARGS_WITH_PRETRAIN[@]+"${SFT_ARGS_WITH_PRETRAIN[@]}"}
 
 if [ -f "$CHECKPOINT_SFT" ]; then
+  link_legacy_checkpoint "$CHECKPOINT_SFT" "$LEGACY_SFT"
   echo "[eval] SFT evaluation"
   "${EVAL_CMD_BASE[@]}" --stage sft --checkpoint "$CHECKPOINT_SFT" --data-path "$SFT_JSON" --max-seq-len 512 --max-samples "$SFT_EVAL_MAX_SAMPLES" --batch-size "$SFT_EVAL_BATCH" --tensorboard-dir "$TB_EVAL_DIR/sft"
 else
@@ -805,9 +939,15 @@ if [ -n "$DPO_PRETRAINED_PATH" ]; then
   echo "[checkpoint] Using pretrained model for DPO: $DPO_PRETRAINED_PATH"
   DPO_ARGS_WITH_PRETRAIN+=(--pretrained_path "$DPO_PRETRAINED_PATH")
 fi
-$TRAIN_CMD_PREFIX trainer/train_dpo.py --data_path "$DPO_JSON" --hidden_size "$MODEL_HIDDEN_SIZE" --num_hidden_layers "$MODEL_NUM_LAYERS" --out_dir "$OUT_DIR" --tensorboard_dir "$TB_DPO_DIR" ${DPO_ARGS_WITH_PRETRAIN[@]+"${DPO_ARGS_WITH_PRETRAIN[@]}"}
+DPO_RESUME=$(latest_ckpt "$DPO_OUT")
+if [ -n "$DPO_RESUME" ]; then
+  DPO_ARGS_WITH_PRETRAIN+=(--resume "$DPO_RESUME")
+fi
+DPO_ARGS_WITH_PRETRAIN+=(--ckpt_dir "$DPO_OUT/checkpoints")
+$TRAIN_CMD_PREFIX trainer/train_dpo.py --data_path "$DPO_JSON" --hidden_size "$MODEL_HIDDEN_SIZE" --num_hidden_layers "$MODEL_NUM_LAYERS" --out_dir "$DPO_OUT" --tensorboard_dir "$TB_DPO_DIR" ${DPO_ARGS_WITH_PRETRAIN[@]+"${DPO_ARGS_WITH_PRETRAIN[@]}"}
 
 if [ -f "$CHECKPOINT_DPO" ]; then
+  link_legacy_checkpoint "$CHECKPOINT_DPO" "$LEGACY_DPO"
   echo "[eval] DPO evaluation"
   "${EVAL_CMD_BASE[@]}" --stage dpo --checkpoint "$CHECKPOINT_DPO" --data-path "$DPO_JSON" --max-seq-len 1024 --max-samples "$DPO_EVAL_MAX_SAMPLES" --batch-size "$DPO_EVAL_BATCH" --tensorboard-dir "$TB_EVAL_DIR/dpo"
 else
@@ -819,15 +959,24 @@ if [ "$RUN_R1" -eq 1 ]; then
     echo "[error] R1 dataset not found at $R1_JSON" >&2
     exit 1
   fi
+  if [ ! -f "$CHECKPOINT_DPO" ] && [ -f "$LEGACY_DPO" ]; then
+    link_legacy_checkpoint "$LEGACY_DPO" "$CHECKPOINT_DPO"
+  fi
   if [ ! -f "$CHECKPOINT_DPO" ]; then
     echo "[error] R1 requires DPO checkpoint at $CHECKPOINT_DPO" >&2
     exit 1
   fi
   echo "[stage] Starting R1 distillation (reasoning)"
   R1_ARGS_WITH_PRETRAIN=("${EXTRA_R1_ARGS[@]}")
-  $TRAIN_CMD_PREFIX trainer/train_distill_reason.py --data_path "$R1_JSON" --hidden_size "$MODEL_HIDDEN_SIZE" --num_hidden_layers "$MODEL_NUM_LAYERS" --out_dir "$OUT_DIR" ${R1_ARGS_WITH_PRETRAIN[@]+"${R1_ARGS_WITH_PRETRAIN[@]}"}
+  R1_RESUME=$(latest_ckpt "$R1_OUT")
+  if [ -n "$R1_RESUME" ]; then
+    R1_ARGS_WITH_PRETRAIN+=(--resume "$R1_RESUME")
+  fi
+  R1_ARGS_WITH_PRETRAIN+=(--ckpt_dir "$R1_OUT/checkpoints" --pretrained_path "$CHECKPOINT_DPO")
+  $TRAIN_CMD_PREFIX trainer/train_distill_reason.py --data_path "$R1_JSON" --hidden_size "$MODEL_HIDDEN_SIZE" --num_hidden_layers "$MODEL_NUM_LAYERS" --out_dir "$R1_OUT" ${R1_ARGS_WITH_PRETRAIN[@]+"${R1_ARGS_WITH_PRETRAIN[@]}"}
 
   if [ -f "$CHECKPOINT_R1" ]; then
+    link_legacy_checkpoint "$CHECKPOINT_R1" "$LEGACY_R1"
     R1_DEMO=${R1_DEMO:-1}
     if [ "$R1_DEMO" -ne 0 ]; then
       R1_DEMO_PROMPT=${R1_DEMO_PROMPT:-"Compute 23 * 17. Show reasoning and give the final answer."}
