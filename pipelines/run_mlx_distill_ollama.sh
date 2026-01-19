@@ -28,6 +28,70 @@ if ! "$PY" -c "import requests" >/dev/null 2>&1; then
   exit 1
 fi
 
+# [tb] auto-start
+TB_AUTO=${TB_AUTO:-1}
+TB_PORT=${TB_PORT:-6006}
+TB_HOST=${TB_HOST:-127.0.0.1}
+
+find_tensorboard_dir() {
+  local tb_dir=""
+  local args=("$@")
+  for ((i=0; i<${#args[@]}; i++)); do
+    case "${args[$i]}" in
+      --tensorboard_dir)
+        tb_dir="${args[$((i+1))]:-}"
+        i=$((i+1))
+        ;;
+      --tensorboard_dir=*)
+        tb_dir="${args[$i]#*=}"
+        ;;
+    esac
+  done
+  echo "$tb_dir"
+}
+
+TB_LOGDIR=$(find_tensorboard_dir "$@")
+if [ -n "$TB_LOGDIR" ] && [ "$TB_AUTO" != "0" ]; then
+  if "$PY" -m tensorboard --version >/dev/null 2>&1; then
+    mkdir -p "$TB_LOGDIR"
+    TB_PORT_IN_USE=$("$PY" - "$TB_HOST" "$TB_PORT" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+sock = socket.socket()
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    sock.bind((host, port))
+    print("0")
+except OSError:
+    print("1")
+finally:
+    sock.close()
+PY
+)
+    if [ "$TB_PORT_IN_USE" = "1" ]; then
+      TB_PORT=$("$PY" - "$TB_HOST" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+sock = socket.socket()
+sock.bind((host, 0))
+port = sock.getsockname()[1]
+sock.close()
+print(port)
+PY
+)
+    fi
+    "$PY" -m tensorboard --logdir "$TB_LOGDIR" --host "$TB_HOST" --port "$TB_PORT" >/dev/null 2>&1 &
+    echo "[tensorboard] http://$TB_HOST:$TB_PORT (pid=$!)"
+  else
+    echo "[warn] TensorBoard not available; install tensorboard to enable TB_AUTO" >&2
+  fi
+fi
+
 OLLAMA_URL=${OLLAMA_URL:-http://127.0.0.1:11434}
 OLLAMA_MODEL=${OLLAMA_MODEL:-qwen3:0.6b}
 

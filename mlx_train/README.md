@@ -39,6 +39,16 @@ bash scripts/run_mlx.sh
 tensorboard --logdir out/logs/mlx
 ```
 
+默认会自动启动 TensorBoard（`TB_AUTO=1`）。如需关闭或自定义端口：
+
+```bash
+# 关闭自动启动
+TB_AUTO=0 bash scripts/run_mlx.sh
+
+# 自定义 host/port
+TB_HOST=0.0.0.0 TB_PORT=6007 bash scripts/run_mlx.sh
+```
+
 可用 `TF_DIR` 自定义日志目录，或者设置为空关闭：
 
 ```bash

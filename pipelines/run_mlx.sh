@@ -90,6 +90,9 @@ Advanced:
   INF_TOP_P          Nucleus sampling threshold (default: 1.0)
   INF_MAX_SEQ        Max total tokens (prompt + generation) for infer (default: use checkpoint seq_len if available)
   TF_DIR             TensorBoard log root for MLX training (default: out/logs/<out_dir_basename>; set empty to disable)
+  TB_AUTO            Auto-start TensorBoard when training (default: 1; set 0 to disable)
+  TB_HOST            TensorBoard host (default: 127.0.0.1)
+  TB_PORT            TensorBoard port (default: 6006)
   INF_MODE           Demo mode for --infer-only (default: knowledge; other: bench)
   INF_SUITES         [bench mode] Suites (default: copy,json,sort,math_mcq,logic,qa,knowledge)
   INF_N              [bench mode] Examples per suite (default: 2)
@@ -520,6 +523,56 @@ if [ -n "$TF_DIR" ]; then
   TB_DPO_DIR="$TF_DIR/dpo"
   TB_R1_DIR="$TF_DIR/r1"
   mkdir -p "$TB_PRETRAIN_DIR" "$TB_SFT_DIR" "$TB_DPO_DIR" "$TB_R1_DIR"
+fi
+
+# [tb] auto-start
+TB_AUTO=${TB_AUTO:-1}
+TB_PORT=${TB_PORT:-6006}
+TB_HOST=${TB_HOST:-127.0.0.1}
+
+WILL_TRAIN=0
+if [ "$SKIP_PRETRAIN" -eq 0 ] || [ "$SKIP_SFT" -eq 0 ] || [ "$RUN_DPO" -eq 1 ] || [ "$RUN_R1" -eq 1 ]; then
+  WILL_TRAIN=1
+fi
+
+if [ -n "${TF_DIR:-}" ] && [ "$TB_AUTO" != "0" ] && [ "$WILL_TRAIN" -eq 1 ]; then
+  if "$PY" -m tensorboard --version >/dev/null 2>&1; then
+    TB_PORT_IN_USE=$("$PY" - "$TB_HOST" "$TB_PORT" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+sock = socket.socket()
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+try:
+    sock.bind((host, port))
+    print("0")
+except OSError:
+    print("1")
+finally:
+    sock.close()
+PY
+)
+    if [ "$TB_PORT_IN_USE" = "1" ]; then
+      TB_PORT=$("$PY" - "$TB_HOST" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+sock = socket.socket()
+sock.bind((host, 0))
+port = sock.getsockname()[1]
+sock.close()
+print(port)
+PY
+)
+    fi
+    "$PY" -m tensorboard --logdir "$TF_DIR" --host "$TB_HOST" --port "$TB_PORT" >/dev/null 2>&1 &
+    echo "[tensorboard] http://$TB_HOST:$TB_PORT (pid=$!)"
+  else
+    echo "[warn] TensorBoard not available; install tensorboard to enable TB_AUTO" >&2
+  fi
 fi
 
 latest_ckpt() {
