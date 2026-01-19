@@ -18,10 +18,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
 from dataset.lm_dataset import SFTDataset
 from trainer.loss_utils import compute_mtp_loss
+from trainer import checkpoint_manager
 
 warnings.filterwarnings('ignore')
 
 R1_SPECIAL_IDS = None
+training_state = {"global_step": 0, "step_in_epoch": 0}
+ckpt_root = None
 
 
 def Logger(content):
@@ -37,6 +40,8 @@ def train_epoch(epoch, wandb):
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
     for step, (X, Y, loss_mask) in enumerate(train_loader):
+        if step < training_state.get("step_in_epoch", 0):
+            continue
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device).float()
@@ -64,6 +69,7 @@ def train_epoch(epoch, wandb):
 
         scaler.scale(loss).backward()
 
+        did_update = False
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -72,6 +78,8 @@ def train_epoch(epoch, wandb):
             scaler.update()
 
             optimizer.zero_grad(set_to_none=True)
+            training_state["global_step"] += 1
+            did_update = True
 
         if step % args.log_interval == 0 or step == iter_per_epoch - 1:
             spend_time = time.time() - start_time
@@ -90,7 +98,10 @@ def train_epoch(epoch, wandb):
                            "lr": optimizer.param_groups[-1]['lr'],
                            "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
 
-        if ((step + 1) % args.save_interval == 0 or step == iter_per_epoch - 1) and (not ddp or dist.get_rank() == 0):
+        if (
+            (did_update and training_state["global_step"] % args.save_interval == 0)
+            or step == iter_per_epoch - 1
+        ) and (not ddp or dist.get_rank() == 0):
             model.eval()
             moe_path = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/reason_{lm_config.hidden_size}{moe_path}.pth'
@@ -102,6 +113,21 @@ def train_epoch(epoch, wandb):
 
             state_dict = {k: v.half() for k, v in state_dict.items()}  # 半精度保存
             torch.save(state_dict, ckp)
+            state = {
+                "epoch": epoch,
+                "step_in_epoch": step + 1,
+                "global_step": training_state["global_step"],
+                "args": vars(args),
+            }
+            checkpoint_manager.save_checkpoint(
+                ckpt_root=ckpt_root,
+                step=training_state["global_step"],
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                state=state,
+            )
+            checkpoint_manager.prune_checkpoints(ckpt_root, keep_last=args.keep_last_checkpoints)
             model.train()
 
 
@@ -109,7 +135,9 @@ def init_model(lm_config):
     tokenizer = AutoTokenizer.from_pretrained('./model')
     model = MiniLLMForCausalLM(lm_config)
     moe_path = '_moe' if lm_config.use_moe else ''
-    ckp = f'{args.save_dir}/rlhf_{lm_config.hidden_size}{moe_path}.pth'
+    ckp = args.pretrained_path or f'{args.save_dir}/rlhf_{lm_config.hidden_size}{moe_path}.pth'
+    if not os.path.exists(ckp):
+        raise FileNotFoundError(f"R1 requires DPO checkpoint at {ckp}")
     state_dict = torch.load(ckp, map_location=args.device)
     model.load_state_dict(state_dict, strict=False)
     Logger(f'LLM总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
@@ -146,6 +174,9 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_iters", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=1)
     parser.add_argument("--save_interval", type=int, default=50)
+    parser.add_argument("--resume", type=str, default=None, help="Path to step checkpoint dir")
+    parser.add_argument("--ckpt_dir", type=str, default=None, help="Root dir for step checkpoints")
+    parser.add_argument("--keep_last_checkpoints", type=int, default=3)
     parser.add_argument("--r1_token_weight", type=float, default=10.0, help="Loss weight multiplier for reasoning tokens.")
     parser.add_argument("--r1_tokens", type=str, default="<think>,</think>,<answer>,</answer>", help="Comma-separated reasoning tokens.")
     parser.add_argument('--local_rank', type=int, default=-1)
@@ -172,6 +203,8 @@ if __name__ == "__main__":
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
+    ckpt_root = args.ckpt_dir or os.path.join(args.out_dir, "checkpoints")
+    os.makedirs(ckpt_root, exist_ok=True)
     tokens_per_iter = args.batch_size * args.max_seq_len
     device_type = "cuda" if "cuda" in args.device else "cpu"
 
@@ -232,6 +265,30 @@ if __name__ == "__main__":
         model = DistributedDataParallel(model, device_ids=[ddp_local_rank])
 
     iter_per_epoch = len(train_loader)
-    for epoch in range(args.epochs):
+    training_state["global_step"] = 0
+    training_state["step_in_epoch"] = 0
+    if args.resume:
+        resume_state = checkpoint_manager.load_checkpoint(
+            ckpt_path=args.resume,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=str(args.device),
+        )
+        training_state["global_step"] = int(resume_state.get("global_step", 0))
+        training_state["step_in_epoch"] = int(resume_state.get("step_in_epoch", 0))
+        start_epoch = int(resume_state.get("epoch", 0))
+        Logger(
+            f"[resume] step={training_state['global_step']} epoch={start_epoch + 1} "
+            f"step_in_epoch={training_state['step_in_epoch']}"
+        )
+        if training_state["step_in_epoch"] >= iter_per_epoch:
+            start_epoch += 1
+            training_state["step_in_epoch"] = 0
+    else:
+        start_epoch = 0
+
+    for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         train_epoch(epoch, wandb)
+        training_state["step_in_epoch"] = 0

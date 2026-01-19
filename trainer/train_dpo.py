@@ -23,11 +23,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from model.model_minillm import MiniLLMConfig, MiniLLMForCausalLM
 from dataset.lm_dataset import DPODataset
 from checkpoint_loader import CheckpointLoader
+from trainer import checkpoint_manager
 
 warnings.filterwarnings('ignore')
 
 
 training_state = {"max_steps": None, "global_step": 0, "stop": False}
+ckpt_root = None
 
 
 def Logger(content):
@@ -75,6 +77,8 @@ def train_epoch(epoch, wandb):
         return
 
     for step, batch in enumerate(train_loader):
+        if step < training_state.get("step_in_epoch", 0):
+            continue
         if training_state["stop"]:
             break
         x_chosen = batch['x_chosen'].to(args.device)
@@ -106,12 +110,15 @@ def train_epoch(epoch, wandb):
 
         scaler.scale(loss).backward()
 
+        did_update = False
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            training_state["global_step"] += 1
+            did_update = True
 
         if step % args.log_interval == 0 or step == iter_per_epoch - 1:
             spend_time = time.time() - start_time
@@ -131,11 +138,14 @@ def train_epoch(epoch, wandb):
                            "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
 
             if writer is not None and (not ddp or dist.get_rank() == 0):
-                global_step = epoch * iter_per_epoch + step
+                global_step = training_state["global_step"]
                 writer.add_scalar("train/loss", loss.item() * args.accumulation_steps, global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[-1]['lr'], global_step)
 
-        if ((step + 1) % args.save_interval == 0 or step == iter_per_epoch - 1) and (not ddp or dist.get_rank() == 0):
+        if (
+            (did_update and training_state["global_step"] % args.save_interval == 0)
+            or step == iter_per_epoch - 1
+        ) and (not ddp or dist.get_rank() == 0):
             model.eval()
             moe_path = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/rlhf_{lm_config.hidden_size}{moe_path}.pth'
@@ -146,9 +156,23 @@ def train_epoch(epoch, wandb):
                 state_dict = model.state_dict()
             state_dict = {k: v.half() for k, v in state_dict.items()}  # 半精度保存
             torch.save(state_dict, ckp)
+            state = {
+                "epoch": epoch,
+                "step_in_epoch": step + 1,
+                "global_step": training_state["global_step"],
+                "args": vars(args),
+            }
+            checkpoint_manager.save_checkpoint(
+                ckpt_root=ckpt_root,
+                step=training_state["global_step"],
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                state=state,
+            )
+            checkpoint_manager.prune_checkpoints(ckpt_root, keep_last=args.keep_last_checkpoints)
             model.train()
 
-        training_state["global_step"] += 1
         max_steps = training_state["max_steps"]
         if max_steps is not None and training_state["global_step"] >= max_steps:
             Logger(f"[smoke] Reached max_steps={max_steps}, stopping early")
@@ -223,6 +247,9 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_iters", type=int, default=0)
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--save_interval", type=int, default=100)
+    parser.add_argument("--resume", type=str, default=None, help="Path to step checkpoint dir")
+    parser.add_argument("--ckpt_dir", type=str, default=None, help="Root dir for step checkpoints")
+    parser.add_argument("--keep_last_checkpoints", type=int, default=3)
     parser.add_argument("--dpo_beta", type=float, default=0.1, help="DPO temperature beta.")
     parser.add_argument('--local_rank', type=int, default=-1)
     parser.add_argument('--hidden_size', default=512, type=int)
@@ -251,6 +278,8 @@ if __name__ == "__main__":
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
+    ckpt_root = args.ckpt_dir or os.path.join(args.out_dir, "checkpoints")
+    os.makedirs(ckpt_root, exist_ok=True)
     tokens_per_iter = args.batch_size * args.max_seq_len
     device_type = "cuda" if "cuda" in args.device else "cpu"
 
@@ -310,8 +339,30 @@ if __name__ == "__main__":
     training_state["max_steps"] = args.max_steps
     training_state["global_step"] = 0
     training_state["stop"] = False
+    training_state["step_in_epoch"] = 0
 
-    for epoch in range(args.epochs):
+    if args.resume:
+        resume_state = checkpoint_manager.load_checkpoint(
+            ckpt_path=args.resume,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=str(args.device),
+        )
+        training_state["global_step"] = int(resume_state.get("global_step", 0))
+        training_state["step_in_epoch"] = int(resume_state.get("step_in_epoch", 0))
+        start_epoch = int(resume_state.get("epoch", 0))
+        Logger(
+            f"[resume] step={training_state['global_step']} epoch={start_epoch + 1} "
+            f"step_in_epoch={training_state['step_in_epoch']}"
+        )
+        if training_state["step_in_epoch"] >= iter_per_epoch:
+            start_epoch += 1
+            training_state["step_in_epoch"] = 0
+    else:
+        start_epoch = 0
+
+    for epoch in range(start_epoch, args.epochs):
         if training_state["stop"]:
             break
         train_sampler and train_sampler.set_epoch(epoch)
@@ -319,6 +370,7 @@ if __name__ == "__main__":
         if training_state["stop"]:
             Logger("[smoke] Early stop triggered, exiting training loop")
             break
+        training_state["step_in_epoch"] = 0
 
     if writer is not None:
         writer.flush()
