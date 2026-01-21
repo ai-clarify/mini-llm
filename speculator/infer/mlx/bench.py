@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from mlx_train.stats import _find_latest_checkpoint as _find_latest_checkpoint_impl
 from speculator.infer.mlx.common import (
     SpecStats,
     _apply_chat_template,
@@ -31,7 +32,6 @@ from speculator.infer.mlx.common import (
     speculative_decode_with_trace,
 )
 from speculator.infer.prompt_utils import load_prompt_messages, resolve_prompts_jsonl
-from mlx_train.stats import _find_latest_checkpoint as _find_latest_checkpoint_impl
 
 
 @dataclass(frozen=True)
@@ -357,7 +357,9 @@ def _run_baseline_qwen3(
     elapsed = time.perf_counter() - start
     num_input = len(input_ids)
     num_output = max(len(output_ids) - num_input, 0)
-    return BenchResult(num_input, num_output, elapsed), (output_ids if return_output_ids else None)
+    return BenchResult(num_input, num_output, elapsed), (
+        output_ids if return_output_ids else None
+    )
 
 
 def _run_spec_qwen3(
@@ -431,7 +433,9 @@ def _run_baseline_minillm(
     elapsed = time.perf_counter() - start
     num_input = len(input_ids)
     num_output = max(len(output_ids) - num_input, 0)
-    return BenchResult(num_input, num_output, elapsed), (output_ids if return_output_ids else None)
+    return BenchResult(num_input, num_output, elapsed), (
+        output_ids if return_output_ids else None
+    )
 
 
 def _run_spec_minillm(
@@ -511,7 +515,7 @@ def main() -> None:
     parser.add_argument("--prompts_jsonl", type=str, default=None)
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=32)
-    parser.add_argument("--max_new_tokens", type=int, default=512)
+    parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0)
     parser.add_argument("--top_p", type=float, default=1)
     parser.add_argument(
@@ -725,7 +729,9 @@ def main() -> None:
 
                 if output_logger is not None and baseline_ids is not None:
                     prompt_len = len(input_ids)
-                    baseline_text = _decode_generated(tokenizer, baseline_ids, prompt_len)
+                    baseline_text = _decode_generated(
+                        tokenizer, baseline_ids, prompt_len
+                    )
                     spec_text = (
                         _decode_generated(tokenizer, spec_ids, prompt_len)
                         if spec_ids is not None
