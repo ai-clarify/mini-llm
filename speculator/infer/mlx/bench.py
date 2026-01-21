@@ -515,7 +515,7 @@ def main() -> None:
     parser.add_argument("--prompts_jsonl", type=str, default=None)
     parser.add_argument("--system", type=str, default=None)
     parser.add_argument("--max_samples", type=int, default=32)
-    parser.add_argument("--max_new_tokens", type=int, default=4096)
+    parser.add_argument("--max_new_tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0)
     parser.add_argument("--top_p", type=float, default=1)
     parser.add_argument(
