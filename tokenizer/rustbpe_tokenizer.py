@@ -6,7 +6,7 @@ import os
 import pickle
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterable, List, Sequence, Tuple, cast
+from typing import Any, Iterable, List, Optional, Sequence, Tuple, cast
 
 import rustbpe  # type: ignore
 import tiktoken  # type: ignore
@@ -33,9 +33,27 @@ SPLIT_PATTERN = (
 class RustBPETokenizer:
     """Wrapper around rustbpe (training) + tiktoken (fast inference)."""
 
-    def __init__(self, encoding: tiktoken.Encoding, bos_token: str = "<|bos|>") -> None:
+    def __init__(
+        self,
+        encoding: tiktoken.Encoding,
+        bos_token: str = "<|bos|>",
+        *,
+        pad_token: Optional[str] = None,
+        eos_token: Optional[str] = None,
+    ) -> None:
         self.enc = encoding
-        self.bos_token_id = self.encode_special(bos_token)
+        self.bos_token = bos_token
+        self.pad_token = pad_token or bos_token
+        self.eos_token = eos_token
+        self.assistant_start_token = "<|assistant_start|>"
+        self.assistant_end_token = "<|assistant_end|>"
+        self.user_start_token = "<|user_start|>"
+        self.user_end_token = "<|user_end|>"
+        self.bos_token_id = self._encode_optional(self.bos_token)
+        self.pad_token_id = self._encode_optional(self.pad_token)
+        self.eos_token_id = self._encode_optional(self.eos_token)
+        self.all_special_ids = [self.encode_special(tok) for tok in SPECIAL_TOKENS]
+        self.vocab_size = self.enc.n_vocab
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -103,11 +121,46 @@ class RustBPETokenizer:
     def encode_special(self, token: str) -> int:
         return self.enc.encode_single_token(token)
 
-    def encode(self, text: str, *, num_threads: int = 8) -> List[int]:
+    def _encode_optional(self, token: Optional[str]) -> Optional[int]:
+        if token is None:
+            return None
+        try:
+            return self.encode_special(token)
+        except Exception:
+            return None
+
+    def encode(
+        self, text: str, *, num_threads: int = 8, add_special_tokens: Optional[bool] = None
+    ) -> List[int]:
+        _ = add_special_tokens
         return self.enc.encode_ordinary(text, num_threads=num_threads)
 
-    def decode(self, ids: Sequence[int]) -> str:
-        return self.enc.decode(ids)
+    def decode(self, ids: Sequence[int], *, skip_special_tokens: bool = False) -> str:
+        if not skip_special_tokens:
+            return self.enc.decode(ids)
+        specials = set(self.all_special_ids)
+        filtered = [int(t) for t in ids if int(t) not in specials]
+        return self.enc.decode(filtered)
+
+    def convert_ids_to_tokens(self, ids: Sequence[int]) -> List[str]:
+        return [self.enc.decode([int(t)]) for t in ids]
+
+    def apply_chat_template(
+        self,
+        messages: Sequence[Message | dict],
+        *,
+        tokenize: bool = False,
+        add_generation_prompt: bool = False,
+        **_: Any,
+    ) -> str | List[int]:
+        text = self.render_prompt_text(messages, include_bos=False)
+        if add_generation_prompt:
+            if text:
+                text += "\n"
+            text += self.assistant_start_token
+        if tokenize:
+            return self.encode(text, add_special_tokens=False)
+        return text
 
     # ------------------------------------------------------------------
     def render_conversation(

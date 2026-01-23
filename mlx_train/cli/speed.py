@@ -92,10 +92,11 @@ def _loss_fn(
     hidden = model.model(x)  # [B, T, H]
     return chunked_ce_loss(
         hidden=hidden,
-        lm_head_weight=model.model.embed_tokens.weight,
+        lm_head_weight=model.lm_head_weight(),
         labels=y,
         loss_mask=loss_mask,
         chunk_size=int(logits_chunk_size),
+        logit_softcap=float(model.config.logit_softcap),
     )
 
 
@@ -112,11 +113,12 @@ def _sparse_loss_fn(
     hidden = model.model(x)  # [B, T, H]
     return sparse_ce_loss(
         hidden=hidden,
-        lm_head_weight=model.model.embed_tokens.weight,
+        lm_head_weight=model.lm_head_weight(),
         labels=y,
         label_positions=label_positions,
         label_pos_mask=label_pos_mask,
         chunk_size=int(logits_chunk_size),
+        logit_softcap=float(model.config.logit_softcap),
     )
 
 
@@ -487,7 +489,7 @@ def main() -> None:
 
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.1)
-    parser.add_argument("--optimizer", type=str, choices=["adamw", "adafactor", "lion"], default="adamw")
+    parser.add_argument("--optimizer", type=str, choices=["adamw", "adafactor", "lion", "muon"], default="adamw")
     parser.add_argument(
         "--optim_state_dtype",
         type=str,

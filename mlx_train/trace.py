@@ -4,7 +4,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TypeVar
 
 import mlx.core as mx
 
@@ -323,6 +323,86 @@ class ActivationTracer:
         return out
 
 
+def _flatten_arrays(obj: Any) -> List[mx.array]:
+    if isinstance(obj, mx.array):
+        return [obj]
+    if isinstance(obj, dict):
+        out: List[mx.array] = []
+        for v in obj.values():
+            out.extend(_flatten_arrays(v))
+        return out
+    if isinstance(obj, (list, tuple)):
+        out = []
+        for v in obj:
+            out.extend(_flatten_arrays(v))
+        return out
+    return []
+
+
+class TimingTracer:
+    def __init__(self, *, record_memory: bool = False) -> None:
+        self.created_at_s = time.time()
+        self.record_memory = bool(record_memory)
+        self.events: List[Dict[str, Any]] = []
+        self.prefix = ""
+
+    def set_prefix(self, prefix: Optional[str]) -> None:
+        self.prefix = str(prefix) if prefix else ""
+
+    def start(self) -> float:
+        return time.perf_counter()
+
+    def end(
+        self,
+        name: str,
+        t0: float,
+        *,
+        arrays: Optional[Sequence[Any]] = None,
+        depth: int = 0,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> float:
+        if arrays:
+            flat = []
+            for item in arrays:
+                flat.extend(_flatten_arrays(item))
+            if flat:
+                mx.eval(*flat)
+        ms = (time.perf_counter() - float(t0)) * 1000.0
+        event: Dict[str, Any] = {
+            "name": f"{self.prefix}/{name}" if self.prefix else str(name),
+            "ms": float(ms),
+            "depth": int(depth),
+        }
+        if meta:
+            event["meta"] = meta
+        if self.record_memory:
+            try:
+                event["active_mem_mib"] = float(mx.get_active_memory()) / 1024.0 / 1024.0
+                event["peak_mem_mib"] = float(mx.get_peak_memory()) / 1024.0 / 1024.0
+            except Exception:
+                pass
+        self.events.append(event)
+        return ms
+
+    def summary(self, *, top_n: int = 12) -> List[Tuple[str, float]]:
+        totals: Dict[str, float] = {}
+        for event in self.events:
+            name = str(event.get("name", ""))
+            totals[name] = totals.get(name, 0.0) + float(event.get("ms", 0.0))
+        pairs = sorted(totals.items(), key=lambda x: x[1], reverse=True)
+        return pairs[: max(0, int(top_n))]
+
+    def to_dict(self, *, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return {
+            "meta": {
+                "created_at_s": float(self.created_at_s),
+                "record_memory": bool(self.record_memory),
+                **(meta or {}),
+            },
+            "events": list(self.events),
+        }
+
+
 def render_trace_html(trace: Dict[str, Any]) -> str:
     # Minimal self-contained HTML report (no external deps).
     payload = json.dumps(trace, ensure_ascii=False)
@@ -630,3 +710,14 @@ def write_trace_outputs(*, out_path: str | Path, trace: Dict[str, Any]) -> Tuple
     json_path.write_text(json.dumps(trace, ensure_ascii=False, indent=2), encoding="utf-8")
     html_path.write_text(render_trace_html(trace), encoding="utf-8")
     return json_path, html_path
+
+
+def write_timing_trace(*, out_path: str | Path, trace: Dict[str, Any]) -> Path:
+    out = Path(out_path)
+    if out.suffix.lower() == ".json":
+        json_path = out
+    else:
+        out.mkdir(parents=True, exist_ok=True)
+        json_path = out / "timing.json"
+    json_path.write_text(json.dumps(trace, ensure_ascii=False, indent=2), encoding="utf-8")
+    return json_path

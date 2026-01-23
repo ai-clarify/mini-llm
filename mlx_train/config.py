@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, fields
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -25,6 +25,8 @@ class MiniLLMConfig:
     inference_rope_scaling: bool = False
     attention_dropout: float = 0.0
     attention_bias: bool = False
+    logit_softcap: float = 0.0
+    tie_word_embeddings: bool = True
 
     # MLA
     q_lora_rank: int = 256
@@ -32,6 +34,15 @@ class MiniLLMConfig:
     qk_nope_head_dim: int = 64
     qk_rope_head_dim: int = 32
     v_head_dim: int = 64
+    qk_norm: bool = False
+    qk_norm_eps: float = 1e-6
+    value_mix: float = 0.0
+    partial_key_offset: int = 0
+    paired_heads: bool = False
+    attn_window: int = 0
+    attn_global_tokens: int = 0
+    sparse_attn_gate: bool = False
+    sparse_attn_gate_topk: int = 0
 
     # MoE
     use_moe: bool = False
@@ -53,6 +64,34 @@ class MiniLLMConfig:
     num_nextn_predict_layers: int = 1
     mtp_intermediate_size: Optional[int] = None
     mtp_loss_weight: float = 0.1
+
+    # Residual scaling / init
+    residual_scale: float = 1.0
+    residual_decay: float = 0.0
+    zero_init_residual: bool = False
+
+    # Skip/value embedding tricks
+    embed_skip_scale: float = 0.0
+    embed_skip_gate: bool = False
+    skip_connections: Optional[List[List[int]]] = None
+    skip_scale: float = 1.0
+    skip_gate: bool = False
+    value_embed_count: int = 0
+    value_embed_scale: float = 0.0
+    value_embed_gate: bool = False
+    value_embed_repeat_ends: bool = True
+
+    # Input augmentation
+    smear: bool = False
+    smear_scale: float = 0.0
+    bigram_hash_size: int = 0
+    bigram_hash_scale: float = 0.0
+    bigram_hash_base: int = 1000003
+
+    # Back-out / untying schedule
+    back_out_ratio: float = 0.0
+    back_out_scale: float = 1.0
+    untie_lm_head_at_ratio: float = 0.0
 
     # DSA / indexer (optional)
     index_n_heads: int = 0

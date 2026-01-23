@@ -6,6 +6,10 @@ import os
 import random
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, cast
+import mmap
+import sys
+from array import array
+from pathlib import Path
 
 
 def resolve_jsonl_paths(data_path: str) -> List[str]:
@@ -23,6 +27,230 @@ def resolve_jsonl_paths(data_path: str) -> List[str]:
     if not paths:
         raise FileNotFoundError(f"No JSONL files found from: {data_path}")
     return paths
+
+
+def detect_bin_format(path: str) -> Optional[str]:
+    p = str(path)
+    if p.endswith(".ids2d.bin") or p.endswith(".ids2d.idx"):
+        return "bin2d"
+    if p.endswith(".ids.bin") or p.endswith(".ids.idx"):
+        return "bin"
+    if p.endswith(".meta.json"):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            fmt = str(meta.get("format", "bin")).lower()
+            if fmt in ("bin", "bin2d"):
+                return fmt
+        except Exception:
+            return "bin"
+    return None
+
+
+def looks_like_bin_path(path: str) -> bool:
+    return detect_bin_format(path) is not None
+
+
+def resolve_bin_prefix(path: str) -> str:
+    p = str(path)
+    if p.endswith(".meta.json"):
+        return p[: -len(".meta.json")]
+    if p.endswith(".ids.bin"):
+        return p[: -len(".ids.bin")]
+    if p.endswith(".ids.idx"):
+        return p[: -len(".ids.idx")]
+    return p
+
+
+class BinDataset:
+    def __init__(self, prefix: str, *, cache: str = "mmap") -> None:
+        if cache not in ("mmap", "memory"):
+            raise ValueError(f"cache must be 'mmap' or 'memory', got {cache}")
+
+        prefix = resolve_bin_prefix(prefix)
+        meta_path = Path(prefix + ".meta.json")
+        if meta_path.exists():
+            with meta_path.open("r", encoding="utf-8") as f:
+                meta = json.load(f)
+            base_dir = meta_path.parent
+            ids_bin = base_dir / str(meta["ids"]["bin"])
+            ids_idx = base_dir / str(meta["ids"]["idx"])
+            labels = meta.get("labels")
+            lbl_bin = base_dir / str(labels["bin"]) if labels and labels.get("bin") else None
+            lbl_idx = base_dir / str(labels["idx"]) if labels and labels.get("idx") else None
+            byteorder = str(meta.get("byteorder", "little"))
+        else:
+            ids_bin = Path(prefix + ".ids.bin")
+            ids_idx = Path(prefix + ".ids.idx")
+            lbl_bin = Path(prefix + ".lbl.bin")
+            lbl_idx = Path(prefix + ".lbl.idx")
+            byteorder = "little"
+
+        if not ids_bin.exists() or not ids_idx.exists():
+            raise FileNotFoundError(f"Missing bin dataset files for prefix={prefix}")
+
+        self.byteorder = byteorder
+        self.ids_bin_path = ids_bin
+        self.ids_idx_path = ids_idx
+        self.lbl_bin_path = lbl_bin if lbl_bin and lbl_bin.exists() else None
+        self.lbl_idx_path = lbl_idx if lbl_idx and lbl_idx.exists() else None
+
+        self._ids_idx = self._load_idx(self.ids_idx_path)
+        self._ids_buf = self._open_bin(self.ids_bin_path, cache=cache)
+
+        self._lbl_idx = None
+        self._lbl_buf = None
+        if self.lbl_bin_path and self.lbl_idx_path:
+            self._lbl_idx = self._load_idx(self.lbl_idx_path)
+            self._lbl_buf = self._open_bin(self.lbl_bin_path, cache=cache)
+
+    def __len__(self) -> int:
+        return len(self._ids_idx) // 2
+
+    def _load_idx(self, path: Path) -> array:
+        data = array("Q")
+        with path.open("rb") as f:
+            data.fromfile(f, path.stat().st_size // data.itemsize)
+        if self.byteorder != sys.byteorder:
+            data.byteswap()
+        return data
+
+    def _open_bin(self, path: Path, *, cache: str) -> memoryview:
+        if cache == "memory":
+            raw = path.read_bytes()
+            return memoryview(raw)
+        f = path.open("rb")
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        return memoryview(mm)
+
+    def get_ids(self, idx: int) -> Sequence[int]:
+        off = int(self._ids_idx[2 * idx])
+        length = int(self._ids_idx[2 * idx + 1])
+        start = off * 4
+        end = (off + length) * 4
+        view = self._ids_buf[start:end].cast("I")
+        if self.byteorder != sys.byteorder:
+            tmp = array("I", view)
+            tmp.byteswap()
+            return tmp
+        return view
+
+    def get_label_pos(self, idx: int) -> Optional[List[int]]:
+        if self._lbl_idx is None or self._lbl_buf is None:
+            return None
+        off = int(self._lbl_idx[2 * idx])
+        length = int(self._lbl_idx[2 * idx + 1])
+        start = off * 4
+        end = (off + length) * 4
+        view = self._lbl_buf[start:end].cast("I")
+        if self.byteorder != sys.byteorder:
+            tmp = array("I", view)
+            tmp.byteswap()
+            return list(tmp)
+        return list(view)
+
+
+class Bin2DDataset:
+    def __init__(self, prefix: str, *, cache: str = "mmap") -> None:
+        if cache not in ("mmap", "memory"):
+            raise ValueError(f"cache must be 'mmap' or 'memory', got {cache}")
+        prefix = resolve_bin_prefix(prefix)
+        meta_path = Path(prefix + ".meta.json")
+        if not meta_path.exists():
+            raise FileNotFoundError(f"Missing meta.json for bin2d dataset: {meta_path}")
+        with meta_path.open("r", encoding="utf-8") as f:
+            meta = json.load(f)
+        fmt = str(meta.get("format", "bin2d")).lower()
+        if fmt != "bin2d":
+            raise ValueError(f"meta format={fmt} is not bin2d")
+        base_dir = meta_path.parent
+        ids_bin = base_dir / str(meta["ids"]["bin"])
+        lbl = meta.get("labels")
+        lbl_bin = base_dir / str(lbl["bin"]) if lbl and lbl.get("bin") else None
+        lbl_idx = base_dir / str(lbl["idx"]) if lbl and lbl.get("idx") else None
+        if not ids_bin.exists():
+            raise FileNotFoundError(f"Missing ids bin: {ids_bin}")
+
+        self.ids_bin_path = ids_bin
+        self.lbl_bin_path = lbl_bin if lbl_bin and lbl_bin.exists() else None
+        self.lbl_idx_path = lbl_idx if lbl_idx and lbl_idx.exists() else None
+        self.byteorder = str(meta.get("byteorder", "little"))
+        self.seq_len = int(meta["seq_len"])
+        self.stride = int(meta.get("stride", self.seq_len + 1))
+        self.num_samples = int(meta["num_samples"])
+
+        self._ids_buf = self._open_bin(self.ids_bin_path, cache=cache)
+        if self._ids_buf.nbytes < self.num_samples * self.stride * 4:
+            raise ValueError("bin2d ids.bin is smaller than expected from meta")
+
+        self._lbl_idx = None
+        self._lbl_buf = None
+        if self.lbl_bin_path and self.lbl_idx_path:
+            self._lbl_idx = self._load_idx(self.lbl_idx_path)
+            self._lbl_buf = self._open_bin(self.lbl_bin_path, cache=cache)
+
+    def _load_idx(self, path: Path) -> array:
+        data = array("Q")
+        with path.open("rb") as f:
+            data.fromfile(f, path.stat().st_size // data.itemsize)
+        if self.byteorder != sys.byteorder:
+            data.byteswap()
+        return data
+
+    def _open_bin(self, path: Path, *, cache: str) -> memoryview:
+        if cache == "memory":
+            raw = path.read_bytes()
+            return memoryview(raw)
+        f = path.open("rb")
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        return memoryview(mm)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def get_ids(self, idx: int) -> Sequence[int]:
+        start = int(idx) * int(self.stride) * 4
+        end = start + int(self.stride) * 4
+        view = self._ids_buf[start:end].cast("I")
+        if self.byteorder != sys.byteorder:
+            tmp = array("I", view)
+            tmp.byteswap()
+            return tmp
+        return view
+
+    def get_label_pos(self, idx: int) -> Optional[List[int]]:
+        if self._lbl_idx is None or self._lbl_buf is None:
+            return None
+        off = int(self._lbl_idx[2 * idx])
+        length = int(self._lbl_idx[2 * idx + 1])
+        start = off * 4
+        end = (off + length) * 4
+        view = self._lbl_buf[start:end].cast("I")
+        if self.byteorder != sys.byteorder:
+            tmp = array("I", view)
+            tmp.byteswap()
+            return list(tmp)
+        return list(view)
+
+
+def iter_bin_dataset(dataset: BinDataset) -> Iterator[Dict[str, Any]]:
+    for i in range(len(dataset)):
+        ids = dataset.get_ids(i)
+        item: Dict[str, Any] = {"ids": ids}
+        pos = dataset.get_label_pos(i)
+        if pos is not None:
+            item["label_pos"] = pos
+        yield item
+
+
+def iter_bin2d_dataset(dataset: Bin2DDataset) -> Iterator[Dict[str, Any]]:
+    for i in range(len(dataset)):
+        ids = dataset.get_ids(i)
+        item: Dict[str, Any] = {"ids": ids}
+        pos = dataset.get_label_pos(i)
+        if pos is not None:
+            item["label_pos"] = pos
+        yield item
 
 
 def iter_jsonl(paths: Sequence[str]) -> Iterator[Dict[str, Any]]:
@@ -110,6 +338,58 @@ def _pad_or_truncate(ids: List[int], *, length: int, pad_id: int) -> List[int]:
     if len(ids) >= length:
         return ids[:length]
     return ids + [pad_id] * (length - len(ids))
+
+
+def pack_pretrain_ids(
+    ids_iter: Iterable[List[int]],
+    *,
+    seq_len: int,
+    pad_id: int,
+    eos_id: Optional[int],
+    add_eos: bool,
+    allow_doc_split: bool,
+) -> Iterator[List[int]]:
+    """
+    Pack variable-length pretrain token IDs into fixed-size sequences.
+
+    Complexity: O(N) time, O(seq_len) space for total tokens N.
+    """
+    max_len = int(seq_len) + 1
+    if max_len <= 1:
+        raise ValueError("seq_len must be > 0 for packing")
+    cur: List[int] = []
+    for ids in ids_iter:
+        if not ids:
+            continue
+        if add_eos and eos_id is not None:
+            if ids[-1] != int(eos_id):
+                ids = list(ids) + [int(eos_id)]
+        if not bool(allow_doc_split):
+            if len(ids) > max_len:
+                ids = ids[:max_len]
+            if len(cur) + len(ids) > max_len:
+                if cur:
+                    yield _pad_or_truncate(cur, length=max_len, pad_id=pad_id)
+                cur = []
+            cur.extend(ids)
+            if len(cur) >= max_len:
+                yield cur[:max_len]
+                cur = []
+        else:
+            while ids:
+                space = max_len - len(cur)
+                if space <= 0:
+                    yield cur[:max_len]
+                    cur = []
+                    space = max_len
+                take = ids[:space]
+                cur.extend(take)
+                ids = ids[space:]
+                if len(cur) >= max_len:
+                    yield cur[:max_len]
+                    cur = []
+    if cur:
+        yield _pad_or_truncate(cur, length=max_len, pad_id=pad_id)
 
 
 def _generate_sft_loss_mask(input_ids: Sequence[int], bos_id: Sequence[int], eos_id: Sequence[int], max_length: int) -> List[int]:
@@ -215,6 +495,31 @@ def tokenize_sft_from_ids(
     return x, y, mask
 
 
+def tokenize_sft_from_ids_fast(
+    *,
+    ids: Sequence[int],
+    seq_len: int,
+    pad_id: int,
+) -> Tuple[List[int], List[int]]:
+    ids_list = _pad_or_truncate(list(ids), length=seq_len + 1, pad_id=pad_id)
+    x = ids_list[:-1]
+    y = ids_list[1:]
+    return x, y
+
+
+def tokenize_sft_from_ids_fixed(
+    *,
+    ids: Sequence[int],
+) -> Tuple[List[int], List[int]]:
+    if len(ids) < 2:
+        raise ValueError("ids must contain at least 2 tokens for fixed-length slicing.")
+    if isinstance(ids, list):
+        ids_list = ids
+    else:
+        ids_list = list(ids)
+    return ids_list[:-1], ids_list[1:]
+
+
 def _pick_bucket(seq_len: int, buckets: Sequence[int]) -> int:
     if seq_len <= 0:
         return int(buckets[0])
@@ -227,6 +532,8 @@ def _pick_bucket(seq_len: int, buckets: Sequence[int]) -> int:
 def make_batch_iterator(
     *,
     paths: Sequence[str],
+    bin_dataset: Optional[BinDataset] = None,
+    bin2d_dataset: Optional[Bin2DDataset] = None,
     pretokenized: Optional[Sequence[Dict[str, Any]]] = None,
     tokenizer,
     task: str,
@@ -245,7 +552,12 @@ def make_batch_iterator(
         bos_id = tokenizer.encode(f"{tokenizer.bos_token}assistant", add_special_tokens=False)
         eos_id = tokenizer.encode(f"{tokenizer.eos_token}", add_special_tokens=False)
 
-    stream: Iterable[Dict[str, Any]] = pretokenized if pretokenized is not None else iter_jsonl(paths)
+    if bin2d_dataset is not None:
+        stream = iter_bin2d_dataset(bin2d_dataset)
+    elif bin_dataset is not None:
+        stream = iter_bin_dataset(bin_dataset)
+    else:
+        stream = pretokenized if pretokenized is not None else iter_jsonl(paths)
     stream = shuffle_stream(stream, buffer_size=shuffle_buffer, seed=seed)
 
     cur_x: List[List[int]] = []
@@ -279,6 +591,8 @@ def make_batch_iterator(
 def make_microbatch_iterator(
     *,
     paths: Sequence[str],
+    bin_dataset: Optional[BinDataset] = None,
+    bin2d_dataset: Optional[Bin2DDataset] = None,
     tokenizer,
     task: str,
     seq_len: int,
@@ -290,6 +604,11 @@ def make_microbatch_iterator(
     return_label_positions: bool = False,
     label_bucket_sizes: Optional[Sequence[int]] = None,
     pretokenized: Optional[Sequence[Dict[str, Any]]] = None,
+    pack_sequences: bool = False,
+    pack_eos: bool = True,
+    pack_no_doc_split: bool = False,
+    max_doc_tokens: int = 0,
+    drop_long: bool = False,
 ) -> Iterator[MicroBatchGroup]:
     """
     Yield groups of `accum_steps` micro-batches with the same padded `seq_len`.
@@ -300,6 +619,9 @@ def make_microbatch_iterator(
     If `return_label_positions` is True, the iterator also groups by the number of
     loss tokens (bucketed via `label_bucket_sizes`) and returns per-sample padded
     label positions + masks to enable sparse masked-loss computation.
+
+    If `pack_sequences` is True (pretrain only), pack multiple documents into a
+    fixed-length sequence to reduce padding. `pack_eos` appends EOS between docs.
     """
     if accum_steps <= 0:
         raise ValueError("accum_steps must be > 0")
@@ -351,8 +673,50 @@ def make_microbatch_iterator(
         bos_id = tokenizer.encode(f"{tokenizer.bos_token}assistant", add_special_tokens=False)
         eos_id = tokenizer.encode(f"{tokenizer.eos_token}", add_special_tokens=False)
 
-    stream: Iterable[Dict[str, Any]] = pretokenized if pretokenized is not None else iter_jsonl(paths)
+    if bin_dataset is not None:
+        stream = iter_bin_dataset(bin_dataset)
+    else:
+        stream = pretokenized if pretokenized is not None else iter_jsonl(paths)
     stream = shuffle_stream(stream, buffer_size=shuffle_buffer, seed=seed)
+
+    max_doc = int(max_doc_tokens)
+    use_pack = bool(pack_sequences) and str(task) == "pretrain"
+    eos_token_id = tokenizer.eos_token_id
+
+    def _clip_ids(ids: List[int]) -> Optional[List[int]]:
+        if max_doc > 0 and len(ids) > max_doc:
+            if bool(drop_long):
+                return None
+            ids = ids[:max_doc]
+        return ids
+
+    def iter_ids() -> Iterator[List[int]]:
+        for obj in stream:
+            ids = _encode_sample(obj, tokenizer=tokenizer, task=task)
+            ids = _clip_ids(ids)
+            if ids is None:
+                continue
+            yield ids
+
+    if bin2d_dataset is not None:
+        if int(max_seq_len) != int(bin2d_dataset.seq_len):
+            raise ValueError(
+                f"bin2d seq_len={bin2d_dataset.seq_len} != requested seq_len={max_seq_len}"
+            )
+        ids_iter = iter_bin2d_dataset(bin2d_dataset)
+    elif bin_dataset is not None:
+        ids_iter = iter_bin_dataset(bin_dataset)
+    elif use_pack:
+        ids_iter = pack_pretrain_ids(
+            iter_ids(),
+            seq_len=int(max_seq_len),
+            pad_id=int(pad_id),
+            eos_id=eos_token_id,
+            add_eos=bool(pack_eos),
+            allow_doc_split=not bool(pack_no_doc_split),
+        )
+    else:
+        ids_iter = iter_ids()
 
     buffers: Dict[int, List[Tuple[List[int], List[int], List[int]]]] = {b: [] for b in buckets}
     buffers2: Dict[Tuple[int, int], List[Tuple[List[int], List[int], List[int], List[int], List[int]]]] = {}
@@ -404,27 +768,59 @@ def make_microbatch_iterator(
             label_pos_mask=pms,
         )
 
-    for obj in stream:
-        ids = _encode_sample(obj, tokenizer=tokenizer, task=task)
-        ids = ids[: max_seq_len + 1]
+    for obj in ids_iter:
+        label_pos_obj: Optional[List[int]] = None
+        if isinstance(obj, dict) and "ids" in obj:
+            raw_ids = obj["ids"]
+            if isinstance(raw_ids, (array, memoryview)):
+                ids = raw_ids
+            else:
+                ids = [int(t) for t in cast(Sequence[Any], raw_ids)]
+            if "label_pos" in obj:
+                label_pos_obj = [int(t) for t in cast(Sequence[Any], obj["label_pos"])]
+        else:
+            ids = obj if isinstance(obj, (array, memoryview)) else list(cast(List[int], obj))
+
+        if bin2d_dataset is None:
+            ids = ids[: max_seq_len + 1]
         b = _pick_bucket(max(1, len(ids) - 1), buckets)
 
         if task == "pretrain":
             x, y, m = tokenize_pretrain_from_ids(ids=ids, seq_len=int(b), pad_id=pad_id)
         elif task in ("sft", "r1"):
-            x, y, m = tokenize_sft_from_ids(
-                ids=ids,
-                seq_len=int(b),
-                pad_id=pad_id,
-                bos_id=bos_id or [],
-                eos_id=eos_id or [],
-            )
+            if bin2d_dataset is not None:
+                x, y = tokenize_sft_from_ids_fixed(ids=ids)
+                if return_label_positions and label_pos_obj is not None:
+                    m = [0] * len(y)
+                else:
+                    loss_mask = _generate_sft_loss_mask(ids, bos_id or [], eos_id or [], len(ids))
+                    m = loss_mask[1:]
+            else:
+                if return_label_positions and label_pos_obj is not None:
+                    x, y = tokenize_sft_from_ids_fast(
+                        ids=ids,
+                        seq_len=int(b),
+                        pad_id=pad_id,
+                    )
+                    m = [0] * len(y)
+                else:
+                    x, y, m = tokenize_sft_from_ids(
+                        ids=ids,
+                        seq_len=int(b),
+                        pad_id=pad_id,
+                        bos_id=bos_id or [],
+                        eos_id=eos_id or [],
+                    )
         else:
             raise ValueError(f"Unknown task: {task}")
 
         if return_label_positions:
             assert label_buckets is not None
-            pos = [i for i, v in enumerate(m) if int(v) != 0]
+            if label_pos_obj is None:
+                pos = [i for i, v in enumerate(m) if int(v) != 0]
+            else:
+                limit = max(1, len(y))
+                pos = [i for i in label_pos_obj if int(i) < limit]
             n = len(pos)
             l = _pick_bucket(max(1, n), label_buckets)
             if n > int(l):

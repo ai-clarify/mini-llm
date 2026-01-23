@@ -853,19 +853,14 @@ def run_mlx(
     *,
     checkpoint_dir: Path,
     tokenizer_path: str,
+    tokenizer_type: str,
     examples: List[Example],
     max_new_tokens: int,
     seed: int,
     progress: bool,
     progress_every: int,
 ) -> RunStats:
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as e:
-        raise ImportError(
-            "Failed to import `transformers`. Install MLX training deps via "
-            "`python3 -m pip install -r mlx_train/requirements.txt`."
-        ) from e
+    from .tokenizer_utils import load_tokenizer
 
     mx.random.seed(seed)
 
@@ -877,7 +872,10 @@ def run_mlx(
     if int(cfg.lora_r) > 0:
         merge_lora(model)
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer = load_tokenizer(
+        tokenizer_path,
+        tokenizer_type=str(tokenizer_type),
+    )
 
     stats = RunStats(name="mini_llm")
     started = time.perf_counter()
@@ -1025,6 +1023,13 @@ def main() -> None:
     parser.add_argument("--out_dir", type=str, default="out/mlx")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--tokenizer_path", type=str, default="./model")
+    parser.add_argument(
+        "--tokenizer_type",
+        type=str,
+        choices=["auto", "hf", "rustbpe"],
+        default="auto",
+        help="Tokenizer backend: auto (prefer RustBPE), hf, or rustbpe.",
+    )
 
     parser.add_argument("--ollama_url", type=str, default="http://127.0.0.1:11434")
     parser.add_argument("--ollama_model", type=str, default="qwen3:0.6b")
@@ -1062,13 +1067,7 @@ def main() -> None:
     parser.add_argument("--no_mlx", action="store_true")
     args = parser.parse_args()
 
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as e:
-        raise ImportError(
-            "Failed to import `transformers`. Install MLX training deps via "
-            "`python3 -m pip install -r mlx_train/requirements.txt`."
-        ) from e
+    from .tokenizer_utils import load_tokenizer
 
     suites = [s.strip() for s in str(args.suite).split(",") if s.strip()]
     if "all" in suites:
@@ -1135,6 +1134,7 @@ def main() -> None:
             run_mlx(
                 checkpoint_dir=ckpt,
                 tokenizer_path=args.tokenizer_path,
+                tokenizer_type=str(args.tokenizer_type),
                 examples=examples,
                 max_new_tokens=int(args.max_new_tokens),
                 seed=int(args.seed),

@@ -89,11 +89,36 @@ python3 -m mlx_train.train \
 - Chunked logits CE：`--logits_chunk_size 128`（避免一次性保留完整 `[B,T,V]` logits）
 - Sparse gathered loss（SFT 常见）：`--sparse_loss`（只在 `loss_mask==1` 的位置算 CE；可配合 `--label_bucket_sizes 32,64,128,256`）
 - Bucketing（动态 padding）：`--bucket_sizes 256,512,1024,2048`（按样本长度选最小 bucket）
+- 数据预取（减小 CPU 供数瓶颈）：`--prefetch_batches 2`（后台线程预取 micro-batch）
+- Pretrain packing（减少 padding 浪费）：`--pack_pretrain --pack_eos --pack_no_doc_split`（只对 pretrain 生效）
+- 文档长度上限：`--max_doc_tokens 2048`（配合 `--drop_long` 可直接丢弃超长样本）
+- 显存监控/限额：`--log_memory`（打印 active/cache/peak） / `--memory_limit_mb 12000` / `--memory_limit_auto_ratio 0.9 --memory_limit_auto_mode available`
 - Optimizer（全参训练的“大头”）：`--optimizer adafactor`（显著减少优化器状态显存）；AdamW 也可用 `--optim_state_dtype param` 降显存
 - 预分词（数据管线大头）：JSONL 行里如果有 `ids: List[int]` 字段会自动跳过 `tokenizer.encode`
+- RustBPE 分词：`--tokenizer_type rustbpe`（默认 `auto`，若 `tokenizer.pkl` 存在会优先使用）
 - 编译提速：`--compile --compile_optimizer`（默认开启；关闭：`--no-compile --no-compile_optimizer`）
+- 架构实验开关：`--hidden_act relu2` / `--qk_norm --qk_norm_eps` / `--logit_softcap 30` / `--value_mix 0.1` / `--zero_init_residual --residual_scale 1.0`
+- 速度/结构实验扩展：`--embed_skip_scale` / `--skip_connections 3->6` / `--value_embed_count 3 --value_embed_scale 0.1` / `--smear --smear_scale 0.1` / `--bigram_hash_size 50000 --bigram_hash_scale 0.1` / `--attn_window 512 --attn_global_tokens 16`
+- 训练流程实验：`--batch_size_schedule 0:24,1000:32` / `--accum_schedule 0:2,1000:1` / `--weight_decay_schedule lr` / `--slow_embed_head_steps 2` / `--untie_lm_head_at_ratio 0.66` / `--save_interval 0`（测速禁用保存）
+- Muon 优化器（实验）：`--optimizer muon --muon_ns_steps 5 --muon_variant norm`（1D 参数默认 AdamW-style）
 
 > 模型内部默认会优先走自定义 Metal fused kernel（RMSNorm / SiLU*mul），如果编译失败会自动 fallback 到普通实现。
+
+### Tiny time-first 推荐（质量快检通过）
+在 tiny 基准下，使用 bin2d 固定长度 + `shuffle_buffer=512`（质量友好），当前最快组合为：
+
+```bash
+PYTHONUNBUFFERED=1 .venv_mlx/bin/python -m mlx_train.train \
+  --data_path dataset/minimind/sft_mini_512_2d.meta.json --data_format bin2d --bin_cache memory \
+  --task sft --preset tiny --seq_len 512 --batch_size 72 --accum_steps 1 --max_steps 50 \
+  --log_interval 50 --save_interval 0 --prefetch_batches 4 --shuffle_buffer 512 \
+  --dtype bfloat16 --sparse_loss --label_bucket_sizes 64,128,256,512 \
+  --paired_heads --memory_limit_mb 14000 \
+  --tokenizer_type auto \
+  --out_dir out/mlx_tiny_time_extreme_bin2d_shuffle512_paired_b72
+```
+
+1000-batch eval 未见质量下降（详见 `docs/training_speed_report.md`）。
 
 ### 预分词（把 tokenizer 开销移出训练循环）
 
@@ -114,7 +139,46 @@ python3 -m mlx_train.train \
   --data_path out/minimind_auto_ids.jsonl \
   --task pretrain \
   --preset 200mb \
-  --seq_len 1024
+  --seq_len 1024 \
+  --pack_pretrain --pack_eos
+```
+
+### 二进制数据集（实验，减少 JSON 解析开销）
+将 JSONL 打包为 MLX 二进制格式（可选存储 label positions）：
+
+```bash
+python3 -m mlx_train.packbin \
+  --task sft --seq_len 512 \
+  --data_path dataset/minimind/sft_mini_512.jsonl \
+  --out_prefix dataset/minimind/sft_mini_512
+```
+
+训练时启用：
+
+```bash
+python3 -m mlx_train.train \
+  --data_format bin --data_path dataset/minimind/sft_mini_512.meta.json \
+  --task sft --preset tiny --seq_len 512
+```
+
+可选：`--bin_cache memory` 将二进制文件读入内存（用 RAM 换速度）。
+
+### bin2d 固定长度格式（更激进，减少 Python 开销）
+将每条样本强制 pad/clip 到固定长度（`seq_len+1`），省去动态 bucketing：
+
+```bash
+python3 -m mlx_train.packbin2d \
+  --task sft --seq_len 512 \
+  --data_path dataset/minimind/sft_mini_512.jsonl \
+  --out_prefix dataset/minimind/sft_mini_512_2d
+```
+
+训练时启用：
+
+```bash
+python3 -m mlx_train.train \
+  --data_format bin2d --data_path dataset/minimind/sft_mini_512_2d.meta.json \
+  --task sft --preset tiny --seq_len 512
 ```
 
 ## 自动下载训练数据（MiniMind 数据集）
@@ -399,6 +463,20 @@ python3 -m mlx_train.train \
   --profile_timing
 ```
 
+更细粒度层级 timing trace（按 step 写 JSON，包含 layer.attn / layer.mlp 等分解）：
+
+```bash
+python3 -m mlx_train.train \
+  --data_path minimind:smoke \
+  --task sft \
+  --preset tiny \
+  --seq_len 256 \
+  --batch_size 2 \
+  --max_steps 1 \
+  --trace_timing_out out/trace_timing \
+  --trace_timing_steps 1
+```
+
 GPU 侧（Metal）kernel 级别分析：生成 `.gputrace` 后用 Xcode 打开即可查看时间线。
 
 ```bash
@@ -411,6 +489,20 @@ python3 -m mlx_train.train \
   --max_steps 3 \
   --metal_capture out/trace.gputrace \
   --metal_capture_steps 1
+```
+
+按系统剩余内存自动设置训练内存上限（避免误炸机器）：
+
+```bash
+python3 -m mlx_train.train \
+  --data_path minimind:smoke \
+  --task sft \
+  --preset tiny \
+  --seq_len 256 \
+  --batch_size 2 \
+  --max_steps 3 \
+  --memory_limit_auto_ratio 0.85 \
+  --memory_limit_auto_max_mb 20000
 ```
 
 ## 说明

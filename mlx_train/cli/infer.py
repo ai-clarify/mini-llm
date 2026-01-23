@@ -144,6 +144,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="MiniLLM (MLX) inference")
     parser.add_argument("--tokenizer_path", type=str, default="./model")
     parser.add_argument(
+        "--tokenizer_type",
+        type=str,
+        choices=["auto", "hf", "rustbpe"],
+        default="auto",
+        help="Tokenizer backend: auto (prefer RustBPE), hf, or rustbpe.",
+    )
+    parser.add_argument(
         "--checkpoint",
         type=str,
         required=True,
@@ -196,13 +203,7 @@ def main() -> None:
 
     mx.random.seed(args.seed)
 
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as e:
-        raise ImportError(
-            "Failed to import `transformers`. Install MLX training deps via "
-            "`python3 -m pip install -r mlx_train/requirements.txt`."
-        ) from e
+    from .tokenizer_utils import load_tokenizer
 
     ckpt = Path(args.checkpoint)
     if not ckpt.exists() or not ckpt.is_dir():
@@ -215,7 +216,10 @@ def main() -> None:
     if int(cfg.lora_r) > 0:
         merge_lora(model)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    tokenizer = load_tokenizer(
+        args.tokenizer_path,
+        tokenizer_type=str(args.tokenizer_type),
+    )
     messages = [{"role": "user", "content": args.prompt}]
     prompt_text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     prompt_ids: List[int] = tokenizer.encode(prompt_text, add_special_tokens=False)

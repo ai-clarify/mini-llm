@@ -35,6 +35,8 @@ class MiniLLMConfig(PretrainedConfig):
         dropout: float = 0.0,
         attention_dropout: float = 0.0,
         attention_bias: bool = False,
+        logit_softcap: float = 0.0,
+        tie_word_embeddings: bool = True,
         rope_theta: float = 10000.0,
         rope_scaling: Optional[dict] = None,
         inference_rope_scaling: bool = False,
@@ -44,6 +46,15 @@ class MiniLLMConfig(PretrainedConfig):
         qk_nope_head_dim: int = 64,
         qk_rope_head_dim: int = 32,
         v_head_dim: int = 64,
+        qk_norm: bool = False,
+        qk_norm_eps: float = 1e-6,
+        value_mix: float = 0.0,
+        partial_key_offset: int = 0,
+        paired_heads: bool = False,
+        attn_window: int = 0,
+        attn_global_tokens: int = 0,
+        sparse_attn_gate: bool = False,
+        sparse_attn_gate_topk: int = 0,
         # MoE
         use_moe: bool = False,
         num_experts_per_tok: int = 2,
@@ -63,6 +74,26 @@ class MiniLLMConfig(PretrainedConfig):
         num_nextn_predict_layers: int = 1,
         mtp_intermediate_size: Optional[int] = None,
         mtp_loss_weight: float = 0.1,
+        residual_scale: float = 1.0,
+        residual_decay: float = 0.0,
+        zero_init_residual: bool = False,
+        embed_skip_scale: float = 0.0,
+        embed_skip_gate: bool = False,
+        skip_connections: Optional[list] = None,
+        skip_scale: float = 1.0,
+        skip_gate: bool = False,
+        value_embed_count: int = 0,
+        value_embed_scale: float = 0.0,
+        value_embed_gate: bool = False,
+        value_embed_repeat_ends: bool = True,
+        smear: bool = False,
+        smear_scale: float = 0.0,
+        bigram_hash_size: int = 0,
+        bigram_hash_scale: float = 0.0,
+        bigram_hash_base: int = 1000003,
+        back_out_ratio: float = 0.0,
+        back_out_scale: float = 1.0,
+        untie_lm_head_at_ratio: float = 0.0,
         # DSA / indexer
         index_n_heads: int = 0,
         index_head_dim: int = 32,
@@ -70,7 +101,6 @@ class MiniLLMConfig(PretrainedConfig):
         # misc
         bos_token_id: int = 1,
         eos_token_id: int = 2,
-        tie_word_embeddings: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -92,15 +122,26 @@ class MiniLLMConfig(PretrainedConfig):
         self.dropout = dropout
         self.attention_dropout = attention_dropout
         self.attention_bias = attention_bias
+        self.logit_softcap = logit_softcap
         self.rope_theta = rope_theta
         self.rope_scaling = rope_scaling
         self.inference_rope_scaling = inference_rope_scaling
+        self.tie_word_embeddings = tie_word_embeddings
 
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
         self.qk_nope_head_dim = qk_nope_head_dim
         self.qk_rope_head_dim = qk_rope_head_dim
         self.v_head_dim = v_head_dim
+        self.qk_norm = qk_norm
+        self.qk_norm_eps = qk_norm_eps
+        self.value_mix = value_mix
+        self.partial_key_offset = partial_key_offset
+        self.paired_heads = paired_heads
+        self.attn_window = attn_window
+        self.attn_global_tokens = attn_global_tokens
+        self.sparse_attn_gate = sparse_attn_gate
+        self.sparse_attn_gate_topk = sparse_attn_gate_topk
 
         self.use_moe = use_moe
         self.num_experts_per_tok = num_experts_per_tok
@@ -120,6 +161,26 @@ class MiniLLMConfig(PretrainedConfig):
         self.num_nextn_predict_layers = num_nextn_predict_layers
         self.mtp_intermediate_size = mtp_intermediate_size
         self.mtp_loss_weight = mtp_loss_weight
+        self.residual_scale = residual_scale
+        self.residual_decay = residual_decay
+        self.zero_init_residual = zero_init_residual
+        self.embed_skip_scale = embed_skip_scale
+        self.embed_skip_gate = embed_skip_gate
+        self.skip_connections = skip_connections
+        self.skip_scale = skip_scale
+        self.skip_gate = skip_gate
+        self.value_embed_count = value_embed_count
+        self.value_embed_scale = value_embed_scale
+        self.value_embed_gate = value_embed_gate
+        self.value_embed_repeat_ends = value_embed_repeat_ends
+        self.smear = smear
+        self.smear_scale = smear_scale
+        self.bigram_hash_size = bigram_hash_size
+        self.bigram_hash_scale = bigram_hash_scale
+        self.bigram_hash_base = bigram_hash_base
+        self.back_out_ratio = back_out_ratio
+        self.back_out_scale = back_out_scale
+        self.untie_lm_head_at_ratio = untie_lm_head_at_ratio
 
         self.index_n_heads = index_n_heads
         self.index_head_dim = index_head_dim
@@ -221,15 +282,27 @@ def precompute_rope_freqs(
 
 
 def apply_rotary_pos_emb(
-    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    *,
+    cos_k: Optional[torch.Tensor] = None,
+    sin_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     def rotate_half(x: torch.Tensor) -> torch.Tensor:
         return torch.cat((-x[..., x.shape[-1] // 2 :], x[..., : x.shape[-1] // 2]), dim=-1)
 
-    cos = cos.unsqueeze(0).unsqueeze(0)
-    sin = sin.unsqueeze(0).unsqueeze(0)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
+    cos_q = cos.unsqueeze(0).unsqueeze(0)
+    sin_q = sin.unsqueeze(0).unsqueeze(0)
+    if cos_k is None:
+        cos_k = cos
+    if sin_k is None:
+        sin_k = sin
+    cos_k = cos_k.unsqueeze(0).unsqueeze(0)
+    sin_k = sin_k.unsqueeze(0).unsqueeze(0)
+    q_embed = (q * cos_q) + (rotate_half(q) * sin_q)
+    k_embed = (k * cos_k) + (rotate_half(k) * sin_k)
     return q_embed, k_embed
 
 
@@ -284,6 +357,17 @@ class MiniLLMAttention(nn.Module):
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.q_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
+        self.qk_norm = bool(config.qk_norm)
+        self.qk_norm_eps = float(config.qk_norm_eps)
+        self.value_mix_scale = float(config.value_mix)
+        self.value_embed_scale = float(config.value_embed_scale)
+        self.value_embed_gate = bool(config.value_embed_gate)
+        self.partial_key_offset = int(config.partial_key_offset)
+        self.paired_heads = bool(config.paired_heads)
+        self.attn_window = int(config.attn_window)
+        self.attn_global_tokens = int(config.attn_global_tokens)
+        self.sparse_attn_gate = bool(config.sparse_attn_gate)
+        self.sparse_attn_gate_topk = int(config.sparse_attn_gate_topk)
         self.q_lora_rank = config.q_lora_rank if config.q_lora_rank and config.q_lora_rank > 0 else None
         self.kv_lora_rank = config.kv_lora_rank
         if self.q_lora_rank is None:
@@ -304,7 +388,18 @@ class MiniLLMAttention(nn.Module):
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
         )
+        self.v_mix_proj = None
+        if self.value_mix_scale > 0.0:
+            self.v_mix_proj = nn.Linear(config.hidden_size, self.num_heads * self.v_head_dim, bias=False)
+        self.v_embed_proj = None
+        if self.value_embed_scale > 0.0:
+            self.v_embed_proj = nn.Linear(config.hidden_size, self.num_heads * self.v_head_dim, bias=False)
+        self.value_embed_gate_logit = (
+            nn.Parameter(torch.zeros(())) if self.value_embed_gate and self.value_embed_scale > 0.0 else None
+        )
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, config.hidden_size, bias=config.attention_bias)
+        if bool(config.zero_init_residual):
+            nn.init.zeros_(self.o_proj.weight)
         self.attn_dropout = nn.Dropout(config.attention_dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.softmax_scale = self.q_head_dim ** -0.5
@@ -314,6 +409,9 @@ class MiniLLMAttention(nn.Module):
                 mscale = yarn_get_mscale(config.rope_scaling.get("factor", 1.0), mscale_all_dim)
                 self.softmax_scale = self.softmax_scale * mscale * mscale
         self.indexer = MiniLLMIndexer(config)
+        self.attn_head_gate = (
+            nn.Parameter(torch.zeros(self.num_heads)) if self.sparse_attn_gate else None
+        )
 
     def forward(
         self,
@@ -322,6 +420,7 @@ class MiniLLMAttention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         attention_mask: Optional[torch.Tensor] = None,
+        value_embed: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
         bsz, q_len, _ = x.shape
         if self.q_lora_rank is None:
@@ -337,15 +436,35 @@ class MiniLLMAttention(nn.Module):
         kv = self.kv_b_proj(kv)
         kv = kv.view(bsz, q_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim).transpose(1, 2)
         k_nope, value_states = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        if self.v_mix_proj is not None and self.value_mix_scale > 0.0:
+            v_mix = self.v_mix_proj(x)
+            v_mix = v_mix.view(bsz, q_len, self.num_heads, self.v_head_dim).transpose(1, 2)
+            value_states = value_states + v_mix * self.value_mix_scale
+        if value_embed is not None and self.v_embed_proj is not None and self.value_embed_scale > 0.0:
+            v_embed = self.v_embed_proj(value_embed)
+            v_embed = v_embed.view(bsz, q_len, self.num_heads, self.v_head_dim).transpose(1, 2)
+            gate = 1.0
+            if self.value_embed_gate_logit is not None:
+                gate = torch.sigmoid(self.value_embed_gate_logit).to(v_embed.dtype)
+            value_states = value_states + v_embed * (self.value_embed_scale * gate)
 
         k_pe = k_pe.view(bsz, q_len, 1, self.qk_rope_head_dim).transpose(1, 2)
         cos, sin = position_embeddings
         cos = cos[:q_len]
         sin = sin[:q_len]
-        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin)
+        if self.partial_key_offset:
+            cos_k = torch.roll(cos, shifts=int(self.partial_key_offset), dims=0)
+            sin_k = torch.roll(sin, shifts=int(self.partial_key_offset), dims=0)
+        else:
+            cos_k = cos
+            sin_k = sin
+        q_pe, k_pe = apply_rotary_pos_emb(q_pe, k_pe, cos, sin, cos_k=cos_k, sin_k=sin_k)
 
         query_states = torch.cat([q_nope, q_pe], dim=-1)
         key_states = torch.cat([k_nope, k_pe.expand(-1, self.num_heads, -1, -1)], dim=-1)
+        if self.qk_norm:
+            query_states = query_states * torch.rsqrt(query_states.pow(2).mean(dim=-1, keepdim=True) + self.qk_norm_eps)
+            key_states = key_states * torch.rsqrt(key_states.pow(2).mean(dim=-1, keepdim=True) + self.qk_norm_eps)
 
         if past_key_value is not None:
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
@@ -355,6 +474,16 @@ class MiniLLMAttention(nn.Module):
 
         k_len = key_states.shape[2]
         past_len = k_len - q_len
+
+        paired = False
+        if self.paired_heads:
+            if self.num_heads % 2 != 0:
+                raise ValueError("paired_heads requires even num_attention_heads")
+            paired = True
+            pair_h = self.num_heads // 2
+            query_states = query_states.view(bsz, pair_h, 2, q_len, self.q_head_dim).mean(dim=2)
+            key_states = key_states.view(bsz, pair_h, 2, k_len, self.q_head_dim).mean(dim=2)
+            value_states = value_states.view(bsz, pair_h, 2, k_len, self.v_head_dim).mean(dim=2)
 
         attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.softmax_scale
 
@@ -371,6 +500,15 @@ class MiniLLMAttention(nn.Module):
             causal = k_positions[None, :] > q_positions[:, None]
             attn_weights = attn_weights + causal.to(attn_weights.dtype) * -1e9
 
+        if self.attn_window > 0:
+            q_positions = torch.arange(q_len, device=attn_weights.device) + past_len
+            k_positions = torch.arange(k_len, device=attn_weights.device)
+            allow = k_positions[None, :] >= (q_positions[:, None] - int(self.attn_window) + 1)
+            allow = allow & (k_positions[None, :] <= q_positions[:, None])
+            if self.attn_global_tokens > 0:
+                allow = allow | (k_positions[None, :] < int(self.attn_global_tokens))
+            attn_weights = attn_weights + (~allow).to(attn_weights.dtype) * -1e9
+
         topk_idx = self.indexer(hidden_states=x, attention_mask=attention_mask, past_len=past_len)
         if topk_idx is not None:
             index_mask = attn_weights.new_full((bsz, q_len, k_len), float("-inf"))
@@ -380,6 +518,15 @@ class MiniLLMAttention(nn.Module):
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(query_states)
         attn_weights = self.attn_dropout(attn_weights)
         attn_output = torch.matmul(attn_weights, value_states)
+        if paired:
+            attn_output = attn_output.repeat_interleave(2, dim=1)
+        if self.attn_head_gate is not None:
+            gate = torch.sigmoid(self.attn_head_gate).to(attn_output.dtype)
+            if self.sparse_attn_gate_topk > 0 and self.sparse_attn_gate_topk < self.num_heads:
+                topk_vals, _ = torch.topk(gate, k=int(self.sparse_attn_gate_topk))
+                threshold = topk_vals[-1]
+                gate = gate * (gate >= threshold).to(gate.dtype)
+            attn_output = attn_output * gate.view(1, -1, 1, 1)
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
         attn_output = self.resid_dropout(self.o_proj(attn_output))
         return attn_output, present
@@ -393,11 +540,21 @@ class FeedForward(nn.Module):
         self.up_proj = nn.Linear(config.hidden_size, inter, bias=False)
         self.down_proj = nn.Linear(inter, config.hidden_size, bias=False)
         self.dropout = nn.Dropout(config.dropout)
-        if config.hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {config.hidden_act}")
+        self.hidden_act = str(config.hidden_act)
+        if self.hidden_act not in {"silu", "relu2"}:
+            raise ValueError(f"Unsupported activation: {self.hidden_act}")
+        if bool(config.zero_init_residual):
+            nn.init.zeros_(self.down_proj.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        if self.hidden_act == "silu":
+            act = F.silu(gate) * up
+        else:
+            relu = torch.relu(gate)
+            act = (relu * relu) * up
+        return self.dropout(self.down_proj(act))
 
 
 class MoEGate(nn.Module):
@@ -542,6 +699,13 @@ class MiniLLMBlock(nn.Module):
         self.self_attn = MiniLLMAttention(config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        decay = float(config.residual_decay)
+        base_scale = float(config.residual_scale)
+        self.residual_scale = base_scale * math.exp(-decay * float(layer_id)) if decay > 0.0 else base_scale
+        self.embed_skip_scale = float(config.embed_skip_scale)
+        self.embed_skip_gate_logit = (
+            nn.Parameter(torch.zeros(())) if bool(config.embed_skip_gate) and self.embed_skip_scale != 0.0 else None
+        )
         if _is_moe_layer(layer_id, config):
             self.mlp = MoEFeedForward(config)
         else:
@@ -554,7 +718,14 @@ class MiniLLMBlock(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache: bool = False,
         attention_mask: Optional[torch.Tensor] = None,
+        embed_skip: Optional[torch.Tensor] = None,
+        value_embed: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        if embed_skip is not None and self.embed_skip_scale != 0.0:
+            gate = 1.0
+            if self.embed_skip_gate_logit is not None:
+                gate = torch.sigmoid(self.embed_skip_gate_logit).to(hidden_states.dtype)
+            hidden_states = hidden_states + (self.embed_skip_scale * gate) * embed_skip
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states, present = self.self_attn(
@@ -563,11 +734,12 @@ class MiniLLMBlock(nn.Module):
             past_key_value=past_key_value,
             use_cache=use_cache,
             attention_mask=attention_mask,
+            value_embed=value_embed,
         )
-        hidden_states = residual + hidden_states
+        hidden_states = residual + self.residual_scale * hidden_states
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = residual + self.mlp(hidden_states)
+        hidden_states = residual + self.residual_scale * self.mlp(hidden_states)
         return hidden_states, present
 
 
@@ -580,10 +752,22 @@ class MTPPredictor(nn.Module):
         self.up_proj = nn.Linear(config.hidden_size, inter, bias=False)
         self.down_proj = nn.Linear(inter, config.hidden_size, bias=False)
         self.dropout = nn.Dropout(config.dropout)
+        self.hidden_act = str(config.hidden_act)
+        if bool(config.zero_init_residual):
+            nn.init.zeros_(self.down_proj.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.norm(x)
-        return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        if self.hidden_act == "silu":
+            act = F.silu(gate) * up
+        elif self.hidden_act == "relu2":
+            relu = torch.relu(gate)
+            act = (relu * relu) * up
+        else:
+            raise ValueError(f"Unsupported activation: {self.hidden_act}")
+        return self.dropout(self.down_proj(act))
 
 
 def _is_moe_layer(layer_id: int, config: MiniLLMConfig) -> bool:
@@ -603,6 +787,56 @@ class MiniLLMModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([MiniLLMBlock(i, config) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.embed_skip_scale = float(config.embed_skip_scale)
+        self.skip_scale = float(config.skip_scale)
+        self.back_out_ratio = float(config.back_out_ratio)
+        self.back_out_scale = float(config.back_out_scale)
+
+        self.skip_pairs: List[Tuple[int, int]] = []
+        if config.skip_connections:
+            for pair in config.skip_connections:
+                if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                    continue
+                try:
+                    src = int(pair[0])
+                    tgt = int(pair[1])
+                except (TypeError, ValueError):
+                    continue
+                if src >= 0 and tgt >= 0:
+                    self.skip_pairs.append((src, tgt))
+        self.skip_gate_params = nn.ParameterList()
+        if self.skip_pairs and bool(config.skip_gate):
+            for _ in self.skip_pairs:
+                self.skip_gate_params.append(nn.Parameter(torch.zeros(())))
+
+        self.value_embed_count = int(config.value_embed_count)
+        self.value_embed_repeat_ends = bool(config.value_embed_repeat_ends)
+        self.value_embeds = nn.ModuleList()
+        if self.value_embed_count > 0:
+            for _ in range(self.value_embed_count):
+                self.value_embeds.append(nn.Embedding(config.vocab_size, config.hidden_size))
+        self.value_embed_layers: List[int] = [-1] * int(config.num_hidden_layers)
+        if self.value_embed_count > 0:
+            count = min(int(self.value_embed_count), int(config.num_hidden_layers))
+            if self.value_embed_repeat_ends:
+                for i in range(count):
+                    self.value_embed_layers[i] = i
+                    self.value_embed_layers[int(config.num_hidden_layers) - count + i] = i
+            else:
+                for i in range(count):
+                    self.value_embed_layers[i] = i
+
+        self.smear_scale = float(config.smear_scale)
+        self.smear_proj = None
+        if bool(config.smear) or self.smear_scale != 0.0:
+            self.smear_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+
+        self.bigram_hash_size = int(config.bigram_hash_size)
+        self.bigram_hash_scale = float(config.bigram_hash_scale)
+        self.bigram_hash_base = int(config.bigram_hash_base)
+        self.bigram_embed = None
+        if self.bigram_hash_size > 0 and self.bigram_hash_scale != 0.0:
+            self.bigram_embed = nn.Embedding(self.bigram_hash_size, config.hidden_size)
 
         rope_dim = config.qk_rope_head_dim
         freqs_cos, freqs_sin = precompute_rope_freqs(
@@ -634,7 +868,18 @@ class MiniLLMModel(nn.Module):
         first_past = past_list[0]
         start_pos = int(first_past[0].shape[2]) if first_past is not None else 0
 
-        hidden_states = self.dropout(self.embed_tokens(input_ids))
+        hidden_states = self.embed_tokens(input_ids)
+        if self.bigram_embed is not None and self.bigram_hash_size > 0 and self.bigram_hash_scale != 0.0:
+            pad = torch.full((batch_size, 1), int(self.config.bos_token_id), device=input_ids.device, dtype=input_ids.dtype)
+            prev = torch.cat([pad, input_ids[:, :-1]], dim=1)
+            bigram = (prev.long() * int(self.bigram_hash_base) + input_ids.long()) % int(self.bigram_hash_size)
+            hidden_states = hidden_states + self.bigram_embed(bigram) * float(self.bigram_hash_scale)
+        hidden_states = self.dropout(hidden_states)
+        if self.smear_proj is not None and self.smear_scale != 0.0:
+            zeros = torch.zeros(batch_size, 1, hidden_states.shape[-1], device=hidden_states.device, dtype=hidden_states.dtype)
+            shifted = torch.cat([zeros, hidden_states[:, :-1, :]], dim=1)
+            hidden_states = hidden_states + self.smear_proj(shifted) * float(self.smear_scale)
+        x0 = hidden_states
 
         position_embeddings = (
             self.freqs_cos[start_pos : start_pos + seq_len],
@@ -642,15 +887,44 @@ class MiniLLMModel(nn.Module):
         )
 
         presents: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []
-        for layer, past_key_value in zip(self.layers, past_list):
+        hidden_cache: List[torch.Tensor] = []
+        back_out_state: Optional[torch.Tensor] = None
+        back_out_idx = None
+        if self.back_out_ratio > 0.0:
+            back_out_idx = max(0, min(int(self.config.num_hidden_layers) - 1, int(self.back_out_ratio * int(self.config.num_hidden_layers))))
+        value_embed_cache: List[torch.Tensor] = []
+        if len(self.value_embeds) > 0:
+            for emb in self.value_embeds:
+                value_embed_cache.append(emb(input_ids))
+        for i, (layer, past_key_value) in enumerate(zip(self.layers, past_list)):
+            if self.skip_pairs:
+                for j, (src, tgt) in enumerate(self.skip_pairs):
+                    if tgt == i and src < len(hidden_cache):
+                        gate = 1.0
+                        if len(self.skip_gate_params) > 0:
+                            gate = torch.sigmoid(self.skip_gate_params[j]).to(hidden_states.dtype)
+                        hidden_states = hidden_states + float(self.skip_scale) * gate * hidden_cache[src]
+            value_embed = None
+            if value_embed_cache:
+                idx = self.value_embed_layers[i]
+                if idx >= 0 and idx < len(value_embed_cache):
+                    value_embed = value_embed_cache[idx]
             hidden_states, present = layer(
                 hidden_states,
                 position_embeddings,
                 past_key_value=past_key_value,
                 use_cache=use_cache,
                 attention_mask=attention_mask,
+                embed_skip=x0,
+                value_embed=value_embed,
             )
             presents.append(present)
+            hidden_cache.append(hidden_states)
+            if back_out_idx is not None and i == back_out_idx:
+                back_out_state = hidden_states
+
+        if back_out_state is not None and self.back_out_scale != 0.0:
+            hidden_states = hidden_states - back_out_state * float(self.back_out_scale)
 
         hidden_states = self.norm(hidden_states)
         aux_loss = torch.tensor(0.0, device=hidden_states.device)
@@ -677,6 +951,17 @@ class MiniLLMForCausalLM(PreTrainedModel, GenerationMixin):
         )
         self.OUT = CausalLMOutputWithPast()
 
+    def _apply_logit_softcap(self, logits: torch.Tensor) -> torch.Tensor:
+        cap = float(self.config.logit_softcap)
+        if cap <= 0.0:
+            return logits
+        return cap * torch.tanh(logits / cap)
+
+    def untie_lm_head(self) -> None:
+        if self.model.embed_tokens.weight is self.lm_head.weight:
+            self.lm_head.weight = nn.Parameter(self.model.embed_tokens.weight.detach().clone())
+        self.config.tie_word_embeddings = False
+
     def _mtp_logits(
         self,
         hidden_states: torch.Tensor,
@@ -689,7 +974,7 @@ class MiniLLMForCausalLM(PreTrainedModel, GenerationMixin):
         mtp_hidden = hidden_states
         for layer in self.mtp_layers:
             mtp_hidden = mtp_hidden + layer(mtp_hidden)
-            mtp_logits.append(self.lm_head(mtp_hidden[:, slice_indices, :]))
+            mtp_logits.append(self._apply_logit_softcap(self.lm_head(mtp_hidden[:, slice_indices, :])))
         return mtp_logits
 
     def forward(
@@ -713,7 +998,7 @@ class MiniLLMForCausalLM(PreTrainedModel, GenerationMixin):
         else:
             slice_indices = logits_to_keep
 
-        logits = self.lm_head(hidden[:, slice_indices, :])
+        logits = self._apply_logit_softcap(self.lm_head(hidden[:, slice_indices, :]))
         mtp_logits = self._mtp_logits(hidden, slice_indices=slice_indices)
 
         self.OUT.__setitem__("last_hidden_state", hidden)

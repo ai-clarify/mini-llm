@@ -4,14 +4,23 @@ import argparse
 import json
 import math
 import os
+import re
+import subprocess
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 
 from ..config import MiniLLMConfig
-from ..data import make_batch_iterator, resolve_jsonl_paths
+from ..data import (
+    Bin2DDataset,
+    BinDataset,
+    detect_bin_format,
+    make_batch_iterator,
+    resolve_bin_prefix,
+    resolve_jsonl_paths,
+)
 from ..download import resolve_data_path_spec
 from ..models import MiniLLMForCausalLM
 from ..ops.loss import chunked_ce_loss_sum_and_tokens
@@ -29,22 +38,154 @@ def load_config(checkpoint_dir: Path) -> MiniLLMConfig:
     return MiniLLMConfig.from_dict(data)
 
 
+def _run_cmd_first(cmds: Sequence[Sequence[str]]) -> Optional[str]:
+    for cmd in cmds:
+        try:
+            return subprocess.check_output(list(cmd), text=True).strip()
+        except Exception:
+            continue
+    return None
+
+
+def _read_vm_stat() -> Optional[str]:
+    return _run_cmd_first(
+        [
+            ["/usr/bin/vm_stat"],
+            ["/usr/sbin/vm_stat"],
+            ["vm_stat"],
+        ]
+    )
+
+
+def _parse_vm_stat() -> Tuple[Optional[int], Dict[str, int]]:
+    out = _read_vm_stat()
+    if not out:
+        return None, {}
+    page_size = None
+    pages: Dict[str, int] = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "page size of" in line and "bytes" in line:
+            m = re.search(r"page size of (\d+) bytes", line)
+            if m:
+                page_size = int(m.group(1))
+            continue
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key = key.strip().lower()
+        val = val.strip().strip(".")
+        try:
+            pages[key] = int(val)
+        except ValueError:
+            continue
+    return page_size, pages
+
+
+def _estimate_available_mem_bytes(*, mode: str = "available") -> Optional[int]:
+    page_size, pages = _parse_vm_stat()
+    if page_size is None or not pages:
+        return None
+    mode = str(mode).lower().strip()
+    if mode == "free":
+        keys = ("pages free", "pages speculative")
+    else:
+        keys = ("pages free", "pages inactive", "pages speculative", "pages purgeable")
+    avail_pages = 0
+    for key in keys:
+        if key in pages:
+            avail_pages += pages[key]
+    if avail_pages <= 0:
+        return None
+    return int(avail_pages) * int(page_size)
+
+
+def _estimate_bin_bytes(path: str) -> Optional[int]:
+    prefix = resolve_bin_prefix(path)
+    meta_path = Path(prefix + ".meta.json")
+    files: List[Path] = []
+    if meta_path.exists():
+        try:
+            with meta_path.open("r", encoding="utf-8") as f:
+                meta = json.load(f)
+            base_dir = meta_path.parent
+            ids = meta.get("ids", {})
+            ids_bin = ids.get("bin")
+            if ids_bin:
+                files.append(base_dir / str(ids_bin))
+            labels = meta.get("labels", {})
+            lbl_bin = labels.get("bin")
+            if lbl_bin:
+                files.append(base_dir / str(lbl_bin))
+        except Exception:
+            files = []
+    if not files:
+        ids_bin = Path(prefix + ".ids.bin")
+        if ids_bin.exists():
+            files.append(ids_bin)
+        lbl_bin = Path(prefix + ".lbl.bin")
+        if lbl_bin.exists():
+            files.append(lbl_bin)
+    if not files:
+        return None
+    total = 0
+    for p in files:
+        try:
+            total += int(p.stat().st_size)
+        except Exception:
+            continue
+    return total or None
+
+
+def _choose_bin_cache(
+    path: str,
+    cache: str,
+    *,
+    avail_bytes: Optional[int],
+    reserve_mb: int = 2048,
+    ratio: float = 0.35,
+) -> str:
+    cache = str(cache).lower().strip()
+    if cache != "auto":
+        return cache
+    bin_bytes = _estimate_bin_bytes(path)
+    if bin_bytes is None or avail_bytes is None:
+        return "mmap"
+    reserve = int(reserve_mb) * 1024 * 1024
+    budget = max(0, int(avail_bytes) - reserve)
+    if budget <= 0:
+        return "mmap"
+    if bin_bytes <= int(budget * float(ratio)):
+        return "memory"
+    return "mmap"
+
+
 def loss_sum_and_tokens(
     model: MiniLLMForCausalLM, x: mx.array, y: mx.array, loss_mask: mx.array
 ) -> Tuple[mx.array, mx.array]:
     hidden = model.model(x)  # [B, T, H]
     return chunked_ce_loss_sum_and_tokens(
         hidden=hidden,
-        lm_head_weight=model.model.embed_tokens.weight,
+        lm_head_weight=model.lm_head_weight(),
         labels=y,
         loss_mask=loss_mask,
         chunk_size=0,
+        logit_softcap=float(model.config.logit_softcap),
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="MiniLLM (MLX) eval: average loss / perplexity")
     parser.add_argument("--tokenizer_path", type=str, default="./model")
+    parser.add_argument(
+        "--tokenizer_type",
+        type=str,
+        choices=["auto", "hf", "rustbpe"],
+        default="auto",
+        help="Tokenizer backend: auto (prefer RustBPE), hf, or rustbpe.",
+    )
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -82,6 +223,20 @@ def main() -> None:
     parser.add_argument("--ms_revision", type=str, default=None, help="Optional ModelScope revision/tag.")
     parser.add_argument("--force_download", action="store_true")
     parser.add_argument("--max_download_mb", type=int, default=2048)
+    parser.add_argument(
+        "--data_format",
+        type=str,
+        choices=["auto", "jsonl", "bin", "bin2d"],
+        default="auto",
+        help="Dataset format: jsonl, bin (mlx bin format), bin2d (fixed-length), or auto-detect.",
+    )
+    parser.add_argument(
+        "--bin_cache",
+        type=str,
+        choices=["mmap", "memory", "auto"],
+        default="mmap",
+        help="Binary dataset cache mode: mmap, memory, or auto (choose based on free RAM).",
+    )
     parser.add_argument("--seq_len", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--shuffle_buffer", type=int, default=0)
@@ -99,13 +254,7 @@ def main() -> None:
 
     mx.random.seed(args.seed)
 
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as e:
-        raise ImportError(
-            "Failed to import `transformers`. Install MLX training deps via "
-            "`python3 -m pip install -r mlx_train/requirements.txt`."
-        ) from e
+    from .tokenizer_utils import load_tokenizer
 
     ckpt = Path(args.checkpoint)
     if not ckpt.exists() or not ckpt.is_dir():
@@ -124,9 +273,36 @@ def main() -> None:
         ms_cache_dir=args.ms_cache_dir,
         ms_revision=args.ms_revision,
     )
-    paths = resolve_jsonl_paths(resolved)
+    bin_dataset: Optional[BinDataset] = None
+    bin2d_dataset: Optional[Bin2DDataset] = None
+    paths: Sequence[str] = []
+    fmt = str(args.data_format)
+    if fmt == "auto":
+        detected = detect_bin_format(str(resolved))
+        fmt = detected if detected is not None else "jsonl"
+    if fmt == "bin2d":
+        avail_for_cache = _estimate_available_mem_bytes(mode="available")
+        bin_cache = _choose_bin_cache(
+            str(resolved), str(args.bin_cache), avail_bytes=avail_for_cache
+        )
+        if str(args.bin_cache) == "auto":
+            print(f"[data] bin_cache=auto resolved to {bin_cache}")
+        bin2d_dataset = Bin2DDataset(str(resolved), cache=str(bin_cache))
+    elif fmt == "bin":
+        avail_for_cache = _estimate_available_mem_bytes(mode="available")
+        bin_cache = _choose_bin_cache(
+            str(resolved), str(args.bin_cache), avail_bytes=avail_for_cache
+        )
+        if str(args.bin_cache) == "auto":
+            print(f"[data] bin_cache=auto resolved to {bin_cache}")
+        bin_dataset = BinDataset(str(resolved), cache=str(bin_cache))
+    else:
+        paths = resolve_jsonl_paths(resolved)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    tokenizer = load_tokenizer(
+        args.tokenizer_path,
+        tokenizer_type=str(args.tokenizer_type),
+    )
     cfg = load_config(ckpt)
     model = MiniLLMForCausalLM(cfg)
     model.load_weights(os.fspath(ckpt / "model.safetensors"))
@@ -148,6 +324,8 @@ def main() -> None:
 
     it = make_batch_iterator(
         paths=paths,
+        bin_dataset=bin_dataset,
+        bin2d_dataset=bin2d_dataset,
         tokenizer=tokenizer,
         task=args.task,
         seq_len=args.seq_len,

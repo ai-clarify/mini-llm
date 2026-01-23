@@ -72,3 +72,4 @@ dataset/gsm8k/
 **/.___pycache__
 dataset/minimind/.msc
 dataset/minimind/.mv
+dataset/minimind/*

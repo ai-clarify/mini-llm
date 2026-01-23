@@ -6,6 +6,14 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+def _apply_logit_softcap(logits: mx.array, *, softcap: float) -> mx.array:
+    cap = float(softcap)
+    if cap <= 0.0:
+        return logits
+    cap_arr = mx.array(cap, dtype=logits.dtype)
+    return cap_arr * mx.tanh(logits / cap_arr)
+
+
 def _pad_to_multiple(
     x: mx.array, *, multiple: int, axis: int, pad_value: float | int = 0
 ) -> mx.array:
@@ -29,6 +37,7 @@ def chunked_ce_loss_sum_and_tokens(
     labels: mx.array,
     loss_mask: mx.array,
     chunk_size: int,
+    logit_softcap: float = 0.0,
 ) -> Tuple[mx.array, mx.array]:
     """
     Compute masked cross entropy without materializing full [B, T, V] logits.
@@ -62,6 +71,7 @@ def chunked_ce_loss_sum_and_tokens(
 
     if chunk_size <= 0 or int(chunk_size) >= int(seq_len):
         logits = hidden @ lm_head_weight.transpose()  # [B, T, V]
+        logits = _apply_logit_softcap(logits, softcap=logit_softcap)
         loss = nn.losses.cross_entropy(
             logits.reshape(bsz * seq_len, vocab),
             labels.reshape(bsz * seq_len),
@@ -82,6 +92,7 @@ def chunked_ce_loss_sum_and_tokens(
         m = mask_p[:, start : start + chunk]
 
         logits = h @ lm_head_weight.transpose()  # [B, chunk, V]
+        logits = _apply_logit_softcap(logits, softcap=logit_softcap)
         loss = nn.losses.cross_entropy(
             logits.reshape(bsz * chunk, vocab),
             y.reshape(bsz * chunk),
@@ -99,6 +110,7 @@ def chunked_ce_loss(
     labels: mx.array,
     loss_mask: mx.array,
     chunk_size: int,
+    logit_softcap: float = 0.0,
 ) -> mx.array:
     loss_sum, tokens = chunked_ce_loss_sum_and_tokens(
         hidden=hidden,
@@ -106,6 +118,7 @@ def chunked_ce_loss(
         labels=labels,
         loss_mask=loss_mask,
         chunk_size=chunk_size,
+        logit_softcap=logit_softcap,
     )
     denom = mx.maximum(tokens, mx.array(1.0, dtype=mx.float32))
     return loss_sum / denom
@@ -119,6 +132,7 @@ def sparse_ce_loss_sum_and_tokens(
     label_positions: mx.array,
     label_pos_mask: mx.array,
     chunk_size: int,
+    logit_softcap: float = 0.0,
 ) -> Tuple[mx.array, mx.array]:
     """
     Compute masked cross entropy on selected token positions only.
@@ -163,6 +177,7 @@ def sparse_ce_loss_sum_and_tokens(
         labels=y_sel,
         loss_mask=m_sel,
         chunk_size=int(chunk_size),
+        logit_softcap=logit_softcap,
     )
 
 
@@ -174,6 +189,7 @@ def sparse_ce_loss(
     label_positions: mx.array,
     label_pos_mask: mx.array,
     chunk_size: int,
+    logit_softcap: float = 0.0,
 ) -> mx.array:
     loss_sum, tokens = sparse_ce_loss_sum_and_tokens(
         hidden=hidden,
@@ -182,6 +198,7 @@ def sparse_ce_loss(
         label_positions=label_positions,
         label_pos_mask=label_pos_mask,
         chunk_size=chunk_size,
+        logit_softcap=logit_softcap,
     )
     denom = mx.maximum(tokens, mx.array(1.0, dtype=mx.float32))
     return loss_sum / denom
@@ -194,6 +211,7 @@ def sequence_logprobs(
     labels: mx.array,
     loss_mask: mx.array,
     chunk_size: int,
+    logit_softcap: float = 0.0,
 ) -> mx.array:
     """
     Compute per-sequence average log-probabilities.
@@ -219,6 +237,7 @@ def sequence_logprobs(
 
     if chunk_size <= 0 or int(chunk_size) >= int(seq_len):
         logits = hidden @ lm_head_weight.transpose()
+        logits = _apply_logit_softcap(logits, softcap=logit_softcap)
         log_probs = nn.log_softmax(logits, axis=-1)
         token_logp = mx.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
         seq_logp = mx.sum(token_logp * mask, axis=1)
@@ -231,6 +250,7 @@ def sequence_logprobs(
         y = labels[:, start : start + chunk]
         m = mask[:, start : start + chunk]
         logits = h @ lm_head_weight.transpose()
+        logits = _apply_logit_softcap(logits, softcap=logit_softcap)
         log_probs = nn.log_softmax(logits, axis=-1)
         token_logp = mx.take_along_axis(log_probs, y[..., None], axis=-1).squeeze(-1)
         logp_sum = logp_sum + mx.sum(token_logp * m, axis=1)

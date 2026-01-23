@@ -301,6 +301,13 @@ def main() -> None:
     parser.add_argument("--out_dir", type=str, default="out/mlx")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--tokenizer_path", type=str, default="./model")
+    parser.add_argument(
+        "--tokenizer_type",
+        type=str,
+        choices=["auto", "hf", "rustbpe"],
+        default="auto",
+        help="Tokenizer backend: auto (prefer RustBPE), hf, or rustbpe.",
+    )
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument(
@@ -331,13 +338,7 @@ def main() -> None:
     parser.add_argument("--no_chat", action="store_true", help="Skip the open-ended chat demo prompt.")
     args = parser.parse_args()
 
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as e:
-        raise ImportError(
-            "Failed to import `transformers`. Install MLX training deps via "
-            "`python3 -m pip install -r mlx_train/requirements.txt`."
-        ) from e
+    from .tokenizer_utils import load_tokenizer
 
     ckpt = _resolve_checkpoint(args.checkpoint, out_dir=args.out_dir)
     cfg_dict = _load_config(ckpt)
@@ -348,7 +349,10 @@ def main() -> None:
     if int(cfg.lora_r) > 0:
         merge_lora(model)
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    tokenizer = load_tokenizer(
+        args.tokenizer_path,
+        tokenizer_type=str(args.tokenizer_type),
+    )
 
     seed = int(args.seed)
     max_seq_len: Optional[int] = args.max_seq_len

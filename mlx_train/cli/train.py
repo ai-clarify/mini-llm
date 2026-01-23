@@ -6,8 +6,12 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from queue import Queue
+from pathlib import Path
+from threading import Thread
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -16,10 +20,15 @@ import mlx.utils as mlx_utils
 
 from ..config import MiniLLMConfig, minillm_200mb
 from ..data import (
+    Bin2DDataset,
+    BinDataset,
+    detect_bin_format,
+    looks_like_bin_path,
     make_dpo_microbatch_iterator,
     make_microbatch_iterator,
     pretokenize_dpo_jsonl,
     pretokenize_jsonl,
+    resolve_bin_prefix,
     resolve_jsonl_paths,
 )
 from ..download import resolve_data_path_spec
@@ -32,6 +41,7 @@ from ..ops.loss import (
     sequence_logprobs,
     sparse_ce_loss,
 )
+from ..trace import TimingTracer, write_timing_trace
 
 
 def set_seed(seed: int) -> None:
@@ -70,6 +80,218 @@ def count_jsonl_samples(paths: Sequence[str]) -> int:
                 if line.strip():
                     total += 1
     return total
+
+
+def _run_cmd_first(cmds: Sequence[Sequence[str]]) -> Optional[str]:
+    for cmd in cmds:
+        try:
+            return subprocess.check_output(list(cmd), text=True).strip()
+        except Exception:
+            continue
+    return None
+
+
+def _read_sysctl_int(name: str) -> Optional[int]:
+    out = _run_cmd_first(
+        [
+            ["/usr/sbin/sysctl", "-n", name],
+            ["/usr/bin/sysctl", "-n", name],
+            ["sysctl", "-n", name],
+        ]
+    )
+    if out is None:
+        return None
+    try:
+        return int(out)
+    except ValueError:
+        return None
+
+
+def _read_vm_stat() -> Optional[str]:
+    return _run_cmd_first(
+        [
+            ["/usr/bin/vm_stat"],
+            ["/usr/sbin/vm_stat"],
+            ["vm_stat"],
+        ]
+    )
+
+
+def _parse_vm_stat() -> Tuple[Optional[int], Dict[str, int]]:
+    out = _read_vm_stat()
+    if not out:
+        return None, {}
+    page_size = None
+    pages: Dict[str, int] = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if "page size of" in line and "bytes" in line:
+            m = re.search(r"page size of (\d+) bytes", line)
+            if m:
+                page_size = int(m.group(1))
+            continue
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        key = key.strip().lower()
+        val = val.strip().strip(".")
+        try:
+            pages[key] = int(val)
+        except ValueError:
+            continue
+    return page_size, pages
+
+
+def _estimate_available_mem_bytes(*, mode: str = "available") -> Optional[int]:
+    page_size, pages = _parse_vm_stat()
+    if page_size is None or not pages:
+        return None
+    mode = str(mode).lower().strip()
+    if mode == "free":
+        keys = ("pages free", "pages speculative")
+    else:
+        # "available" includes reclaimable caches (inactive/purgeable).
+        keys = ("pages free", "pages inactive", "pages speculative", "pages purgeable")
+    avail_pages = 0
+    for key in keys:
+        if key in pages:
+            avail_pages += pages[key]
+    if avail_pages <= 0:
+        return None
+    avail_bytes = int(avail_pages) * int(page_size)
+    total_bytes = _read_sysctl_int("hw.memsize")
+    if total_bytes is not None and avail_bytes > total_bytes:
+        avail_bytes = total_bytes
+    return avail_bytes
+
+
+def _bytes_per_dtype(dtype: str) -> int:
+    dt = str(dtype).lower().strip()
+    if dt in ("float16", "bfloat16"):
+        return 2
+    if dt == "float32":
+        return 4
+    return 4
+
+
+def _estimate_bin_bytes(path: str) -> Optional[int]:
+    prefix = resolve_bin_prefix(path)
+    meta_path = Path(prefix + ".meta.json")
+    files: List[Path] = []
+    if meta_path.exists():
+        try:
+            with meta_path.open("r", encoding="utf-8") as f:
+                meta = json.load(f)
+            base_dir = meta_path.parent
+            ids = meta.get("ids", {})
+            ids_bin = ids.get("bin")
+            if ids_bin:
+                files.append(base_dir / str(ids_bin))
+            labels = meta.get("labels", {})
+            lbl_bin = labels.get("bin")
+            if lbl_bin:
+                files.append(base_dir / str(lbl_bin))
+        except Exception:
+            files = []
+    if not files:
+        ids_bin = Path(prefix + ".ids.bin")
+        if ids_bin.exists():
+            files.append(ids_bin)
+        lbl_bin = Path(prefix + ".lbl.bin")
+        if lbl_bin.exists():
+            files.append(lbl_bin)
+    if not files:
+        return None
+    total = 0
+    for p in files:
+        try:
+            total += int(p.stat().st_size)
+        except Exception:
+            continue
+    return total or None
+
+
+def _choose_bin_cache(
+    path: str,
+    cache: str,
+    *,
+    avail_bytes: Optional[int],
+    reserve_mb: int = 2048,
+    ratio: float = 0.35,
+) -> str:
+    cache = str(cache).lower().strip()
+    if cache != "auto":
+        return cache
+    bin_bytes = _estimate_bin_bytes(path)
+    if bin_bytes is None:
+        return "mmap"
+    if avail_bytes is None:
+        return "mmap"
+    reserve = int(reserve_mb) * 1024 * 1024
+    budget = max(0, int(avail_bytes) - reserve)
+    if budget <= 0:
+        return "mmap"
+    if bin_bytes <= int(budget * float(ratio)):
+        return "memory"
+    return "mmap"
+
+
+def _auto_logits_chunk_size(
+    *,
+    batch_size: int,
+    seq_len: int,
+    vocab_size: int,
+    dtype: str,
+    mem_limit_bytes: int,
+    sparse_loss: bool,
+    label_bucket_sizes: Optional[Sequence[int]],
+    budget_ratio: float = 0.25,
+) -> int:
+    if mem_limit_bytes <= 0:
+        return 0
+    label_len = int(seq_len)
+    if sparse_loss and label_bucket_sizes:
+        label_len = int(max(label_bucket_sizes))
+    bytes_per = _bytes_per_dtype(dtype)
+    full_bytes = int(batch_size) * int(label_len) * int(vocab_size) * int(bytes_per)
+    budget = int(float(mem_limit_bytes) * float(budget_ratio))
+    if budget <= 0 or full_bytes <= budget:
+        return 0
+    per_step = int(batch_size) * int(vocab_size) * int(bytes_per)
+    if per_step <= 0:
+        return 0
+    chunk = max(1, min(int(seq_len), int(budget // per_step)))
+    return int(chunk)
+
+
+def prefetch_iterator(items: Iterator[Any], *, prefetch: int) -> Iterator[Any]:
+    if int(prefetch) <= 0:
+        yield from items
+        return
+
+    queue: Queue[Any] = Queue(maxsize=int(prefetch))
+    sentinel = object()
+    errors: List[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            for item in items:
+                queue.put(item)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            queue.put(sentinel)
+
+    Thread(target=_worker, daemon=True).start()
+    while True:
+        item = queue.get()
+        if item is sentinel:
+            if errors:
+                raise errors[0]
+            break
+        yield item
 
 
 def estimate_steps_per_epoch(num_samples: int, batch_size: int, accum_steps: int) -> int:
@@ -317,6 +539,84 @@ def compile_train_step(
     return compiled
 
 
+def parse_int_schedule(spec: Optional[str]) -> List[Tuple[int, int]]:
+    if not spec:
+        return []
+    items: List[Tuple[int, int]] = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            step_s, val_s = part.split(":", 1)
+        elif "=" in part:
+            step_s, val_s = part.split("=", 1)
+        else:
+            continue
+        try:
+            step = int(step_s.strip())
+            val = int(val_s.strip())
+        except ValueError:
+            continue
+        items.append((step, val))
+    items.sort(key=lambda x: x[0])
+    return items
+
+
+def schedule_value(step: int, schedule: List[Tuple[int, int]], default: int) -> int:
+    if not schedule:
+        return int(default)
+    cur = int(default)
+    for s, v in schedule:
+        if int(step) >= int(s):
+            cur = int(v)
+        else:
+            break
+    return int(cur)
+
+
+def parse_skip_connections(spec: Optional[str]) -> Optional[List[List[int]]]:
+    if not spec:
+        return None
+    pairs: List[List[int]] = []
+    for part in str(spec).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "->" in part:
+            left, right = part.split("->", 1)
+        elif ":" in part:
+            left, right = part.split(":", 1)
+        elif "-" in part:
+            left, right = part.split("-", 1)
+        else:
+            continue
+        try:
+            src = int(left.strip())
+            tgt = int(right.strip())
+        except ValueError:
+            continue
+        pairs.append([src, tgt])
+    return pairs or None
+
+
+def build_slow_param_mask(model: MiniLLMForCausalLM) -> Any:
+    targets = {id(model.model.embed_tokens.weight), id(model.lm_head_weight())}
+
+    def _mask(p: Any) -> Any:
+        if isinstance(p, mx.array):
+            return mx.array(1.0 if id(p) in targets else 0.0, dtype=p.dtype)
+        if isinstance(p, dict):
+            return {k: _mask(v) for k, v in p.items()}
+        if isinstance(p, list):
+            return [_mask(v) for v in p]
+        if isinstance(p, tuple):
+            return tuple(_mask(v) for v in p)
+        return p
+
+    return _mask(model.trainable_parameters())
+
+
 def loss_fn(
     model: MiniLLMForCausalLM,
     x: mx.array,
@@ -326,12 +626,14 @@ def loss_fn(
     logits_chunk_size: int,
 ) -> mx.array:
     hidden, mtp_hidden, aux_loss = model.forward_with_mtp_hidden(x)
+    logit_softcap = float(model.config.logit_softcap)
     loss = chunked_ce_loss(
         hidden=hidden,
-        lm_head_weight=model.model.embed_tokens.weight,
+        lm_head_weight=model.lm_head_weight(),
         labels=y,
         loss_mask=loss_mask,
         chunk_size=int(logits_chunk_size),
+        logit_softcap=logit_softcap,
     )
     if mtp_hidden and float(model.config.mtp_loss_weight) > 0.0:
         mtp_loss = mx.array(0.0, dtype=mx.float32)
@@ -342,10 +644,11 @@ def loss_fn(
                 continue
             mtp_loss = mtp_loss + chunked_ce_loss(
                 hidden=mtp_h[:, :-offset, :],
-                lm_head_weight=model.model.embed_tokens.weight,
+                lm_head_weight=model.lm_head_weight(),
                 labels=y[:, offset:],
                 loss_mask=loss_mask[:, offset:],
                 chunk_size=int(logits_chunk_size),
+                logit_softcap=logit_softcap,
             )
             count += 1
         if count > 0:
@@ -364,13 +667,15 @@ def sparse_loss_fn(
     logits_chunk_size: int,
 ) -> mx.array:
     hidden, _, aux_loss = model.forward_with_mtp_hidden(x)
+    logit_softcap = float(model.config.logit_softcap)
     loss = sparse_ce_loss(
         hidden=hidden,
-        lm_head_weight=model.model.embed_tokens.weight,
+        lm_head_weight=model.lm_head_weight(),
         labels=y,
         label_positions=label_positions,
         label_pos_mask=label_pos_mask,
         chunk_size=int(logits_chunk_size),
+        logit_softcap=logit_softcap,
     )
     return loss + aux_loss
 
@@ -402,15 +707,17 @@ def r1_loss_fn(
     r1_token_weight: float,
 ) -> mx.array:
     hidden, mtp_hidden, aux_loss = model.forward_with_mtp_hidden(x)
+    logit_softcap = float(model.config.logit_softcap)
     base_mask, weighted_mask = _r1_weighted_mask(
         y, loss_mask, special_ids=r1_special_ids, token_weight=r1_token_weight
     )
     loss_sum, _ = chunked_ce_loss_sum_and_tokens(
         hidden=hidden,
-        lm_head_weight=model.model.embed_tokens.weight,
+        lm_head_weight=model.lm_head_weight(),
         labels=y,
         loss_mask=weighted_mask,
         chunk_size=int(logits_chunk_size),
+        logit_softcap=logit_softcap,
     )
     base_tokens = mx.sum(base_mask)
     denom = mx.maximum(base_tokens, mx.array(1.0, dtype=mx.float32))
@@ -424,10 +731,11 @@ def r1_loss_fn(
                 continue
             mtp_loss = mtp_loss + chunked_ce_loss(
                 hidden=mtp_h[:, :-offset, :],
-                lm_head_weight=model.model.embed_tokens.weight,
+                lm_head_weight=model.lm_head_weight(),
                 labels=y[:, offset:],
                 loss_mask=weighted_mask[:, offset:],
                 chunk_size=int(logits_chunk_size),
+                logit_softcap=logit_softcap,
             )
             count += 1
         if count > 0:
@@ -448,19 +756,21 @@ def dpo_loss_fn(
     hidden, _, _ = model.forward_with_mtp_hidden(x)
     policy_logp = sequence_logprobs(
         hidden=hidden,
-        lm_head_weight=model.model.embed_tokens.weight,
+        lm_head_weight=model.lm_head_weight(),
         labels=y,
         loss_mask=loss_mask,
         chunk_size=int(logits_chunk_size),
+        logit_softcap=float(model.config.logit_softcap),
     )
     ref_hidden, _, _ = ref_model.forward_with_mtp_hidden(x)
     ref_hidden = mx.stop_gradient(ref_hidden)
     ref_logp = sequence_logprobs(
         hidden=ref_hidden,
-        lm_head_weight=ref_model.model.embed_tokens.weight,
+        lm_head_weight=ref_model.lm_head_weight(),
         labels=y,
         loss_mask=loss_mask,
         chunk_size=int(logits_chunk_size),
+        logit_softcap=float(ref_model.config.logit_softcap),
     )
     return dpo_loss(policy_logp=policy_logp, ref_logp=ref_logp, beta=float(beta))
 
@@ -503,6 +813,38 @@ def make_config(args, tokenizer) -> MiniLLMConfig:
     cfg.lora_targets = str(args.lora_targets)
     cfg.num_nextn_predict_layers = int(args.mtp_layers)
     cfg.mtp_loss_weight = float(args.mtp_loss_weight)
+    cfg.hidden_act = str(args.hidden_act)
+    cfg.qk_norm = bool(args.qk_norm)
+    cfg.qk_norm_eps = float(args.qk_norm_eps)
+    cfg.logit_softcap = float(args.logit_softcap)
+    cfg.value_mix = float(args.value_mix)
+    cfg.residual_scale = float(args.residual_scale)
+    cfg.zero_init_residual = bool(args.zero_init_residual)
+    cfg.residual_decay = float(args.residual_decay)
+    cfg.tie_word_embeddings = bool(args.tie_word_embeddings)
+    cfg.untie_lm_head_at_ratio = float(args.untie_lm_head_at_ratio)
+    cfg.embed_skip_scale = float(args.embed_skip_scale)
+    cfg.embed_skip_gate = bool(args.embed_skip_gate)
+    cfg.skip_connections = parse_skip_connections(args.skip_connections)
+    cfg.skip_scale = float(args.skip_scale)
+    cfg.skip_gate = bool(args.skip_gate)
+    cfg.value_embed_count = int(args.value_embed_count)
+    cfg.value_embed_scale = float(args.value_embed_scale)
+    cfg.value_embed_gate = bool(args.value_embed_gate)
+    cfg.value_embed_repeat_ends = bool(args.value_embed_repeat_ends)
+    cfg.smear = bool(args.smear)
+    cfg.smear_scale = float(args.smear_scale)
+    cfg.bigram_hash_size = int(args.bigram_hash_size)
+    cfg.bigram_hash_scale = float(args.bigram_hash_scale)
+    cfg.bigram_hash_base = int(args.bigram_hash_base)
+    cfg.partial_key_offset = int(args.partial_key_offset)
+    cfg.paired_heads = bool(args.paired_heads)
+    cfg.attn_window = int(args.attn_window)
+    cfg.attn_global_tokens = int(args.attn_global_tokens)
+    cfg.sparse_attn_gate = bool(args.sparse_attn_gate)
+    cfg.sparse_attn_gate_topk = int(args.sparse_attn_gate_topk)
+    cfg.back_out_ratio = float(args.back_out_ratio)
+    cfg.back_out_scale = float(args.back_out_scale)
 
     moe_args = [
         args.n_routed_experts,
@@ -616,6 +958,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="MiniLLM (MLX) training")
     parser.add_argument("--tokenizer_path", type=str, default="./model")
     parser.add_argument(
+        "--tokenizer_type",
+        type=str,
+        choices=["auto", "hf", "rustbpe"],
+        default="auto",
+        help="Tokenizer backend: auto (prefer RustBPE), hf, or rustbpe.",
+    )
+    parser.add_argument(
         "--data_path",
         type=str,
         required=True,
@@ -675,6 +1024,20 @@ def main() -> None:
         help="Safety guard for remote dataset downloads (MB); set 0 to disable.",
     )
     parser.add_argument(
+        "--data_format",
+        type=str,
+        choices=["auto", "jsonl", "bin", "bin2d"],
+        default="auto",
+        help="Dataset format: jsonl, bin (mlx bin format), bin2d (fixed-length), or auto-detect.",
+    )
+    parser.add_argument(
+        "--bin_cache",
+        type=str,
+        choices=["mmap", "memory", "auto"],
+        default="mmap",
+        help="Binary dataset cache mode: mmap, memory, or auto (choose based on free RAM).",
+    )
+    parser.add_argument(
         "--task", type=str, choices=["pretrain", "sft", "r1", "dpo"], default="pretrain"
     )
 
@@ -689,6 +1052,199 @@ def main() -> None:
     parser.add_argument("--max_position_embeddings", type=int, default=32768)
     parser.add_argument("--rope_theta", type=float, default=1_000_000.0)
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument(
+        "--hidden_act",
+        type=str,
+        default="silu",
+        choices=["silu", "relu2"],
+        help="MLP activation (silu or relu2).",
+    )
+    parser.add_argument(
+        "--tie_word_embeddings",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Tie input embedding and lm_head weights (default: True).",
+    )
+    parser.add_argument(
+        "--untie_lm_head_at_ratio",
+        type=float,
+        default=0.0,
+        help="Untie embed/lm_head at this fraction of total steps (0 = disable).",
+    )
+    parser.add_argument(
+        "--embed_skip_scale",
+        type=float,
+        default=0.0,
+        help="Scale for embedding skip added into each block (0 = disable).",
+    )
+    parser.add_argument(
+        "--embed_skip_gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Learn a gate for the embedding skip connection.",
+    )
+    parser.add_argument(
+        "--skip_connections",
+        type=str,
+        default=None,
+        help="Comma-separated skip pairs like '3->6,5->7' (0-indexed).",
+    )
+    parser.add_argument(
+        "--skip_scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for cross-layer skip connections.",
+    )
+    parser.add_argument(
+        "--skip_gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Learn gates for cross-layer skip connections.",
+    )
+    parser.add_argument(
+        "--value_embed_count",
+        type=int,
+        default=0,
+        help="Number of extra value embedding tables (0 = disable).",
+    )
+    parser.add_argument(
+        "--value_embed_scale",
+        type=float,
+        default=0.0,
+        help="Scale for extra value embeddings mixed into attention values.",
+    )
+    parser.add_argument(
+        "--value_embed_gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Learn a gate for value embedding mix.",
+    )
+    parser.add_argument(
+        "--value_embed_repeat_ends",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Repeat value embeddings on first/last layers.",
+    )
+    parser.add_argument(
+        "--smear",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable smear module (1-token lookback).",
+    )
+    parser.add_argument(
+        "--smear_scale",
+        type=float,
+        default=0.0,
+        help="Scale for smear module output.",
+    )
+    parser.add_argument(
+        "--bigram_hash_size",
+        type=int,
+        default=0,
+        help="Bigram hash embedding table size (0 = disable).",
+    )
+    parser.add_argument(
+        "--bigram_hash_scale",
+        type=float,
+        default=0.0,
+        help="Scale for bigram hash embeddings.",
+    )
+    parser.add_argument(
+        "--bigram_hash_base",
+        type=int,
+        default=1000003,
+        help="Hash base for bigram embeddings.",
+    )
+    parser.add_argument(
+        "--qk_norm",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Apply RMS normalization to Q/K vectors before attention.",
+    )
+    parser.add_argument(
+        "--qk_norm_eps",
+        type=float,
+        default=1e-6,
+        help="Epsilon for Q/K RMS normalization.",
+    )
+    parser.add_argument(
+        "--logit_softcap",
+        type=float,
+        default=0.0,
+        help="If >0, apply tanh softcap to logits (cap * tanh(logits/cap)).",
+    )
+    parser.add_argument(
+        "--value_mix",
+        type=float,
+        default=0.0,
+        help="Mix input projection into attention values (0 = disable).",
+    )
+    parser.add_argument(
+        "--partial_key_offset",
+        type=int,
+        default=0,
+        help="Shift rotary positions for keys by this offset.",
+    )
+    parser.add_argument(
+        "--paired_heads",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pair adjacent attention heads (averaged).",
+    )
+    parser.add_argument(
+        "--attn_window",
+        type=int,
+        default=0,
+        help="Sliding window size for attention (0 = full causal).",
+    )
+    parser.add_argument(
+        "--attn_global_tokens",
+        type=int,
+        default=0,
+        help="Number of global tokens always visible in window attention.",
+    )
+    parser.add_argument(
+        "--sparse_attn_gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable per-head attention gating with optional top-k sparsity.",
+    )
+    parser.add_argument(
+        "--sparse_attn_gate_topk",
+        type=int,
+        default=0,
+        help="Keep top-k attention head gates when sparse gating is enabled (0 = keep all).",
+    )
+    parser.add_argument(
+        "--residual_scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for residual branches (1.0 = default).",
+    )
+    parser.add_argument(
+        "--residual_decay",
+        type=float,
+        default=0.0,
+        help="Exponential decay rate for residual scale across layers.",
+    )
+    parser.add_argument(
+        "--zero_init_residual",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Zero-initialize attention/MLP output projections.",
+    )
+    parser.add_argument(
+        "--back_out_ratio",
+        type=float,
+        default=0.0,
+        help="Subtract hidden state at this fraction of layers before final norm (0 = disable).",
+    )
+    parser.add_argument(
+        "--back_out_scale",
+        type=float,
+        default=1.0,
+        help="Scale for back-out hidden subtraction.",
+    )
     parser.add_argument("--mtp_layers", type=int, default=1, help="Number of MTP predictor layers.")
     parser.add_argument("--mtp_loss_weight", type=float, default=0.1, help="Weight for MTP auxiliary loss.")
     parser.add_argument(
@@ -770,12 +1326,31 @@ def main() -> None:
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--accum_steps", type=int, default=1)
+    parser.add_argument(
+        "--batch_size_schedule",
+        type=str,
+        default=None,
+        help="Optional batch size schedule like '0:24,1000:32' (applied at epoch boundaries).",
+    )
+    parser.add_argument(
+        "--accum_schedule",
+        type=str,
+        default=None,
+        help="Optional accum_steps schedule like '0:2,1000:1' (applied at epoch boundaries).",
+    )
     parser.add_argument("--learning_rate", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0.1)
     parser.add_argument(
+        "--weight_decay_schedule",
+        type=str,
+        default="none",
+        choices=["none", "lr"],
+        help="Weight decay schedule: none or lr (scale by lr/base_lr).",
+    )
+    parser.add_argument(
         "--optimizer",
         type=str,
-        choices=["adamw", "adafactor", "lion"],
+        choices=["adamw", "adafactor", "lion", "muon"],
         default="adamw",
         help="Optimizer for full-parameter training.",
     )
@@ -786,16 +1361,126 @@ def main() -> None:
         default="float32",
         help="AdamW optimizer state dtype: float32 (stable, memory-heavy) or param (uses parameter dtype).",
     )
+    parser.add_argument("--muon_momentum", type=float, default=0.9)
+    parser.add_argument("--muon_ns_steps", type=int, default=5)
+    parser.add_argument("--muon_eps", type=float, default=1e-7)
+    parser.add_argument("--muon_adam_beta1", type=float, default=0.9)
+    parser.add_argument("--muon_adam_beta2", type=float, default=0.999)
+    parser.add_argument("--muon_adam_eps", type=float, default=1e-8)
+    parser.add_argument(
+        "--muon_adam_for_1d",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use AdamW-style update for 1D parameters when optimizer=muon.",
+    )
+    parser.add_argument(
+        "--muon_variant",
+        type=str,
+        choices=["default", "polar", "norm"],
+        default="default",
+        help="Muon variant: default | polar (fewer NS steps) | norm (normalize update).",
+    )
+    parser.add_argument(
+        "--muon_normalize_update",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Normalize Muon update to unit Frobenius norm.",
+    )
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument(
+        "--slow_embed_head_steps",
+        type=int,
+        default=1,
+        help="Update embedding/lm_head every N steps (1 = normal).",
+    )
     parser.add_argument("--warmup_steps", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max_steps", type=int, default=None)
     parser.add_argument("--shuffle_buffer", type=int, default=2048)
     parser.add_argument(
+        "--pack_pretrain",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pack pretrain documents into full sequences to reduce padding (pretrain only).",
+    )
+    parser.add_argument(
+        "--pack_eos",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When packing, append EOS tokens between documents.",
+    )
+    parser.add_argument(
+        "--pack_no_doc_split",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="When packing, do not split a document across sequences (align batch starts with EOS).",
+    )
+    parser.add_argument(
+        "--max_doc_tokens",
+        type=int,
+        default=0,
+        help="Optional per-document token cap before packing/truncation (0 = no cap).",
+    )
+    parser.add_argument(
+        "--drop_long",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Drop documents longer than --max_doc_tokens instead of truncating.",
+    )
+    parser.add_argument(
         "--cache_tokenized",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Pre-tokenize the dataset once and reuse token IDs across epochs (trades RAM for speed).",
+    )
+    parser.add_argument(
+        "--prefetch_batches",
+        type=int,
+        default=0,
+        help="Prefetch N micro-batch groups in a background thread to overlap CPU data prep with GPU compute.",
+    )
+    parser.add_argument(
+        "--log_memory",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Log MLX Metal memory stats (active/cache/peak) alongside training metrics.",
+    )
+    parser.add_argument(
+        "--memory_limit_mb",
+        type=int,
+        default=0,
+        help="Optional MLX Metal memory limit in MB (0 = no limit).",
+    )
+    parser.add_argument(
+        "--memory_limit_auto_ratio",
+        type=float,
+        default=0.0,
+        help="Auto-set memory limit as ratio of estimated free memory (0 = disable).",
+    )
+    parser.add_argument(
+        "--memory_limit_auto_mode",
+        type=str,
+        choices=["available", "free"],
+        default="free",
+        help="Memory estimation mode for auto limit (free uses free+speculative only).",
+    )
+    parser.add_argument(
+        "--memory_limit_auto_reserve_mb",
+        type=int,
+        default=0,
+        help="Reserve MiB from auto-estimated memory to avoid OS pressure (0 = no reserve).",
+    )
+    parser.add_argument(
+        "--memory_limit_auto_min_mb",
+        type=int,
+        default=0,
+        help="Minimum MiB when auto memory limit is enabled (0 = no minimum).",
+    )
+    parser.add_argument(
+        "--memory_limit_auto_max_mb",
+        type=int,
+        default=0,
+        help="Maximum MiB when auto memory limit is enabled (0 = no maximum).",
     )
     parser.add_argument(
         "--keep_last_checkpoints",
@@ -818,7 +1503,12 @@ def main() -> None:
     )
     parser.add_argument("--out_dir", type=str, default="./out/mlx")
     parser.add_argument("--log_interval", type=int, default=10)
-    parser.add_argument("--save_interval", type=int, default=200)
+    parser.add_argument(
+        "--save_interval",
+        type=int,
+        default=200,
+        help="Save a checkpoint every N steps (0 to disable).",
+    )
     parser.add_argument(
         "--tensorboard_dir",
         type=str,
@@ -830,7 +1520,10 @@ def main() -> None:
         "--logits_chunk_size",
         type=int,
         default=0,
-        help="Compute CE loss in sequence chunks to avoid materializing full [B,T,V] logits (0 = disable).",
+        help=(
+            "Compute CE loss in sequence chunks to avoid materializing full [B,T,V] logits "
+            "(0 = disable; may auto-tune when memory limit is enabled)."
+        ),
     )
     parser.add_argument(
         "--sparse_loss",
@@ -910,6 +1603,29 @@ def main() -> None:
         help="Ignore the first N steps for timing stats when --profile_timing is enabled.",
     )
     parser.add_argument(
+        "--trace_timing_out",
+        type=str,
+        default=None,
+        help="Write a fine-grained timing trace JSON to a file or directory (disables compile for traced steps).",
+    )
+    parser.add_argument(
+        "--trace_timing_steps",
+        type=int,
+        default=1,
+        help="Number of optimizer steps to trace when --trace_timing_out is set.",
+    )
+    parser.add_argument(
+        "--trace_timing_start_step",
+        type=int,
+        default=None,
+        help="Which global step to start timing trace (default: first step after resume).",
+    )
+    parser.add_argument(
+        "--trace_timing_memory",
+        action="store_true",
+        help="Include active/peak memory snapshots in timing trace events.",
+    )
+    parser.add_argument(
         "--compile",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -955,6 +1671,30 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    batch_schedule = parse_int_schedule(args.batch_size_schedule)
+    accum_schedule = parse_int_schedule(args.accum_schedule)
+
+    if int(args.slow_embed_head_steps) > 1 and (bool(args.compile) or bool(args.compile_optimizer)):
+        print("[warn] slow_embed_head_steps requires Python update path; disabling --compile/--compile_optimizer")
+        args.compile = False
+        args.compile_optimizer = False
+
+    if (
+        args.preset in ("200mb", "tiny")
+        and int(args.memory_limit_mb) == 0
+        and float(args.memory_limit_auto_ratio) == 0.0
+        and int(args.memory_limit_auto_reserve_mb) == 0
+        and int(args.memory_limit_auto_max_mb) == 0
+    ):
+        args.memory_limit_auto_ratio = 0.9
+        args.memory_limit_auto_mode = "available"
+        args.memory_limit_auto_reserve_mb = 2048
+        args.memory_limit_auto_max_mb = 0
+        print(
+            f"[metal] default auto memory limit for preset={args.preset}: "
+            "mode=available ratio=0.90 reserve=2048MiB max=0MiB"
+        )
+
     if args.init_from and args.resume:
         raise ValueError("`--init_from` and `--resume` are mutually exclusive.")
 
@@ -973,17 +1713,50 @@ def main() -> None:
     ckpt_dir = os.path.join(args.out_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    avail_mem_bytes: Optional[int] = None
+    mem_limit_mb = int(args.memory_limit_mb)
+    if mem_limit_mb <= 0 and float(args.memory_limit_auto_ratio) > 0.0:
+        avail = _estimate_available_mem_bytes(mode=str(args.memory_limit_auto_mode))
+        if avail is not None:
+            avail_mem_bytes = int(avail)
+            ratio = float(args.memory_limit_auto_ratio)
+            reserve_mb = int(args.memory_limit_auto_reserve_mb)
+            mem_limit_mb = int((avail / 1024 / 1024) * ratio) - reserve_mb
+            min_mb = int(args.memory_limit_auto_min_mb)
+            max_mb = int(args.memory_limit_auto_max_mb)
+            if mem_limit_mb < 0:
+                mem_limit_mb = 0
+            if min_mb > 0:
+                mem_limit_mb = max(mem_limit_mb, min_mb)
+            if max_mb > 0:
+                mem_limit_mb = min(mem_limit_mb, max_mb)
+            print(
+                f"[metal] auto memory limit: avail={int(avail / 1024 / 1024)}MiB "
+                f"mode={args.memory_limit_auto_mode} ratio={ratio:.2f} "
+                f"reserve={reserve_mb}MiB -> limit={mem_limit_mb}MiB"
+            )
+        else:
+            print("[warn] auto memory limit requested but could not estimate free memory")
+
+    if mem_limit_mb > 0:
+        limit_bytes = int(mem_limit_mb) * 1024 * 1024
+        try:
+            if hasattr(mx, "set_memory_limit"):
+                mx.set_memory_limit(limit_bytes)
+            else:
+                mx.metal.set_memory_limit(limit_bytes)
+            print(f"[metal] memory_limit_mb={int(mem_limit_mb)}")
+        except Exception as exc:
+            print(f"[warn] failed to set memory limit: {exc}")
+
     set_seed(args.seed)
 
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as e:
-        raise ImportError(
-            "Failed to import `transformers`. Install MLX training deps via "
-            "`python3 -m pip install -r mlx_train/requirements.txt`."
-        ) from e
+    from .tokenizer_utils import load_tokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    tokenizer = load_tokenizer(
+        args.tokenizer_path,
+        tokenizer_type=str(args.tokenizer_type),
+    )
     if tokenizer.pad_token_id is None:
         raise ValueError("Tokenizer must define pad_token_id.")
 
@@ -1016,19 +1789,56 @@ def main() -> None:
         ms_cache_dir=args.ms_cache_dir,
         ms_revision=args.ms_revision,
     )
-    paths = resolve_jsonl_paths(data_spec)
+    bin_dataset: Optional[BinDataset] = None
+    bin2d_dataset: Optional[Bin2DDataset] = None
+    paths: Sequence[str] = []
+    fmt = str(args.data_format)
+    if fmt == "auto":
+        detected = detect_bin_format(str(data_spec))
+        fmt = detected if detected is not None else "jsonl"
+    if fmt == "bin2d":
+        if is_dpo:
+            raise ValueError("Binary datasets are not supported for DPO.")
+        avail_for_cache = avail_mem_bytes or _estimate_available_mem_bytes(mode="available")
+        bin_cache = _choose_bin_cache(
+            str(data_spec), str(args.bin_cache), avail_bytes=avail_for_cache
+        )
+        if str(args.bin_cache) == "auto":
+            print(f"[data] bin_cache=auto resolved to {bin_cache}")
+        bin2d_dataset = Bin2DDataset(str(data_spec), cache=str(bin_cache))
+        print(f"[data] using bin2d dataset: {data_spec}")
+    elif fmt == "bin":
+        if is_dpo:
+            raise ValueError("Binary datasets are not supported for DPO.")
+        avail_for_cache = avail_mem_bytes or _estimate_available_mem_bytes(mode="available")
+        bin_cache = _choose_bin_cache(
+            str(data_spec), str(args.bin_cache), avail_bytes=avail_for_cache
+        )
+        if str(args.bin_cache) == "auto":
+            print(f"[data] bin_cache=auto resolved to {bin_cache}")
+        bin_dataset = BinDataset(str(data_spec), cache=str(bin_cache))
+        print(f"[data] using bin dataset: {data_spec}")
+    else:
+        paths = resolve_jsonl_paths(data_spec)
     cached_dataset = None
     if args.cache_tokenized:
-        if is_dpo:
-            cached_dataset = pretokenize_dpo_jsonl(paths=paths, tokenizer=tokenizer)
+        if bin_dataset is not None or bin2d_dataset is not None:
+            print("[warn] --cache_tokenized ignored for binary datasets")
         else:
-            cached_dataset = pretokenize_jsonl(paths=paths, tokenizer=tokenizer, task=args.task)
-        print(f"[data] cached {len(cached_dataset)} tokenized samples for reuse")
+            if is_dpo:
+                cached_dataset = pretokenize_dpo_jsonl(paths=paths, tokenizer=tokenizer)
+            else:
+                cached_dataset = pretokenize_jsonl(paths=paths, tokenizer=tokenizer, task=args.task)
+            print(f"[data] cached {len(cached_dataset)} tokenized samples for reuse")
 
     estimated_samples: Optional[int] = None
     estimated_steps_per_epoch: Optional[int] = None
     if args.max_steps is None:
-        if cached_dataset is not None:
+        if bin2d_dataset is not None:
+            estimated_samples = len(bin2d_dataset)
+        elif bin_dataset is not None:
+            estimated_samples = len(bin_dataset)
+        elif cached_dataset is not None:
             estimated_samples = len(cached_dataset)
         else:
             estimated_samples = count_jsonl_samples(paths)
@@ -1179,9 +1989,22 @@ def main() -> None:
         learning_rate=float(args.learning_rate),
         weight_decay=float(args.weight_decay),
         state_dtype=str(args.optim_state_dtype),
+        muon_momentum=float(args.muon_momentum),
+        muon_ns_steps=int(args.muon_ns_steps),
+        muon_eps=float(args.muon_eps),
+        muon_adam_beta1=float(args.muon_adam_beta1),
+        muon_adam_beta2=float(args.muon_adam_beta2),
+        muon_adam_eps=float(args.muon_adam_eps),
+        muon_adam_for_1d=bool(args.muon_adam_for_1d),
+        muon_variant=str(args.muon_variant),
+        muon_normalize_update=bool(args.muon_normalize_update),
     )
     if resume_optimizer_path is not None:
         load_optimizer_state(optimizer, resume_optimizer_path)
+
+    slow_steps = max(1, int(args.slow_embed_head_steps))
+    slow_param_mask = build_slow_param_mask(model) if slow_steps > 1 else None
+    slow_grad_accum: Optional[Any] = None
 
     # Estimate total steps for lr scheduling (best-effort).
     if args.max_steps is not None:
@@ -1196,6 +2019,11 @@ def main() -> None:
     else:
         total_steps = 50_000
 
+    untie_step: Optional[int] = None
+    if float(args.untie_lm_head_at_ratio) > 0.0 and total_steps > 0:
+        untie_step = int(float(args.untie_lm_head_at_ratio) * float(total_steps))
+        untie_step = max(0, untie_step)
+
     tb_writer = None
     if args.tensorboard_dir:
         os.makedirs(args.tensorboard_dir, exist_ok=True)
@@ -1204,8 +2032,44 @@ def main() -> None:
             print(f"[tb] logging to {args.tensorboard_dir}")
 
     model.train()
-    effective_batch_size = int(args.batch_size) * (2 if is_dpo else 1)
+    cur_batch_size = schedule_value(start_step, batch_schedule, int(args.batch_size))
+    cur_accum_steps = schedule_value(start_step, accum_schedule, int(args.accum_steps))
+    effective_batch_size = int(cur_batch_size) * (2 if is_dpo else 1)
     use_sparse_loss = bool(args.sparse_loss) if not (is_dpo or is_r1) else False
+
+    bucket_sizes = None
+    if args.bucket_sizes is not None:
+        bucket_sizes = [int(s) for s in str(args.bucket_sizes).split(",") if s.strip()]
+
+    label_bucket_sizes = None
+    if args.label_bucket_sizes is not None:
+        label_bucket_sizes = [int(s) for s in str(args.label_bucket_sizes).split(",") if s.strip()]
+
+    auto_logits_chunk = int(args.logits_chunk_size) == 0 and int(mem_limit_mb) > 0
+    if auto_logits_chunk:
+        label_len = int(args.seq_len)
+        if use_sparse_loss and label_bucket_sizes:
+            label_len = int(max(label_bucket_sizes))
+        bytes_per = _bytes_per_dtype(str(args.dtype))
+        full_logits_bytes = (
+            int(effective_batch_size) * int(label_len) * int(model.config.vocab_size) * int(bytes_per)
+        )
+        auto_chunk = _auto_logits_chunk_size(
+            batch_size=int(effective_batch_size),
+            seq_len=int(args.seq_len),
+            vocab_size=int(model.config.vocab_size),
+            dtype=str(args.dtype),
+            mem_limit_bytes=int(mem_limit_mb) * 1024 * 1024,
+            sparse_loss=bool(use_sparse_loss),
+            label_bucket_sizes=label_bucket_sizes,
+        )
+        if auto_chunk > 0:
+            args.logits_chunk_size = int(auto_chunk)
+            print(
+                "[mem] auto logits_chunk_size="
+                f"{int(args.logits_chunk_size)} (batch={effective_batch_size} "
+                f"full_logits={full_logits_bytes / 1024 / 1024:.1f}MiB)"
+            )
     if is_dpo:
         if ref_model is None:
             raise RuntimeError("DPO reference model was not initialized.")
@@ -1248,29 +2112,33 @@ def main() -> None:
     compiled_value_and_grads: Dict[Tuple[int, int], Callable[..., Tuple[mx.array, Any]]] = {}
     compiled_opt_step: Optional[Callable[..., mx.array]] = None
 
-    def get_compiled_train_step(seq_len: int, label_len: int) -> Callable[..., Tuple[mx.array, mx.array]]:
-        key = (int(seq_len), int(label_len) if use_sparse_loss else 0)
+    def get_compiled_train_step(
+        seq_len: int, label_len: int, *, eff_batch: int, accum_steps: int
+    ) -> Callable[..., Tuple[mx.array, mx.array]]:
+        key = (int(seq_len), int(label_len) if use_sparse_loss else 0, int(eff_batch), int(accum_steps))
         if key not in compiled_train_steps:
             compiled_train_steps[key] = compile_train_step(
                 model=model,
                 optimizer=optimizer,
                 value_and_grad=raw_value_and_grad,
-                batch_size=int(effective_batch_size),
+                batch_size=int(eff_batch),
                 seq_len=int(seq_len),
                 label_len=int(label_len),
-                accum_steps=int(args.accum_steps),
+                accum_steps=int(accum_steps),
                 grad_clip=float(args.grad_clip),
                 sparse_loss=bool(use_sparse_loss),
             )
         return compiled_train_steps[key]
 
-    def get_value_and_grad(seq_len: int, label_len: int) -> Callable[..., Tuple[mx.array, Any]]:
-        key = (int(seq_len), int(label_len) if use_sparse_loss else 0)
+    def get_value_and_grad(
+        seq_len: int, label_len: int, *, eff_batch: int, accum_steps: int
+    ) -> Callable[..., Tuple[mx.array, Any]]:
+        key = (int(seq_len), int(label_len) if use_sparse_loss else 0, int(eff_batch), int(accum_steps))
         if key not in compiled_value_and_grads:
             compiled_value_and_grads[key] = compile_value_and_grad(
                 raw_value_and_grad,
                 model=model,
-                batch_size=int(effective_batch_size),
+                batch_size=int(eff_batch),
                 seq_len=int(seq_len),
                 label_len=int(label_len),
                 sparse_loss=bool(use_sparse_loss),
@@ -1291,16 +2159,6 @@ def main() -> None:
             model=model,
             optimizer=optimizer,
         )
-
-    bucket_sizes = None
-    if args.bucket_sizes is not None:
-        bucket_sizes = [int(s) for s in str(args.bucket_sizes).split(",") if s.strip()]
-
-    label_bucket_sizes = None
-    if args.label_bucket_sizes is not None:
-        label_bucket_sizes = [
-            int(s) for s in str(args.label_bucket_sizes).split(",") if s.strip()
-        ]
 
     global_step = start_step
     t0 = time.time()
@@ -1323,6 +2181,19 @@ def main() -> None:
     metal_capturing = False
     if metal_capture_path is not None and not metal_capture_path.endswith(".gputrace"):
         raise ValueError("--metal_capture must end with .gputrace")
+
+    trace_timing_out: Optional[str] = args.trace_timing_out
+    trace_timing_steps = 0
+    trace_timing_start_step = start_step
+    if trace_timing_out is not None:
+        trace_timing_steps = max(1, int(args.trace_timing_steps))
+        trace_timing_start_step = (
+            start_step
+            if args.trace_timing_start_step is None
+            else int(args.trace_timing_start_step)
+        )
+    trace_timing_end_step = trace_timing_start_step + trace_timing_steps
+    timing_traces: List[Dict[str, Any]] = []
 
     stop_steps = int(total_steps) if int(total_steps) > 0 else None
     if stop_steps is not None and start_step >= stop_steps:
@@ -1367,14 +2238,41 @@ def main() -> None:
 
     try:
         for epoch in range(args.epochs):
+            scheduled_batch = schedule_value(global_step, batch_schedule, int(args.batch_size))
+            scheduled_accum = schedule_value(global_step, accum_schedule, int(args.accum_steps))
+            if scheduled_batch != cur_batch_size or scheduled_accum != cur_accum_steps:
+                cur_batch_size = int(scheduled_batch)
+                cur_accum_steps = int(scheduled_accum)
+                effective_batch_size = int(cur_batch_size) * (2 if is_dpo else 1)
+                if auto_logits_chunk:
+                    new_chunk = _auto_logits_chunk_size(
+                        batch_size=int(effective_batch_size),
+                        seq_len=int(args.seq_len),
+                        vocab_size=int(model.config.vocab_size),
+                        dtype=str(args.dtype),
+                        mem_limit_bytes=int(mem_limit_mb) * 1024 * 1024,
+                        sparse_loss=bool(use_sparse_loss),
+                        label_bucket_sizes=label_bucket_sizes,
+                    )
+                    if new_chunk > 0 and int(args.logits_chunk_size) != int(new_chunk):
+                        args.logits_chunk_size = int(new_chunk)
+                        print(
+                            f"[mem] auto logits_chunk_size={int(args.logits_chunk_size)} "
+                            f"(batch={effective_batch_size})"
+                        )
+                compiled_train_steps.clear()
+                compiled_value_and_grads.clear()
+                print(
+                    f"[schedule] epoch={epoch + 1} batch_size={cur_batch_size} accum_steps={cur_accum_steps}"
+                )
             if is_dpo:
                 micro_iter = iter(
                     make_dpo_microbatch_iterator(
                         paths=paths,
                         tokenizer=tokenizer,
                         seq_len=int(args.seq_len),
-                        batch_size=int(args.batch_size),
-                        accum_steps=int(args.accum_steps),
+                        batch_size=int(cur_batch_size),
+                        accum_steps=int(cur_accum_steps),
                         shuffle_buffer=int(args.shuffle_buffer),
                         seed=int(args.seed) + int(epoch),
                         bucket_sizes=bucket_sizes,
@@ -1385,23 +2283,68 @@ def main() -> None:
                 micro_iter = iter(
                     make_microbatch_iterator(
                         paths=paths,
+                        bin_dataset=bin_dataset,
+                        bin2d_dataset=bin2d_dataset,
                         tokenizer=tokenizer,
                         task=args.task,
                         seq_len=int(args.seq_len),
-                        batch_size=int(args.batch_size),
-                        accum_steps=int(args.accum_steps),
+                        batch_size=int(cur_batch_size),
+                        accum_steps=int(cur_accum_steps),
                         shuffle_buffer=int(args.shuffle_buffer),
                         seed=int(args.seed) + int(epoch),
                         bucket_sizes=bucket_sizes,
                         return_label_positions=bool(use_sparse_loss),
                         label_bucket_sizes=label_bucket_sizes,
                         pretokenized=cached_dataset,
+                        pack_sequences=bool(args.pack_pretrain),
+                        pack_eos=bool(args.pack_eos),
+                        pack_no_doc_split=bool(args.pack_no_doc_split),
+                        max_doc_tokens=int(args.max_doc_tokens),
+                        drop_long=bool(args.drop_long),
+                    )
+                )
+
+            if int(args.prefetch_batches) > 0:
+                micro_iter = iter(
+                    prefetch_iterator(
+                        micro_iter,
+                        prefetch=int(args.prefetch_batches),
                     )
                 )
 
             while True:
                 if stop_steps is not None and global_step >= stop_steps:
                     break
+
+                trace_this_step = (
+                    trace_timing_out is not None
+                    and trace_timing_steps > 0
+                    and trace_timing_start_step <= global_step < trace_timing_end_step
+                )
+                timing_tracer: Optional[TimingTracer] = None
+                trace_step_t0 = 0.0
+                ckpt_restore: Optional[int] = None
+                if trace_this_step:
+                    timing_tracer = TimingTracer(record_memory=bool(args.trace_timing_memory))
+                    model.model.timing_tracer = timing_tracer
+                    ckpt_restore = int(model.model.checkpoint_every_n)
+                    model.model.checkpoint_every_n = 0
+                    timing_tracer.set_prefix(None)
+                    trace_step_t0 = timing_tracer.start()
+
+                if untie_step is not None and global_step >= untie_step and bool(model.tie_word_embeddings):
+                    model.untie_lm_head()
+                    try:
+                        optimizer.init(model.trainable_parameters())
+                        compiled_train_steps.clear()
+                        compiled_value_and_grads.clear()
+                        compiled_opt_step = None
+                    except Exception:
+                        pass
+                    if slow_steps > 1:
+                        slow_param_mask = build_slow_param_mask(model)
+                        slow_grad_accum = None
+                    print(f"[untie] step={global_step} untied lm_head (optimizer state reset)")
 
                 if (
                     metal_capture_path is not None
@@ -1426,11 +2369,17 @@ def main() -> None:
 
                 step_t0 = time.perf_counter() if profile_timing else 0.0
                 try:
-                    data_t0 = time.perf_counter() if profile_timing else 0.0
+                    data_t0 = time.perf_counter() if (profile_timing or timing_tracer is not None) else 0.0
                     group = next(micro_iter)
                     if profile_timing:
                         timing_data_s += time.perf_counter() - data_t0
+                    if timing_tracer is not None:
+                        timing_tracer.end("data", data_t0)
                 except StopIteration:
+                    if timing_tracer is not None:
+                        model.model.timing_tracer = None
+                        if ckpt_restore is not None:
+                            model.model.checkpoint_every_n = ckpt_restore
                     break  # finished this epoch
 
                 micro_batches = int(group.micro_batches)
@@ -1451,12 +2400,17 @@ def main() -> None:
                     warmup_steps=args.warmup_steps,
                 )
                 optimizer.learning_rate = lr
-                to_mx_t0 = time.perf_counter() if profile_timing else 0.0
-                if micro_batches < int(args.accum_steps) and micro_batches > 0:
+                if str(args.weight_decay_schedule) == "lr":
+                    try:
+                        optimizer.weight_decay = float(args.weight_decay) * float(lr) / float(args.learning_rate)
+                    except Exception:
+                        pass
+                to_mx_t0 = time.perf_counter() if (profile_timing or timing_tracer is not None) else 0.0
+                if micro_batches < int(cur_accum_steps) and micro_batches > 0:
                     pad_m = [[0] * int(step_seq_len) for _ in range(int(effective_batch_size))]
                     last_x = xs[micro_batches - 1]
                     last_y = ys[micro_batches - 1]
-                    while len(xs) < int(args.accum_steps):
+                    while len(xs) < int(cur_accum_steps):
                         xs.append(last_x)
                         ys.append(last_y)
                         ms.append(pad_m)
@@ -1465,7 +2419,7 @@ def main() -> None:
                         pad_p = [[0] * int(step_label_len) for _ in range(int(effective_batch_size))]
                         pad_pm = [[0] * int(step_label_len) for _ in range(int(effective_batch_size))]
                         last_p = ps[micro_batches - 1] if ps else pad_p
-                        while len(ps) < int(args.accum_steps):
+                        while len(ps) < int(cur_accum_steps):
                             ps.append(last_p)
                             pms.append(pad_pm)
 
@@ -1482,28 +2436,44 @@ def main() -> None:
                     else:
                         mx.eval(x, y, m, micro)
                     timing_to_mx_s += time.perf_counter() - to_mx_t0
-
-                opt_t0 = time.perf_counter() if profile_timing else 0.0
-                if args.compile and args.compile_optimizer:
+                if timing_tracer is not None:
                     if use_sparse_loss:
-                        loss_accum, grad_norm = get_compiled_train_step(int(step_seq_len), int(step_label_len))(
-                            x, y, m, p, pm, micro
-                        )
+                        timing_tracer.end("to_mx", to_mx_t0, arrays=[x, y, m, p, pm, micro], depth=1)
                     else:
-                        loss_accum, grad_norm = get_compiled_train_step(int(step_seq_len), 0)(x, y, m, micro)
+                        timing_tracer.end("to_mx", to_mx_t0, arrays=[x, y, m, micro], depth=1)
+
+                opt_t0 = time.perf_counter() if (profile_timing or timing_tracer is not None) else 0.0
+                use_compile = bool(args.compile) and not trace_this_step
+                use_compile_opt = bool(args.compile_optimizer) and not trace_this_step
+                opt_step_fn = compiled_opt_step if use_compile_opt else None
+                if use_compile and use_compile_opt:
+                    if use_sparse_loss:
+                        loss_accum, grad_norm = get_compiled_train_step(
+                            int(step_seq_len), int(step_label_len), eff_batch=int(effective_batch_size), accum_steps=int(cur_accum_steps)
+                        )(x, y, m, p, pm, micro)
+                    else:
+                        loss_accum, grad_norm = get_compiled_train_step(
+                            int(step_seq_len), 0, eff_batch=int(effective_batch_size), accum_steps=int(cur_accum_steps)
+                        )(x, y, m, micro)
                 else:
                     # Fallback: run `value_and_grad` micro-batches in Python.
                     grad_accum = None
                     loss_accum = mx.array(0.0, dtype=mx.float32)
                     for i in range(micro_batches):
-                        fwd_bwd_t0 = time.perf_counter() if profile_timing else 0.0
-                        if args.compile and not args.compile_optimizer:
+                        if timing_tracer is not None:
+                            timing_tracer.set_prefix(f"mb{i}")
+                        fwd_bwd_t0 = time.perf_counter() if (profile_timing or timing_tracer is not None) else 0.0
+                        if use_compile and not use_compile_opt:
                             if use_sparse_loss:
-                                loss, grads = get_value_and_grad(int(step_seq_len), int(step_label_len))(
+                                loss, grads = get_value_and_grad(
+                                    int(step_seq_len), int(step_label_len), eff_batch=int(effective_batch_size), accum_steps=int(cur_accum_steps)
+                                )(
                                     x[i], y[i], m[i], p[i], pm[i]
                                 )
                             else:
-                                loss, grads = get_value_and_grad(int(step_seq_len), 0)(x[i], y[i], m[i])
+                                loss, grads = get_value_and_grad(
+                                    int(step_seq_len), 0, eff_batch=int(effective_batch_size), accum_steps=int(cur_accum_steps)
+                                )(x[i], y[i], m[i])
                         else:
                             if use_sparse_loss:
                                 loss, grads = raw_value_and_grad(x[i], y[i], m[i], p[i], pm[i])
@@ -1512,6 +2482,13 @@ def main() -> None:
                         if profile_timing:
                             mx.eval(loss, grads)
                             timing_fwd_bwd_s += time.perf_counter() - fwd_bwd_t0
+                        if timing_tracer is not None:
+                            timing_tracer.end(
+                                "fwd_bwd",
+                                fwd_bwd_t0,
+                                arrays=[loss, grads],
+                                depth=1,
+                            )
                         loss_accum = loss_accum + loss.astype(mx.float32)
                         if grad_accum is None:
                             grad_accum = grads
@@ -1521,22 +2498,47 @@ def main() -> None:
                     assert grad_accum is not None
                     grad_accum = mlx_utils.tree_map(lambda g: g / micro_batches, grad_accum)
 
-                    if compiled_opt_step is None and args.grad_clip > 0:
-                        clip_t0 = time.perf_counter() if profile_timing else 0.0
+                    if slow_steps > 1 and slow_param_mask is not None:
+                        slow_part = mlx_utils.tree_map(lambda g, m: g * m, grad_accum, slow_param_mask)
+                        fast_part = mlx_utils.tree_map(lambda g, m: g * (1.0 - m), grad_accum, slow_param_mask)
+                        if slow_grad_accum is None:
+                            slow_grad_accum = mlx_utils.tree_map(lambda g: mx.zeros_like(g), slow_part)
+                        slow_grad_accum = mlx_utils.tree_map(lambda a, b: a + b, slow_grad_accum, slow_part)
+                        if (global_step + 1) % int(slow_steps) == 0:
+                            slow_update = mlx_utils.tree_map(
+                                lambda g: g / float(slow_steps), slow_grad_accum
+                            )
+                            grad_accum = mlx_utils.tree_map(lambda f, s: f + s, fast_part, slow_update)
+                            slow_grad_accum = mlx_utils.tree_map(lambda g: mx.zeros_like(g), slow_grad_accum)
+                        else:
+                            grad_accum = fast_part
+
+                    if opt_step_fn is None and args.grad_clip > 0:
+                        clip_t0 = time.perf_counter() if (profile_timing or timing_tracer is not None) else 0.0
                         grad_accum, grad_norm = optim.clip_grad_norm(
                             grad_accum, max_norm=args.grad_clip
                         )
                         if profile_timing:
                             mx.eval(grad_accum, grad_norm)
                             timing_clip_s += time.perf_counter() - clip_t0
+                        if timing_tracer is not None:
+                            timing_tracer.end("clip", clip_t0, arrays=[grad_accum, grad_norm], depth=1)
 
-                    if compiled_opt_step is None:
+                    if opt_step_fn is None:
                         optimizer.update(model, grad_accum)
                     else:
-                        grad_norm = compiled_opt_step(grad_accum)
+                        grad_norm = opt_step_fn(grad_accum)
                 mx.eval(model.parameters(), optimizer.state, loss_accum, grad_norm)
                 if profile_timing:
                     timing_opt_s += time.perf_counter() - opt_t0
+                if timing_tracer is not None:
+                    timing_tracer.set_prefix(None)
+                    timing_tracer.end(
+                        "opt",
+                        opt_t0,
+                        arrays=[model.parameters(), optimizer.state, loss_accum, grad_norm],
+                        depth=1,
+                    )
 
                 global_step += 1
                 seen_tokens += int(effective_batch_size) * int(step_seq_len) * micro_batches
@@ -1575,9 +2577,27 @@ def main() -> None:
                             f" clip_ms={(timing_clip_s * to_ms):.1f}"
                             f" opt_ms={(timing_opt_s * to_ms):.1f}"
                         )
+                    mem_msg = ""
+                    if bool(args.log_memory):
+                        try:
+                            if hasattr(mx, "get_active_memory"):
+                                active = mx.get_active_memory() / (1024 * 1024)
+                                cache = mx.get_cache_memory() / (1024 * 1024)
+                                peak = mx.get_peak_memory() / (1024 * 1024)
+                            else:
+                                active = mx.metal.get_active_memory() / (1024 * 1024)
+                                cache = mx.metal.get_cache_memory() / (1024 * 1024)
+                                peak = mx.metal.get_peak_memory() / (1024 * 1024)
+                            mem_msg = (
+                                f" mem_active={active:.0f}MiB"
+                                f" mem_cache={cache:.0f}MiB"
+                                f" mem_peak={peak:.0f}MiB"
+                            )
+                        except Exception:
+                            mem_msg = ""
                     print(
                         f"[train] step={global_step} epoch={epoch + 1}/{args.epochs} "
-                        f"loss={avg_loss:.4f} lr={lr:.2e} tok/s={tok_s:.0f}{timing_msg}"
+                        f"loss={avg_loss:.4f} lr={lr:.2e} tok/s={tok_s:.0f}{timing_msg}{mem_msg}"
                     )
                     if tb_writer is not None:
                         tb_writer.add_scalar("train/loss", avg_loss, global_step)
@@ -1588,18 +2608,53 @@ def main() -> None:
                         tb_writer.add_scalar("train/grad_norm", float(grad_norm.item()), global_step)
                         tb_writer.flush()
 
-                if global_step % args.save_interval == 0:
+                if timing_tracer is not None:
+                    timing_tracer.end(
+                        "step",
+                        trace_step_t0,
+                        arrays=[model.parameters(), optimizer.state, loss_accum, grad_norm],
+                        depth=0,
+                    )
+                    model.model.timing_tracer = None
+                    if ckpt_restore is not None:
+                        model.model.checkpoint_every_n = ckpt_restore
+                    step_meta = {
+                        "step": int(global_step - 1),
+                        "epoch": int(epoch + 1),
+                        "seq_len": int(step_seq_len),
+                        "batch_size": int(effective_batch_size),
+                        "micro_batches": int(micro_batches),
+                        "accum_steps": int(cur_accum_steps),
+                    }
+                    timing_traces.append(timing_tracer.to_dict(meta=step_meta))
+                    json_path = write_timing_trace(
+                        out_path=str(trace_timing_out),
+                        trace={"steps": list(timing_traces)},
+                    )
+                    summary = timing_tracer.summary(top_n=8)
+                    if summary:
+                        top_str = ", ".join([f"{name}={ms:.1f}ms" for name, ms in summary])
+                    else:
+                        top_str = "no events"
+                    print(f"[trace] wrote {json_path} ({top_str})")
+
+                if int(args.save_interval) > 0 and global_step > 0 and global_step % args.save_interval == 0:
                     path = save_checkpoint(global_step)
                     print(f"[ckpt] saved {path}")
+
 
             if stop_steps is not None and global_step >= stop_steps:
                 break
 
     except KeyboardInterrupt:
-        print("\n[train] interrupted, saving last checkpoint...")
+        if int(args.save_interval) != 0:
+            print("\n[train] interrupted, saving last checkpoint...")
+        else:
+            print("\n[train] interrupted, skipping checkpoint save (--save_interval 0).")
     finally:
-        path = save_checkpoint(global_step)
-        print(f"[ckpt] saved {path}")
+        if int(args.save_interval) != 0:
+            path = save_checkpoint(global_step)
+            print(f"[ckpt] saved {path}")
         if tb_writer is not None:
             tb_writer.close()
 

@@ -56,6 +56,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Pretokenize JSONL datasets into `ids` for MLX training")
     parser.add_argument("--tokenizer_path", type=str, default="./model")
     parser.add_argument(
+        "--tokenizer_type",
+        type=str,
+        choices=["auto", "hf", "rustbpe"],
+        default="auto",
+        help="Tokenizer backend: auto (prefer RustBPE), hf, or rustbpe.",
+    )
+    parser.add_argument(
         "--data_path",
         type=str,
         required=True,
@@ -127,15 +134,12 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    try:
-        from transformers import AutoTokenizer
-    except ImportError as e:
-        raise ImportError(
-            "Failed to import `transformers`. Install MLX training deps via "
-            "`python3 -m pip install -r mlx_train/requirements.txt`."
-        ) from e
+    from .tokenizer_utils import load_tokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+    tokenizer = load_tokenizer(
+        args.tokenizer_path,
+        tokenizer_type=str(args.tokenizer_type),
+    )
     if tokenizer.pad_token_id is None:
         raise ValueError("Tokenizer must define pad_token_id.")
 
