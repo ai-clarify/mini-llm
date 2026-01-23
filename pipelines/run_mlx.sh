@@ -37,6 +37,7 @@ Environment overrides:
   OUT               Output root (default: out/mlx; smoke-test: out/mlx_smoke)
   DATA              Dataset cache dir (default: dataset/minimind)
   SMALL             Use smaller SFT dataset; pretrain stays full (default: 1)
+  FAST_TINY         Use fastest tiny settings for all training stages (default: 0)
   PRE_DATA          Dataset spec for pretrain (default: minimind:auto)
   SFT_DATA          Dataset spec for SFT (default: minimind:sft_mini_512.jsonl)
   R1_DATA           Dataset spec for R1 stage (default: minimind:r1_mix_1024.jsonl)
@@ -170,6 +171,12 @@ MINIMIND_DATA_REPO=${MINIMIND_DATA_REPO:-gongjy/minimind_dataset}
 MINIMIND_MS_CACHE=${MINIMIND_MS_CACHE:-$HOME/.cache/modelscope}
 export MINIMIND_DATA_SOURCE MINIMIND_DATA_REPO MINIMIND_MS_CACHE
 MLX_SMALL_DATA=${SMALL:-1}
+FAST_TINY=${FAST_TINY:-0}
+FAST_TINY_COMMON_ARGS=()
+FAST_TINY_PRETRAIN_ARGS=()
+FAST_TINY_SFT_ARGS=()
+FAST_TINY_DPO_ARGS=()
+FAST_TINY_R1_ARGS=()
 AUTO_DOWNLOAD_SET=0
 if [ -n "${AUTO_DL+x}" ]; then
   AUTO_DOWNLOAD_SET=1
@@ -206,6 +213,14 @@ else
   PRESET=${PRESET:-custom}
   DTYPE=${DTYPE:-bfloat16}
   CLEANUP_SMOKE=${SMOKE_CLEAN:-0}
+fi
+
+if [ "$SMOKE_TEST" -eq 1 ] && [ "$FAST_TINY" = "1" ]; then
+  echo "[warn] FAST_TINY ignored for --smoke-test" >&2
+  FAST_TINY=0
+fi
+if [ "$FAST_TINY" = "1" ]; then
+  PRESET=tiny
 fi
 
 if [ "$DOWNLOAD_ONLY" -eq 1 ]; then
@@ -473,6 +488,12 @@ else
   R1_DATA_SPEC=${R1_DATA:-minimind:r1_mix_1024.jsonl}
 fi
 
+if [ "$FAST_TINY" = "1" ]; then
+  if [ -z "${SFT_DATA+x}" ]; then
+    SFT_DATA_SPEC="$DATA_DIR/sft_mini_512_2d.meta.json"
+  fi
+fi
+
 if [ "$MAX_DOWNLOAD_MB_SET" -eq 0 ]; then
   case "$PRETRAIN_DATA_SPEC" in
     *minimind:auto*|*minimind:pretrain_hq*|*minimind:pretrain*)
@@ -701,6 +722,30 @@ else
   SAVE_INTERVAL=${SAVE_INTERVAL:-200}
 fi
 
+if [ "$FAST_TINY" = "1" ]; then
+  SFT_SEQ_LEN=${SFT_LEN:-512}
+  SFT_BATCH_SIZE=${SFT_BS:-72}
+  SFT_ACCUM_STEPS=${SFT_ACCUM:-1}
+  SFT_EPOCHS=${SFT_EPOCH:-1}
+  SFT_MAX_STEPS=${SFT_MAX:-}
+  FAST_TINY_COMMON_ARGS=(
+    --prefetch_batches 6
+    --shuffle_buffer 512
+    --tokenizer_type auto
+    --paired_heads
+  )
+  FAST_TINY_PRETRAIN_ARGS=("${FAST_TINY_COMMON_ARGS[@]}")
+  FAST_TINY_SFT_ARGS=(
+    "${FAST_TINY_COMMON_ARGS[@]}"
+    --data_format bin2d
+    --bin_cache memory
+    --sparse_loss
+    --label_bucket_sizes 64,128,256,512
+  )
+  FAST_TINY_DPO_ARGS=("${FAST_TINY_COMMON_ARGS[@]}")
+  FAST_TINY_R1_ARGS=("${FAST_TINY_COMMON_ARGS[@]}")
+fi
+
 ATTN_GATE=${GATE:-}
 ATTN_GATE_INIT=${GATE_INIT:-}
 
@@ -745,6 +790,9 @@ if [ "$SKIP_PRETRAIN" -eq 0 ]; then
   fi
   if [ -n "$PRETRAIN_MAX_STEPS" ]; then
     PRETRAIN_ARGS+=(--max_steps "$PRETRAIN_MAX_STEPS")
+  fi
+  if [ "${#FAST_TINY_PRETRAIN_ARGS[@]}" -gt 0 ]; then
+    PRETRAIN_ARGS+=("${FAST_TINY_PRETRAIN_ARGS[@]}")
   fi
   if [ -n "$PRETRAIN_RESUME" ]; then
     PRETRAIN_ARGS+=(--resume "$PRETRAIN_RESUME")
@@ -801,6 +849,9 @@ if [ "$SKIP_SFT" -eq 0 ]; then
   fi
   if [ -n "$SFT_MAX_STEPS" ]; then
     SFT_ARGS+=(--max_steps "$SFT_MAX_STEPS")
+  fi
+  if [ "${#FAST_TINY_SFT_ARGS[@]}" -gt 0 ]; then
+    SFT_ARGS+=("${FAST_TINY_SFT_ARGS[@]}")
   fi
 
   if [ -n "$SFT_RESUME" ]; then
@@ -866,6 +917,9 @@ if [ "$RUN_DPO" -eq 1 ]; then
   fi
   if [ -n "$DPO_MAX_STEPS" ]; then
     DPO_ARGS+=(--max_steps "$DPO_MAX_STEPS")
+  fi
+  if [ "${#FAST_TINY_DPO_ARGS[@]}" -gt 0 ]; then
+    DPO_ARGS+=("${FAST_TINY_DPO_ARGS[@]}")
   fi
   if [ -n "$DPO_RESUME" ]; then
     DPO_ARGS+=(--resume "$DPO_RESUME")
@@ -950,6 +1004,9 @@ if [ "$RUN_R1" -eq 1 ]; then
   fi
   if [ -n "$R1_MAX_STEPS" ]; then
     R1_ARGS+=(--max_steps "$R1_MAX_STEPS")
+  fi
+  if [ "${#FAST_TINY_R1_ARGS[@]}" -gt 0 ]; then
+    R1_ARGS+=("${FAST_TINY_R1_ARGS[@]}")
   fi
 
   if [ -n "$R1_RESUME" ]; then

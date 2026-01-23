@@ -225,3 +225,8 @@ Measured without `--profile_timing` (lower overhead), `max_steps=4`, skip first 
 | jsonl_ids_b144_p6_s256 | 144 | 1 | 6 | 512 | 82729 | 14000 | 0 |
 | jsonl_ids_b96_p6_s384 | 96 | 1 | 6 | 512 | 84608 | 14000 | 0 |
 | bin2d_mem_shuffle512_b72_p6_s512_acc2 | 72 | 2 | 6 | 512 | 80841 | 14000 | 0 |
+| bin2d_mem_shuffle512_b72_p6_s512_lblfine | 72 | 1 | 6 | 512 | 81565 | 14000 | 0 |
+| bin2d_mem_shuffle256_b160_p6 | 160 | 1 | 6 | 256 | 88638 | 14000 | 0 |
+| bin2d_mem_shuffle256_b192_p6 | 192 | 1 | 6 | 256 | 87160 | 14000 | 0 |
+| bin2d_mem_shuffle256_b144_p6 | 144 | 1 | 6 | 256 | 85764 | 14000 | 0 |
+| bin2d_mem_shuffle384_b96_p6 | 96 | 1 | 6 | 384 | 81867 | 14000 | 0 |

@@ -257,6 +257,9 @@
 - seq_len=384（jsonl ids, b96）：~84.6k tok/s（略低于最优）
 结论：当前 MLX/Apple GPU 上 **降低 seq_len 与改 float16 并不能拉升吞吐**；最大收益仍来自 bin2d + prefetch/shuffle 的数据管线组合。
 
+补充：对 label bucket 细分（128/160/192/224/256/320/384/448/512）并未带来收益（~81.6k）。
+对 seq_len=256 的 bin2d 测试（b160/p6）达到 ~88.6k tok/s，但仍远未达到 160k；继续增大 batch 并未进一步提升。
+
 ### modded-nanogpt README 逐条清单（2026-01-23）
 以下为 README 中列出的“速度赛”组合拳（原文顺序），便于后续逐项对照与落地规划：
 - Modernized architecture: Rotary embeddings、QK-Norm、ReLU^2

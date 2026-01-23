@@ -242,6 +242,14 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniLLM-RLHF-SFT")
     parser.add_argument("--num_workers", type=int, default=1)
     parser.add_argument("--ddp", action="store_true")
+    parser.add_argument("--prefetch_factor", type=int, default=2)
+    parser.add_argument("--persistent_workers", action="store_true")
+    parser.add_argument(
+        "--pin_memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pin CPU memory for faster H2D transfers (only when using CUDA).",
+    )
     parser.add_argument("--accumulation_steps", type=int, default=1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_iters", type=int, default=0)
@@ -260,6 +268,11 @@ if __name__ == "__main__":
     parser.add_argument("--tensorboard_dir", type=str, default=None)
     parser.add_argument("--max_steps", type=int, default=None, help="Limit total training iterations (for smoke tests)")
     parser.add_argument("--ref_path", type=str, default=None, help="Reference checkpoint path (defaults to policy init).")
+    parser.add_argument("--paired_heads", action="store_true", help="Enable paired attention heads.")
+    parser.add_argument("--qk_norm", action="store_true", help="Enable QK RMSNorm inside attention.")
+    parser.add_argument("--qk_norm_eps", type=float, default=1e-6)
+    parser.add_argument("--value_mix", type=float, default=0.0)
+    parser.add_argument("--logit_softcap", type=float, default=0.0)
 
     # Pretrained model checkpoint arguments
     parser.add_argument("--pretrained_path", type=str, default=None,
@@ -273,8 +286,16 @@ if __name__ == "__main__":
     if args.dpo_beta <= 0:
         raise ValueError("--dpo_beta must be > 0")
 
-    lm_config = MiniLLMConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers,
-                               use_moe=args.use_moe)
+    lm_config = MiniLLMConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        use_moe=args.use_moe,
+        paired_heads=bool(args.paired_heads),
+        qk_norm=bool(args.qk_norm),
+        qk_norm_eps=float(args.qk_norm_eps),
+        value_mix=float(args.value_mix),
+        logit_softcap=float(args.logit_softcap),
+    )
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
@@ -317,14 +338,18 @@ if __name__ == "__main__":
 
     train_ds = DPODataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if ddp else None
+    prefetch_factor = args.prefetch_factor if args.num_workers > 0 else None
+    persistent_workers = bool(args.persistent_workers) if args.num_workers > 0 else False
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
-        pin_memory=True,
+        pin_memory=bool(args.pin_memory),
         drop_last=False,
         shuffle=(train_sampler is None),
         num_workers=args.num_workers,
-        sampler=train_sampler
+        sampler=train_sampler,
+        prefetch_factor=prefetch_factor,
+        persistent_workers=persistent_workers,
     )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
