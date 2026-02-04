@@ -402,7 +402,10 @@ if __name__ == "__main__":
         persistent_workers=persistent_workers,
     )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
+    # GradScaler: only needed for float16, not for bfloat16 (has enough dynamic range)
+    # Also, fused optimizers don't work with GradScaler
+    use_scaler = args.dtype == 'float16'
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     # Optimizer selection
     if args.optimizer == "muon":
@@ -422,17 +425,21 @@ if __name__ == "__main__":
             cautious=args.cautious_wd,
         )
     else:
-        # Use fused AdamW for A100 (requires CUDA and PyTorch 2.0+)
-        use_fused = torch.cuda.is_available() and 'cuda' in str(args.device)
+        # Use fused AdamW for bfloat16 on CUDA (faster, but incompatible with GradScaler)
+        use_fused = (
+            torch.cuda.is_available()
+            and 'cuda' in str(args.device)
+            and args.dtype == 'bfloat16'  # fused doesn't work with GradScaler (float16)
+        )
         if use_fused:
             try:
                 optimizer = optim.AdamW(
                     model.parameters(),
                     lr=args.learning_rate,
                     weight_decay=args.weight_decay,
-                    fused=True,  # Fused kernel for faster updates
+                    fused=True,
                 )
-                Logger("[optim] Using fused AdamW optimizer")
+                Logger("[optim] Using fused AdamW optimizer (bfloat16)")
             except Exception:
                 use_fused = False
         if not use_fused:
