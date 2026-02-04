@@ -667,11 +667,6 @@ fi
 if [ "$TURBO" -eq 2 ]; then
   echo "[turbo] Enabling optimizations (lite mode, AdamW + compile)"
   OPTIMIZER=${OPTIMIZER:-adamw}
-  # NOTE: ZERO_INIT_PROJ disabled - incompatible with tie_word_embeddings=True
-  # When all projection outputs are zero, model degrades to embedding lookup
-  ZERO_INIT_PROJ=${ZERO_INIT_PROJ:-0}
-  BACK_OUT_LAYERS=${BACK_OUT_LAYERS:-0}
-  CAUTIOUS_WD=${CAUTIOUS_WD:-0}
   QK_NORM=${QK_NORM:-1}
   LOGIT_SOFTCAP=${LOGIT_SOFTCAP:-30}
   MTP_LOSS_WEIGHT=${MTP_LOSS_WEIGHT:-0.1}
@@ -679,10 +674,6 @@ if [ "$TURBO" -eq 2 ]; then
 elif [ "$TURBO" -eq 1 ]; then
   echo "[turbo] Enabling all modded-nanogpt optimizations (Muon + compile)"
   OPTIMIZER=${OPTIMIZER:-muon}
-  # NOTE: ZERO_INIT_PROJ disabled - incompatible with tie_word_embeddings=True
-  ZERO_INIT_PROJ=${ZERO_INIT_PROJ:-0}
-  BACK_OUT_LAYERS=${BACK_OUT_LAYERS:-0}
-  CAUTIOUS_WD=${CAUTIOUS_WD:-1}
   QK_NORM=${QK_NORM:-1}
   LOGIT_SOFTCAP=${LOGIT_SOFTCAP:-30}
   MTP_LOSS_WEIGHT=${MTP_LOSS_WEIGHT:-0.1}
@@ -705,12 +696,6 @@ OPTIMIZER=${OPTIMIZER:-adamw}
 MUON_LR=${MUON_LR:-0.02}
 # Weight decay
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.01}
-# Zero-init output projections (muP-like initialization)
-ZERO_INIT_PROJ=${ZERO_INIT_PROJ:-0}
-# Back-out scaling for early layers (0=disabled)
-BACK_OUT_LAYERS=${BACK_OUT_LAYERS:-0}
-# Cautious weight decay (only decay when grad and param agree)
-CAUTIOUS_WD=${CAUTIOUS_WD:-0}
 # QK normalization (improves training stability)
 QK_NORM=${QK_NORM:-1}
 # Logit softcap (like Gemma 2, 0=disabled)
@@ -1026,15 +1011,6 @@ EXTRA_R1_ARGS+=(--keep_last_checkpoints "$KEEP_LAST")
 EXTRA_PRETRAIN_ARGS+=(--optimizer "$OPTIMIZER" --weight_decay "$WEIGHT_DECAY" --mtp_loss_weight "$MTP_LOSS_WEIGHT")
 if [ "$OPTIMIZER" = "muon" ]; then
   EXTRA_PRETRAIN_ARGS+=(--muon_lr "$MUON_LR")
-fi
-if [ "$ZERO_INIT_PROJ" -eq 1 ]; then
-  EXTRA_PRETRAIN_ARGS+=(--zero_init_proj)
-fi
-if [ "$BACK_OUT_LAYERS" -gt 0 ]; then
-  EXTRA_PRETRAIN_ARGS+=(--back_out_layers "$BACK_OUT_LAYERS")
-fi
-if [ "$CAUTIOUS_WD" -eq 1 ]; then
-  EXTRA_PRETRAIN_ARGS+=(--cautious_wd)
 fi
 if [ "$QK_NORM" -eq 1 ]; then
   EXTRA_PRETRAIN_ARGS+=(--qk_norm)

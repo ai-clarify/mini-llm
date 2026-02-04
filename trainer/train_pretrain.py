@@ -26,7 +26,6 @@ from checkpoint_loader import CheckpointLoader
 from trainer import checkpoint_manager
 from trainer.loss_utils import compute_mtp_loss
 from trainer.muon import Muon, get_muon_param_groups
-from trainer.training_schedule import apply_projection_zero_init, apply_back_out_scaling
 
 warnings.filterwarnings('ignore')
 
@@ -292,13 +291,6 @@ if __name__ == "__main__":
     parser.add_argument("--muon_lr", type=float, default=0.02, help="Learning rate for Muon (2D params)")
     parser.add_argument("--muon_momentum", type=float, default=0.95, help="Momentum for Muon")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
-    parser.add_argument("--cautious_wd", action="store_true", help="Cautious weight decay (only when grad and param agree)")
-
-    # Training optimizations (modded-nanogpt style)
-    parser.add_argument("--zero_init_proj", action="store_true",
-                        help="Zero-init output projections (muP-like)")
-    parser.add_argument("--back_out_layers", type=int, default=0,
-                        help="Number of early layers to scale down (back out contributions)")
 
     # Pretrained model checkpoint arguments
     parser.add_argument("--pretrained_path", type=str, default=None,
@@ -371,15 +363,6 @@ if __name__ == "__main__":
 
     model, tokenizer = init_model(lm_config)
 
-    # Apply modded-nanogpt style optimizations
-    if args.zero_init_proj:
-        Logger("[optim] Applying projection zero-init (muP-like)")
-        apply_projection_zero_init(model)
-
-    if args.back_out_layers > 0:
-        Logger(f"[optim] Applying back-out scaling to first {args.back_out_layers} layers")
-        apply_back_out_scaling(model, back_out_layers=args.back_out_layers)
-
     train_ds = PretrainDataset(
         args.data_path,
         tokenizer,
@@ -422,7 +405,6 @@ if __name__ == "__main__":
             momentum=args.muon_momentum,
             adamw_lr=args.learning_rate,
             weight_decay=args.weight_decay,
-            cautious=args.cautious_wd,
         )
     else:
         # Use fused AdamW for bfloat16 on CUDA (faster, but incompatible with GradScaler)
