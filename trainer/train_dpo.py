@@ -50,8 +50,15 @@ def Logger(content):
         print(content)
 
 
-def get_lr(current_step, total_steps, lr):
-    return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
+def get_lr(current_step, total_steps, lr, warmup_steps=0, min_lr=None):
+    """Learning rate schedule with linear warmup and cosine decay."""
+    if min_lr is None:
+        min_lr = lr / 10
+    if current_step < warmup_steps:
+        return min_lr + (lr - min_lr) * (current_step / warmup_steps)
+    decay_steps = total_steps - warmup_steps
+    decay_progress = (current_step - warmup_steps) / max(decay_steps, 1)
+    return min_lr + 0.5 * (lr - min_lr) * (1 + math.cos(math.pi * decay_progress))
 
 
 def logits_to_probs(logits, labels):

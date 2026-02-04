@@ -57,8 +57,24 @@ def Logger(content):
         print(content)
 
 
-def get_lr(current_step, total_steps, lr):
-    return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
+def get_lr(current_step, total_steps, lr, warmup_steps=0, min_lr=None):
+    """
+    Learning rate schedule with linear warmup and cosine decay.
+
+    - Warmup: linear increase from min_lr to lr over warmup_steps
+    - Decay: cosine annealing from lr to min_lr over remaining steps
+    """
+    if min_lr is None:
+        min_lr = lr / 10
+
+    # Linear warmup
+    if current_step < warmup_steps:
+        return min_lr + (lr - min_lr) * (current_step / warmup_steps)
+
+    # Cosine decay after warmup
+    decay_steps = total_steps - warmup_steps
+    decay_progress = (current_step - warmup_steps) / max(decay_steps, 1)
+    return min_lr + 0.5 * (lr - min_lr) * (1 + math.cos(math.pi * decay_progress))
 
 
 def train_epoch(epoch, wandb):
@@ -77,7 +93,13 @@ def train_epoch(epoch, wandb):
         Y = Y.to(args.device, non_blocking=True)
         loss_mask = loss_mask.to(args.device, non_blocking=True)
 
-        lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
+        lr = get_lr(
+            epoch * iter_per_epoch + step,
+            args.epochs * iter_per_epoch,
+            args.learning_rate,
+            warmup_steps=args.warmup_iters,
+            min_lr=args.min_lr,
+        )
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
@@ -239,7 +261,7 @@ if __name__ == "__main__":
     # 若要以最快速度实现zero则epochs设置为1轮；否则应当利用有限的数据训练2~6个epochs。
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--learning_rate", type=float, default=5e-4)
+    parser.add_argument("--learning_rate", type=float, default=2e-3)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--use_wandb", action="store_true")
@@ -248,7 +270,8 @@ if __name__ == "__main__":
     parser.add_argument("--ddp", action="store_true")
     parser.add_argument("--accumulation_steps", type=int, default=8)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--warmup_iters", type=int, default=0)
+    parser.add_argument("--warmup_iters", type=int, default=200, help="Linear warmup steps (default: 200)")
+    parser.add_argument("--min_lr", type=float, default=None, help="Min learning rate (default: learning_rate/10)")
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--save_interval", type=int, default=100)
     parser.add_argument("--resume", type=str, default=None, help="Path to step checkpoint dir")
