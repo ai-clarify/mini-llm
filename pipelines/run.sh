@@ -683,7 +683,7 @@ preprocess_to_bin2d() {
   local meta_file="${out_prefix}.meta.json"
 
   if [ -f "$meta_file" ] && [ "$PREPROCESS_DATA" -ne 2 ]; then
-    echo "[preprocess] Using cached: $meta_file"
+    echo "[preprocess] Using cached: $meta_file" >&2
     echo "$meta_file"
     return 0
   fi
@@ -691,13 +691,13 @@ preprocess_to_bin2d() {
   # Check for RustBPE tokenizer (faster)
   TOKENIZER_TYPE="auto"
   if [ -f "./model/tokenizer.pkl" ] && python -c "import rustbpe" 2>/dev/null; then
-    echo "[preprocess] Using RustBPE tokenizer (fast)"
+    echo "[preprocess] Using RustBPE tokenizer (fast)" >&2
     TOKENIZER_TYPE="rustbpe"
   elif [ -f "./model/tokenizer.pkl" ]; then
-    echo "[preprocess] tokenizer.pkl found but rustbpe not available, using HuggingFace tokenizer"
+    echo "[preprocess] tokenizer.pkl found but rustbpe not available, using HuggingFace tokenizer" >&2
   fi
 
-  echo "[preprocess] Converting $input_path to bin2d format..."
+  echo "[preprocess] Converting $input_path to bin2d format..." >&2
   # Use all available CPU cores for preprocessing
   PREPROCESS_WORKERS=${PREPROCESS_WORKERS:-0}
   python -m mlx_train.cli.packbin2d \
@@ -710,8 +710,8 @@ preprocess_to_bin2d() {
     --show_progress \
     --num_workers "$PREPROCESS_WORKERS" \
     --chunk_size 500 \
-    --log_interval 5000 || {
-      echo "[preprocess] Failed, using original JSONL"
+    --log_interval 5000 >&2 || {
+      echo "[preprocess] Failed, using original JSONL" >&2
       echo "$input_path"
       return 0
     }
