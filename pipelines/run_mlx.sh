@@ -158,7 +158,7 @@ export PYTHONPATH="$ROOT_DIR${PYTHONPATH:+:$PYTHONPATH}"
 
 # Mirrors (consistent with scripts/run.sh)
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY || true
-export PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+export PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.org/simple}
 export UV_INDEX_URL=${UV_INDEX_URL:-$PIP_INDEX_URL}
 
 # Silence transformers advisory warning in MLX-only envs (no torch/tf/flax).

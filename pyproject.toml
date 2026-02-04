@@ -10,9 +10,8 @@ requires-python = ">=3.9,<3.13"
 readme = "README.md"
 license = {text = "MIT"}
 
-[tool.pip]
-# Use Tsinghua mirror by default for faster downloads in China
-index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+# [tool.pip]
+# Uncomment below for China: index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
 # Build configuration
 [tool.setuptools]

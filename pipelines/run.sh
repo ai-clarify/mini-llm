@@ -73,9 +73,9 @@ unset HTTPS_PROXY
 unset no_proxy
 unset NO_PROXY
 
-# Use Tsinghua mirror for faster package downloads in China
-# Can be overridden by setting PIP_INDEX_URL environment variable
-export PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+# PyPI index URL - defaults to official PyPI
+# Set PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple for China
+export PIP_INDEX_URL=${PIP_INDEX_URL:-https://pypi.org/simple}
 
 VENV_DIR=${VENV_DIR:-.venv}
 MINIMIND_DATA_SOURCE=${MINIMIND_DATA_SOURCE:-modelscope}
@@ -270,14 +270,14 @@ if [ "$NEED_INSTALL" -eq 1 ]; then
     echo "[env] Verifying critical dependencies..."
     if ! python -c "import torch" 2>/dev/null; then
       echo "[env] Warning: torch not found, attempting to install..."
-      python -m pip install torch --index-url https://pypi.tuna.tsinghua.edu.cn/simple/ || {
+      python -m pip install torch || {
         echo "[error] Failed to install torch" >&2
         exit 1
       }
     fi
     if ! python -c "import transformers" 2>/dev/null; then
       echo "[env] Warning: transformers not found, attempting to install..."
-      python -m pip install transformers --index-url https://pypi.tuna.tsinghua.edu.cn/simple/ || {
+      python -m pip install transformers || {
         echo "[error] Failed to install transformers" >&2
         exit 1
       }
