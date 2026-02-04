@@ -22,6 +22,24 @@ Options:
                      --skip-pretrain).
 
   -h, --help         Show this help message and exit.
+
+Environment Variables:
+  NO_VENV=1          Skip virtual environment, use system Python (for Colab/cloud)
+  PIP_INDEX_URL      PyPI mirror URL (default: https://pypi.org/simple)
+  MODEL_HIDDEN_SIZE  Model hidden size (default: 512, use 1024 for 0.2B)
+  MODEL_NUM_LAYERS   Number of layers (default: 8, use 16 for 0.2B)
+  MODEL_SEQ_LEN      Sequence length (default: 512)
+  BATCH_SIZE         Override auto-detected batch size
+  PREPROCESS_DATA    0=skip, 1=cache bin2d, 2=force reprocess (default: 1)
+  MINIMIND_DATA_SOURCE  Data source: modelscope (default) or huggingface
+  MINIMIND_DATA_REPO    Dataset repo (default: gongjy/minimind_dataset)
+
+Examples:
+  ./scripts/run.sh                      # Auto-optimized for your GPU
+  ./scripts/run.sh --smoke-test         # Quick test on CPU
+  NO_VENV=1 ./scripts/run.sh            # Run without venv (Colab)
+  MODEL_HIDDEN_SIZE=1024 MODEL_NUM_LAYERS=16 ./scripts/run.sh  # Train 0.2B model
+  MINIMIND_DATA_SOURCE=huggingface MINIMIND_DATA_REPO=jingyaogong/minimind_dataset ./scripts/run.sh
 USAGE
 }
 
@@ -145,150 +163,127 @@ AUTO_DOWNLOAD=${AUTO_DOWNLOAD:-1}
 KEEP_LAST=${KEEP_LAST:-3}
 SAVE_INTERVAL=${SAVE_INTERVAL:-200}
 
-USE_UV=0
+# ============================================================
+# Environment setup - simplified, uv-first approach
+# ============================================================
+# Set NO_VENV=1 to skip virtual environment (e.g., in Colab)
+NO_VENV=${NO_VENV:-0}
 
-# Validate virtual environment thoroughly
-validate_venv() {
-  local venv_path=$1
-
-  # Check if venv directory exists
-  if [ ! -d "$venv_path" ]; then
-    return 1
-  fi
-
-  # Check if python interpreter exists and is executable
-  if [ ! -x "$venv_path/bin/python" ]; then
-    return 1
-  fi
-
-  # Check if pip is available (critical for dependency installation)
-  if ! "$venv_path/bin/python" -m pip --version >/dev/null 2>&1; then
-    echo "[env] Virtual environment at $venv_path is missing pip" >&2
-    return 1
-  fi
-
-  # Check if venv Python version matches our requirements
-  local venv_py_version=$("$venv_path/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)
-  local major=$(echo "$venv_py_version" | cut -d. -f1)
-  local minor=$(echo "$venv_py_version" | cut -d. -f2)
-
-  if [ "$major" -eq 3 ] && [ "$minor" -ge 9 ] && [ "$minor" -le 12 ]; then
-    return 0
-  else
-    echo "[env] Virtual environment Python version $venv_py_version is not compatible (requires 3.9-3.12)" >&2
-    return 1
-  fi
-}
-
-# Check if venv exists and is valid
-if validate_venv "$VENV_DIR"; then
-  VENV_PY_VERSION=$("$VENV_DIR/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-  echo "[env] Using existing virtual environment at $VENV_DIR (Python $VENV_PY_VERSION)"
+# Check for uv
+if command -v uv >/dev/null 2>&1; then
+  USE_UV=1
+  echo "[env] Using uv for package management"
 else
-  # Venv doesn't exist or is broken, recreate it
-  if [ -d "$VENV_DIR" ]; then
-    echo "[env] Virtual environment at $VENV_DIR is broken or incompatible, removing it"
-    rm -rf "$VENV_DIR"
-  fi
+  USE_UV=0
+  echo "[env] uv not found, using pip"
+fi
 
-  # Prefer uv for faster environment creation if available
-  if command -v uv >/dev/null 2>&1; then
-    echo "[env] Attempting to create virtual environment with uv using $PYTHON_CMD"
-    # uv venv doesn't include pip by default, so we need to check if it works properly
-    if uv venv "$VENV_DIR" --python "$PYTHON_CMD" --seed 2>/dev/null; then
-      # Verify pip is available
-      if "$VENV_DIR/bin/python" -m pip --version >/dev/null 2>&1; then
-        USE_UV=1
-        echo "[env] Virtual environment created successfully with uv"
-      else
-        echo "[env] uv venv missing pip, falling back to venv"
-        rm -rf "$VENV_DIR" 2>/dev/null || true
-        "$PYTHON_CMD" -m venv "$VENV_DIR"
-      fi
+# Setup environment
+if [ "$NO_VENV" -eq 1 ]; then
+  echo "[env] NO_VENV=1, using system Python directly"
+  DEPS_MARKER=".deps_installed"
+  DEPS_HASH_FILE=".deps_hash"
+else
+  # Create/use virtual environment
+  if [ ! -d "$VENV_DIR" ] || [ ! -x "$VENV_DIR/bin/python" ]; then
+    echo "[env] Creating virtual environment at $VENV_DIR"
+    rm -rf "$VENV_DIR" 2>/dev/null || true
+    if [ "$USE_UV" -eq 1 ]; then
+      uv venv "$VENV_DIR" --python "$PYTHON_CMD" --seed
     else
-      echo "[env] uv failed, falling back to venv"
-      rm -rf "$VENV_DIR" 2>/dev/null || true
       "$PYTHON_CMD" -m venv "$VENV_DIR"
     fi
-  else
-    echo "[env] Creating virtual environment with venv using $PYTHON_CMD"
-    "$PYTHON_CMD" -m venv "$VENV_DIR"
   fi
+  # shellcheck disable=SC1090
+  source "$VENV_DIR/bin/activate"
+  trap 'deactivate >/dev/null 2>&1 || true' EXIT
+  echo "[env] Activated $VENV_DIR"
+  DEPS_MARKER="$VENV_DIR/.deps_installed"
+  DEPS_HASH_FILE="$VENV_DIR/.deps_hash"
 fi
 
-if [ ! -x "$VENV_DIR/bin/python" ]; then
-  echo "[error] Python interpreter not found in $VENV_DIR after setup" >&2
-  exit 1
-fi
-
-# shellcheck disable=SC1090
-source "$VENV_DIR/bin/activate"
-trap 'deactivate >/dev/null 2>&1 || true' EXIT
-
-# Check if dependencies need to be installed or updated
+# Check if dependencies need installation
 REQUIREMENTS_HASH=$(shasum -a 256 requirements.txt 2>/dev/null | cut -d' ' -f1 || echo "unknown")
-DEPS_MARKER="$VENV_DIR/.deps_installed"
-DEPS_HASH_FILE="$VENV_DIR/.deps_hash"
-
 NEED_INSTALL=0
+
 if [ ! -f "$DEPS_MARKER" ]; then
   NEED_INSTALL=1
-  echo "[env] No dependency marker found, will install"
-elif [ ! -f "$DEPS_HASH_FILE" ]; then
+elif [ ! -f "$DEPS_HASH_FILE" ] || [ "$REQUIREMENTS_HASH" != "$(cat "$DEPS_HASH_FILE" 2>/dev/null)" ]; then
   NEED_INSTALL=1
-  echo "[env] No hash file found, will reinstall to ensure consistency"
-elif [ "$REQUIREMENTS_HASH" != "$(cat "$DEPS_HASH_FILE" 2>/dev/null)" ]; then
-  NEED_INSTALL=1
-  echo "[env] requirements.txt has changed, will update dependencies"
+  echo "[env] requirements.txt changed, updating"
 else
-  echo "[env] Dependencies are up to date, skipping installation"
+  echo "[env] Dependencies up to date"
 fi
 
+# Install dependencies
 if [ "$NEED_INSTALL" -eq 1 ]; then
-  INSTALL_SUCCESS=0
+  echo "[env] Installing dependencies..."
 
-  if [ "$USE_UV" -eq 1 ] && command -v uv >/dev/null 2>&1; then
-    echo "[env] Attempting to sync Python dependencies via uv"
-    if uv pip sync requirements.txt 2>/dev/null; then
-      INSTALL_SUCCESS=1
-      echo "[env] Dependencies synced successfully via uv"
-    else
-      echo "[env] uv pip sync failed, falling back to pip"
-    fi
-  fi
-
-  if [ "$INSTALL_SUCCESS" -eq 0 ]; then
-    echo "[env] Installing Python dependencies via pip"
-    python -m pip install --upgrade pip
-    # Use --no-cache-dir to avoid potential corruption and ensure fresh install
-    python -m pip install --no-cache-dir -r requirements.txt
-    INSTALL_SUCCESS=1
-  fi
-
-  if [ "$INSTALL_SUCCESS" -eq 1 ]; then
-    # Verify critical dependencies are installed
-    echo "[env] Verifying critical dependencies..."
-    if ! python -c "import torch" 2>/dev/null; then
-      echo "[env] Warning: torch not found, attempting to install..."
-      python -m pip install torch || {
-        echo "[error] Failed to install torch" >&2
-        exit 1
-      }
-    fi
-    if ! python -c "import transformers" 2>/dev/null; then
-      echo "[env] Warning: transformers not found, attempting to install..."
-      python -m pip install transformers || {
-        echo "[error] Failed to install transformers" >&2
-        exit 1
-      }
-    fi
-    # Mark dependencies as installed and save hash
-    touch "$DEPS_MARKER"
-    echo "$REQUIREMENTS_HASH" > "$DEPS_HASH_FILE"
-    echo "[env] Dependencies installed successfully"
+  # Determine pip/uv target
+  if [ "$NO_VENV" -eq 1 ]; then
+    UV_PYTHON_FLAG=""
+    PIP_CMD="python -m pip"
   else
-    echo "[error] Failed to install dependencies" >&2
-    exit 1
+    UV_PYTHON_FLAG="--python $VENV_DIR/bin/python"
+    PIP_CMD="$VENV_DIR/bin/python -m pip"
+  fi
+
+  if [ "$USE_UV" -eq 1 ]; then
+    uv pip install $UV_PYTHON_FLAG -r requirements.txt || {
+      echo "[env] uv failed, falling back to pip"
+      USE_UV=0
+    }
+  fi
+
+  if [ "$USE_UV" -eq 0 ]; then
+    $PIP_CMD install --upgrade pip -q
+    $PIP_CMD install -r requirements.txt
+  fi
+
+  # Verify torch
+  if ! python -c "import torch" 2>/dev/null; then
+    echo "[env] Installing torch..."
+    if [ "$USE_UV" -eq 1 ]; then
+      uv pip install $UV_PYTHON_FLAG torch
+    else
+      $PIP_CMD install torch
+    fi
+  fi
+
+  touch "$DEPS_MARKER"
+  echo "$REQUIREMENTS_HASH" > "$DEPS_HASH_FILE"
+  echo "[env] Dependencies ready"
+fi
+
+# ============================================================
+# RustBPE tokenizer setup (optional, for faster tokenization)
+# ============================================================
+RUSTBPE_MARKER="${DEPS_MARKER:-/tmp}/.rustbpe_compiled"
+if [ -d "rustbpe" ]; then
+  # Check if rustbpe is already importable
+  if ! python -c "import rustbpe" 2>/dev/null; then
+    if command -v cargo >/dev/null 2>&1; then
+      echo "[env] Compiling RustBPE tokenizer..."
+      # Install maturin if needed
+      if ! python -c "import maturin" 2>/dev/null; then
+        if [ "$USE_UV" -eq 1 ]; then
+          uv pip install maturin -q 2>/dev/null || pip install maturin -q
+        else
+          pip install maturin -q
+        fi
+      fi
+      # Compile rustbpe
+      if maturin develop --release --manifest-path rustbpe/Cargo.toml 2>/dev/null; then
+        echo "[env] RustBPE compiled successfully"
+        touch "$RUSTBPE_MARKER"
+      else
+        echo "[env] RustBPE compilation failed, will use fallback tokenizer"
+      fi
+    else
+      echo "[env] Rust not found, skipping RustBPE (install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh)"
+    fi
+  else
+    echo "[env] RustBPE already available"
   fi
 fi
 
@@ -608,33 +603,118 @@ fi
 
 MODEL_HIDDEN_SIZE=${MODEL_HIDDEN_SIZE:-512}   # MiniLLM2-Small (~26M params)
 MODEL_NUM_LAYERS=${MODEL_NUM_LAYERS:-8}
+MODEL_SEQ_LEN=${MODEL_SEQ_LEN:-512}
 USE_MOE=${USE_MOE:-false}
 
-# Auto-detect GPU count and enable multi-GPU training
+# ============================================================
+# GPU detection and auto-optimization
+# ============================================================
 detect_gpu_count() {
   if command -v nvidia-smi >/dev/null 2>&1; then
-    local gpu_count=$(nvidia-smi --list-gpus | wc -l | tr -d ' ')
-    echo "$gpu_count"
+    nvidia-smi --list-gpus 2>/dev/null | wc -l | tr -d ' '
   elif [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
-    local gpu_count=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l | tr -d ' ')
-    echo "$gpu_count"
+    echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l | tr -d ' '
   else
     echo "1"
   fi
 }
 
+detect_gpu_memory() {
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '
+  else
+    echo "0"
+  fi
+}
+
 NUM_GPUS=${NUM_GPUS:-$(detect_gpu_count)}
-if [ "$NUM_GPUS" -gt 1 ]; then
-  echo "[gpu] Detected $NUM_GPUS GPUs, will use torchrun for multi-GPU training"
-  TRAIN_CMD_PREFIX="torchrun --nproc_per_node=$NUM_GPUS"
-  # For 24GB GPUs, you can optimize batch_size via environment variables:
-  # export PRETRAIN_ARGS="--batch_size 64 --accumulation_steps 4"  # 2卡时每卡32，总batch=64
-  # export SFT_ARGS="--batch_size 32 --accumulation_steps 2"        # 2卡时每卡16，总batch=32
-  # export DPO_ARGS="--batch_size 8 --accumulation_steps 1"         # 2卡时每卡4，总batch=8
+GPU_MEM=${GPU_MEM:-$(detect_gpu_memory)}
+
+# Auto-configure batch size based on GPU memory
+if [ -z "${BATCH_SIZE:-}" ]; then
+  if [ "$GPU_MEM" -ge 70000 ]; then
+    # A100 80GB or similar
+    BATCH_SIZE=256
+    ACCUM_STEPS=1
+    NUM_WORKERS=8
+    echo "[gpu] A100 80GB detected, using optimized settings: batch=$BATCH_SIZE"
+  elif [ "$GPU_MEM" -ge 38000 ]; then
+    # A100 40GB or A6000
+    BATCH_SIZE=128
+    ACCUM_STEPS=2
+    NUM_WORKERS=8
+    echo "[gpu] 40GB+ GPU detected: batch=$BATCH_SIZE, accum=$ACCUM_STEPS"
+  elif [ "$GPU_MEM" -ge 20000 ]; then
+    # RTX 3090/4090 24GB
+    BATCH_SIZE=64
+    ACCUM_STEPS=4
+    NUM_WORKERS=4
+    echo "[gpu] 24GB GPU detected: batch=$BATCH_SIZE, accum=$ACCUM_STEPS"
+  else
+    # Smaller GPUs or CPU
+    BATCH_SIZE=32
+    ACCUM_STEPS=8
+    NUM_WORKERS=2
+    echo "[gpu] Standard settings: batch=$BATCH_SIZE, accum=$ACCUM_STEPS"
+  fi
 else
-  echo "[gpu] Using single GPU or CPU mode"
+  ACCUM_STEPS=${ACCUM_STEPS:-4}
+  NUM_WORKERS=${NUM_WORKERS:-4}
+fi
+
+if [ "$NUM_GPUS" -gt 1 ]; then
+  echo "[gpu] Detected $NUM_GPUS GPUs, using torchrun"
+  TRAIN_CMD_PREFIX="torchrun --nproc_per_node=$NUM_GPUS"
+else
+  echo "[gpu] Single GPU mode"
   TRAIN_CMD_PREFIX="python"
 fi
+
+# ============================================================
+# Data preprocessing (convert JSONL to fast bin2d format)
+# ============================================================
+PREPROCESS_DATA=${PREPROCESS_DATA:-1}
+
+preprocess_to_bin2d() {
+  local input_path=$1
+  local out_prefix=$2
+  local task=${3:-pretrain}
+  local seq_len=${4:-$MODEL_SEQ_LEN}
+  local meta_file="${out_prefix}.meta.json"
+
+  if [ -f "$meta_file" ] && [ "$PREPROCESS_DATA" -ne 2 ]; then
+    echo "[preprocess] Using cached: $meta_file"
+    echo "$meta_file"
+    return 0
+  fi
+
+  # Check for RustBPE tokenizer (faster)
+  TOKENIZER_TYPE="auto"
+  if [ -f "./model/tokenizer.pkl" ] && python -c "import rustbpe" 2>/dev/null; then
+    echo "[preprocess] Using RustBPE tokenizer (fast)"
+    TOKENIZER_TYPE="rustbpe"
+  elif [ -f "./model/tokenizer.pkl" ]; then
+    echo "[preprocess] tokenizer.pkl found but rustbpe not available, using HuggingFace tokenizer"
+  fi
+
+  echo "[preprocess] Converting $input_path to bin2d format..."
+  python -m mlx_train.cli.packbin2d \
+    --data_path "$input_path" \
+    --out_prefix "$out_prefix" \
+    --seq_len "$seq_len" \
+    --task "$task" \
+    --tokenizer_path ./model \
+    --tokenizer_type "$TOKENIZER_TYPE" \
+    --log_interval 50000 || {
+      echo "[preprocess] Failed, using original JSONL"
+      echo "$input_path"
+      return 0
+    }
+  echo "$meta_file"
+}
+
+# Common DataLoader args for GPU training
+DATALOADER_ARGS="--num_workers $NUM_WORKERS --pin_memory --prefetch_factor 4 --persistent_workers"
 
 MOE_SUFFIX=""
 if [ "$USE_MOE" = "true" ]; then
@@ -815,11 +895,13 @@ if [ "$SMOKE_TEST" -eq 1 ]; then
   DPO_EVAL_BATCH=${SMOKE_DPO_EVAL_BATCH:-1}
 
   EVAL_CMD_BASE+=(--device cpu)
+  PREPROCESS_DATA=0  # Skip preprocessing for smoke test
 else
-  EXTRA_PRETRAIN_ARGS+=(--save_interval "$SAVE_INTERVAL")
-  EXTRA_SFT_ARGS+=(--save_interval "$SAVE_INTERVAL")
-  EXTRA_DPO_ARGS+=(--save_interval "$SAVE_INTERVAL")
-  EXTRA_R1_ARGS+=(--save_interval "$SAVE_INTERVAL")
+  # GPU training with optimized settings
+  EXTRA_PRETRAIN_ARGS+=(--save_interval "$SAVE_INTERVAL" --batch_size "$BATCH_SIZE" --accumulation_steps "$ACCUM_STEPS" --dtype bfloat16 $DATALOADER_ARGS)
+  EXTRA_SFT_ARGS+=(--save_interval "$SAVE_INTERVAL" --batch_size "$BATCH_SIZE" --accumulation_steps "$ACCUM_STEPS" --dtype bfloat16 $DATALOADER_ARGS)
+  EXTRA_DPO_ARGS+=(--save_interval "$SAVE_INTERVAL" --batch_size "$((BATCH_SIZE / 4))" --accumulation_steps "$((ACCUM_STEPS * 2))" --dtype bfloat16 $DATALOADER_ARGS)
+  EXTRA_R1_ARGS+=(--save_interval "$SAVE_INTERVAL" --batch_size "$((BATCH_SIZE / 2))" --accumulation_steps "$ACCUM_STEPS" --dtype bfloat16 $DATALOADER_ARGS)
 fi
 
 EXTRA_PRETRAIN_ARGS+=(--keep_last_checkpoints "$KEEP_LAST")
@@ -871,13 +953,25 @@ fi
 
 if [ "$SHOULD_SKIP_PRETRAIN" -eq 0 ]; then
   echo "[stage] Starting pretrain (2 epochs)"
+
+  # Preprocess data to bin2d for faster loading
+  PRETRAIN_DATA_PATH="$PRETRAIN_JSON"
+  PRETRAIN_DATA_FORMAT_ARG=""
+  if [ "$PREPROCESS_DATA" -ge 1 ] && [ "$SMOKE_TEST" -eq 0 ]; then
+    PRETRAIN_BIN_PREFIX="$PRETRAIN_OUT/data_bin2d"
+    PRETRAIN_DATA_PATH=$(preprocess_to_bin2d "$PRETRAIN_JSON" "$PRETRAIN_BIN_PREFIX" "pretrain" "$MODEL_SEQ_LEN")
+    if [[ "$PRETRAIN_DATA_PATH" == *.meta.json ]]; then
+      PRETRAIN_DATA_FORMAT_ARG="--data_format bin2d"
+    fi
+  fi
+
   PRETRAIN_RESUME=$(latest_ckpt "$PRETRAIN_OUT")
   PRETRAIN_ARGS_WITH_RESUME=("${EXTRA_PRETRAIN_ARGS[@]}")
   if [ -n "$PRETRAIN_RESUME" ]; then
     PRETRAIN_ARGS_WITH_RESUME+=(--resume "$PRETRAIN_RESUME")
   fi
   PRETRAIN_ARGS_WITH_RESUME+=(--ckpt_dir "$PRETRAIN_OUT/checkpoints")
-  $TRAIN_CMD_PREFIX trainer/train_pretrain.py --data_path "$PRETRAIN_JSON" --hidden_size "$MODEL_HIDDEN_SIZE" --num_hidden_layers "$MODEL_NUM_LAYERS" --epochs 2 --out_dir "$PRETRAIN_OUT" --tensorboard_dir "$TB_PRETRAIN_DIR" ${PRETRAIN_ARGS_WITH_RESUME[@]+"${PRETRAIN_ARGS_WITH_RESUME[@]}"}
+  $TRAIN_CMD_PREFIX trainer/train_pretrain.py --data_path "$PRETRAIN_DATA_PATH" $PRETRAIN_DATA_FORMAT_ARG --hidden_size "$MODEL_HIDDEN_SIZE" --num_hidden_layers "$MODEL_NUM_LAYERS" --max_seq_len "$MODEL_SEQ_LEN" --epochs 2 --out_dir "$PRETRAIN_OUT" --tensorboard_dir "$TB_PRETRAIN_DIR" ${PRETRAIN_ARGS_WITH_RESUME[@]+"${PRETRAIN_ARGS_WITH_RESUME[@]}"}
 
   if [ -f "$CHECKPOINT_PRETRAIN" ]; then
     link_legacy_checkpoint "$CHECKPOINT_PRETRAIN" "$LEGACY_PRETRAIN"
