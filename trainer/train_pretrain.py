@@ -31,22 +31,26 @@ warnings.filterwarnings('ignore')
 
 # CUDA optimizations for A100 and modern GPUs
 if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for faster matmul
+    # TF32 for A100 (19x faster than FP32, minimal precision loss)
+    torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    torch.backends.cudnn.benchmark = True  # Auto-tune convolutions
-    torch.set_float32_matmul_precision('high')  # Use TF32 for float32 matmuls
-    # Disable debug features for max performance
+    torch.set_float32_matmul_precision('high')
+    # cuDNN auto-tuning
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    # Disable debug overhead
     torch.autograd.set_detect_anomaly(False)
     torch.autograd.profiler.profile(enabled=False)
     torch.autograd.profiler.emit_nvtx(enabled=False)
-    # Enable CUDA memory efficient features
     if hasattr(torch.cuda, 'set_sync_debug_mode'):
-        torch.cuda.set_sync_debug_mode(0)  # Disable sync debug
-    # Enable flash attention sdpa backend
+        torch.cuda.set_sync_debug_mode(0)
+    # Flash Attention (priority: flash > mem_efficient, disable slow math)
     if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
         torch.backends.cuda.enable_flash_sdp(True)
     if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
         torch.backends.cuda.enable_mem_efficient_sdp(True)
+    if hasattr(torch.backends.cuda, 'enable_math_sdp'):
+        torch.backends.cuda.enable_math_sdp(False)
 
 training_state = {"max_steps": None, "global_step": 0, "stop": False}
 ckpt_root = None
@@ -378,6 +382,11 @@ if __name__ == "__main__":
     else:
         wandb = None
 
+    # Log CUDA optimizations
+    if torch.cuda.is_available():
+        flash_sdp = getattr(torch.backends.cuda, 'flash_sdp_enabled', lambda: False)()
+        Logger(f"[cuda] TF32={torch.backends.cuda.matmul.allow_tf32}, Flash-SDPA={flash_sdp}, cuDNN-benchmark={torch.backends.cudnn.benchmark}")
+
     global writer
     writer = None
     if args.tensorboard_dir and (not ddp or dist.get_rank() == 0):
@@ -427,6 +436,7 @@ if __name__ == "__main__":
             weight_decay=args.weight_decay,
         )
     else:
+        Logger(f"[optim] Using AdamW optimizer (lr={args.learning_rate}, warmup={args.warmup_iters})")
         optimizer = optim.AdamW(
             model.parameters(),
             lr=args.learning_rate,

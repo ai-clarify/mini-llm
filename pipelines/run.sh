@@ -1077,6 +1077,13 @@ fi
 if [ "$SHOULD_SKIP_PRETRAIN" -eq 0 ]; then
   echo "[stage] Starting pretrain (2 epochs)"
 
+  # If force-pretrain, clear old checkpoints to start fresh
+  if [ "$FORCE_PRETRAIN" -eq 1 ]; then
+    echo "[stage] Clearing old pretrain checkpoints..."
+    rm -rf "$PRETRAIN_OUT/checkpoints"
+    rm -f "$PRETRAIN_OUT"/*.pth
+  fi
+
   # Preprocess data to bin2d for faster loading
   PRETRAIN_DATA_PATH="$PRETRAIN_JSON"
   PRETRAIN_DATA_FORMAT_ARG=""
