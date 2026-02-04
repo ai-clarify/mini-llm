@@ -339,23 +339,8 @@ if __name__ == "__main__":
         persistent_workers=persistent_workers,
     )
 
-    # GradScaler: only needed for float16, not for bfloat16
-    use_scaler = args.dtype == 'float16'
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
-
-    # Use fused AdamW for bfloat16 on CUDA (faster)
-    use_fused = (
-        torch.cuda.is_available()
-        and 'cuda' in str(args.device)
-        and args.dtype == 'bfloat16'
-    )
-    if use_fused:
-        try:
-            optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, fused=True)
-        except Exception:
-            optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
-    else:
-        optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     if ddp:
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}

@@ -261,7 +261,7 @@ if __name__ == "__main__":
     # 若要以最快速度实现zero则epochs设置为1轮；否则应当利用有限的数据训练2~6个epochs。
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--learning_rate", type=float, default=2e-3)
+    parser.add_argument("--learning_rate", type=float, default=6e-4)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--use_wandb", action="store_true")
@@ -408,10 +408,7 @@ if __name__ == "__main__":
         persistent_workers=persistent_workers,
     )
 
-    # GradScaler: only needed for float16, not for bfloat16 (has enough dynamic range)
-    # Also, fused optimizers don't work with GradScaler
-    use_scaler = args.dtype == 'float16'
-    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
 
     # Optimizer selection
     if args.optimizer == "muon":
@@ -430,29 +427,11 @@ if __name__ == "__main__":
             weight_decay=args.weight_decay,
         )
     else:
-        # Use fused AdamW for bfloat16 on CUDA (faster, but incompatible with GradScaler)
-        use_fused = (
-            torch.cuda.is_available()
-            and 'cuda' in str(args.device)
-            and args.dtype == 'bfloat16'  # fused doesn't work with GradScaler (float16)
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
         )
-        if use_fused:
-            try:
-                optimizer = optim.AdamW(
-                    model.parameters(),
-                    lr=args.learning_rate,
-                    weight_decay=args.weight_decay,
-                    fused=True,
-                )
-                Logger("[optim] Using fused AdamW optimizer (bfloat16)")
-            except Exception:
-                use_fused = False
-        if not use_fused:
-            optimizer = optim.AdamW(
-                model.parameters(),
-                lr=args.learning_rate,
-                weight_decay=args.weight_decay,
-            )
 
     if ddp:
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
