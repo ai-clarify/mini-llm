@@ -270,14 +270,14 @@ if [ "$NEED_INSTALL" -eq 1 ]; then
     echo "[env] Verifying critical dependencies..."
     if ! python -c "import torch" 2>/dev/null; then
       echo "[env] Warning: torch not found, attempting to install..."
-      python -m pip install torch --index-url https://mirrors.aliyun.com/pypi/simple/ || {
+      python -m pip install torch --index-url https://pypi.tuna.tsinghua.edu.cn/simple/ || {
         echo "[error] Failed to install torch" >&2
         exit 1
       }
     fi
     if ! python -c "import transformers" 2>/dev/null; then
       echo "[env] Warning: transformers not found, attempting to install..."
-      python -m pip install transformers --index-url https://mirrors.aliyun.com/pypi/simple/ || {
+      python -m pip install transformers --index-url https://pypi.tuna.tsinghua.edu.cn/simple/ || {
         echo "[error] Failed to install transformers" >&2
         exit 1
       }
