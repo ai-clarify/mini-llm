@@ -488,24 +488,28 @@ class MiniLLMAttention(nn.Module):
         # Fast path: use SDPA (Flash Attention) when possible
         topk_idx = self.indexer(hidden_states=x, attention_mask=attention_mask, past_len=past_len)
         use_sdpa = (
-            self.training
-            and self.attn_window == 0
+            self.attn_window == 0
             and topk_idx is None
             and self.attn_head_gate is None
-            and attention_mask is None
-            and past_len == 0
             and hasattr(F, 'scaled_dot_product_attention')
         )
+        # For inference with past_key_values, still use SDPA but without causal mask
+        use_sdpa_inference = use_sdpa and not self.training and past_len > 0 and attention_mask is None
+        use_sdpa_training = use_sdpa and self.training and attention_mask is None and past_len == 0
 
-        if use_sdpa:
-            # Use PyTorch's SDPA with Flash Attention
+        if use_sdpa_training or use_sdpa_inference:
+            # Use PyTorch's SDPA with Flash Attention (auto-selects best backend)
+            # Ensure contiguous tensors for optimal memory access
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
             attn_output = F.scaled_dot_product_attention(
                 query_states,
                 key_states,
                 value_states,
                 attn_mask=None,
                 dropout_p=self.attn_dropout.p if self.training else 0.0,
-                is_causal=True,
+                is_causal=use_sdpa_training,  # Only use causal for training without cache
                 scale=self.softmax_scale,
             )
         else:

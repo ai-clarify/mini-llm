@@ -27,6 +27,19 @@ from trainer.loss_utils import compute_mtp_loss
 
 warnings.filterwarnings('ignore')
 
+# CUDA optimizations for A100 and modern GPUs
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')
+    torch.autograd.set_detect_anomaly(False)
+    torch.autograd.profiler.profile(enabled=False)
+    torch.autograd.profiler.emit_nvtx(enabled=False)
+    if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+        torch.backends.cuda.enable_flash_sdp(True)
+    if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 training_state = {"max_steps": None, "global_step": 0, "stop": False}
 ckpt_root = None
@@ -52,9 +65,10 @@ def train_epoch(epoch, wandb):
             continue
         if training_state["stop"]:
             break
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
+        # Use non_blocking=True for async H2D transfer
+        X = X.to(args.device, non_blocking=True)
+        Y = Y.to(args.device, non_blocking=True)
+        loss_mask = loss_mask.to(args.device, non_blocking=True)
         lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr

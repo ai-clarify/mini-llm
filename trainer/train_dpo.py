@@ -27,6 +27,19 @@ from trainer import checkpoint_manager
 
 warnings.filterwarnings('ignore')
 
+# CUDA optimizations for A100 and modern GPUs
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision('high')
+    torch.autograd.set_detect_anomaly(False)
+    torch.autograd.profiler.profile(enabled=False)
+    torch.autograd.profiler.emit_nvtx(enabled=False)
+    if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+        torch.backends.cuda.enable_flash_sdp(True)
+    if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 training_state = {"max_steps": None, "global_step": 0, "stop": False}
 ckpt_root = None
@@ -81,12 +94,13 @@ def train_epoch(epoch, wandb):
             continue
         if training_state["stop"]:
             break
-        x_chosen = batch['x_chosen'].to(args.device)
-        x_rejected = batch['x_rejected'].to(args.device)
-        y_chosen = batch['y_chosen'].to(args.device)
-        y_rejected = batch['y_rejected'].to(args.device)
-        mask_chosen = batch['mask_chosen'].to(args.device)
-        mask_rejected = batch['mask_rejected'].to(args.device)
+        # Use non_blocking=True for async H2D transfer
+        x_chosen = batch['x_chosen'].to(args.device, non_blocking=True)
+        x_rejected = batch['x_rejected'].to(args.device, non_blocking=True)
+        y_chosen = batch['y_chosen'].to(args.device, non_blocking=True)
+        y_rejected = batch['y_rejected'].to(args.device, non_blocking=True)
+        mask_chosen = batch['mask_chosen'].to(args.device, non_blocking=True)
+        mask_rejected = batch['mask_rejected'].to(args.device, non_blocking=True)
         x = torch.cat([x_chosen, x_rejected], dim=0)
         y = torch.cat([y_chosen, y_rejected], dim=0)
         mask = torch.cat([mask_chosen, mask_rejected], dim=0)

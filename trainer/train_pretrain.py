@@ -30,12 +30,24 @@ from trainer.training_schedule import apply_projection_zero_init, apply_back_out
 
 warnings.filterwarnings('ignore')
 
-# CUDA optimizations
+# CUDA optimizations for A100 and modern GPUs
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for faster matmul
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True  # Auto-tune convolutions
     torch.set_float32_matmul_precision('high')  # Use TF32 for float32 matmuls
+    # Disable debug features for max performance
+    torch.autograd.set_detect_anomaly(False)
+    torch.autograd.profiler.profile(enabled=False)
+    torch.autograd.profiler.emit_nvtx(enabled=False)
+    # Enable CUDA memory efficient features
+    if hasattr(torch.cuda, 'set_sync_debug_mode'):
+        torch.cuda.set_sync_debug_mode(0)  # Disable sync debug
+    # Enable flash attention sdpa backend
+    if hasattr(torch.backends.cuda, 'enable_flash_sdp'):
+        torch.backends.cuda.enable_flash_sdp(True)
+    if hasattr(torch.backends.cuda, 'enable_mem_efficient_sdp'):
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
 
 training_state = {"max_steps": None, "global_step": 0, "stop": False}
 ckpt_root = None
@@ -61,9 +73,10 @@ def train_epoch(epoch, wandb):
             continue
         if training_state["stop"]:
             break
-        X = X.to(args.device)
-        Y = Y.to(args.device)
-        loss_mask = loss_mask.to(args.device)
+        # Use non_blocking=True for async H2D transfer (overlaps with GPU compute)
+        X = X.to(args.device, non_blocking=True)
+        Y = Y.to(args.device, non_blocking=True)
+        loss_mask = loss_mask.to(args.device, non_blocking=True)
 
         lr = get_lr(epoch * iter_per_epoch + step, args.epochs * iter_per_epoch, args.learning_rate)
         for param_group in optimizer.param_groups:
@@ -100,25 +113,31 @@ def train_epoch(epoch, wandb):
             time_per_step = spend_time / (step + 1)
             remaining_steps = iter_per_epoch - step - 1
             eta_min = time_per_step * remaining_steps / 60
+            # Calculate tokens/sec throughput
+            tokens_processed = (step + 1) * args.batch_size * args.max_seq_len
+            tokens_per_sec = tokens_processed / spend_time if spend_time > 0 else 0
             Logger(
-                'Epoch:[{}/{}]({}/{}) loss:{:.6f} lr:{:.12f} ETA:{:.1f}min'.format(
+                'Epoch:[{}/{}]({}/{}) loss:{:.6f} lr:{:.12f} tok/s:{:.0f} ETA:{:.1f}min'.format(
                     epoch + 1,
                     args.epochs,
                     step,
                     iter_per_epoch,
                     loss.item() * args.accumulation_steps,
                     optimizer.param_groups[-1]['lr'],
+                    tokens_per_sec,
                     eta_min))
 
             if (wandb is not None) and (not ddp or dist.get_rank() == 0):
                 wandb.log({"loss": loss.item() * args.accumulation_steps,
                            "lr": optimizer.param_groups[-1]['lr'],
+                           "tokens_per_sec": tokens_per_sec,
                            "eta_min": eta_min})
 
             if writer is not None and (not ddp or dist.get_rank() == 0):
                 global_step = training_state["global_step"]
                 writer.add_scalar("train/loss", loss.item() * args.accumulation_steps, global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[-1]['lr'], global_step)
+                writer.add_scalar("train/tokens_per_sec", tokens_per_sec, global_step)
 
         if (
             (did_update and training_state["global_step"] % args.save_interval == 0)
@@ -403,11 +422,25 @@ if __name__ == "__main__":
             cautious=args.cautious_wd,
         )
     else:
-        optimizer = optim.AdamW(
-            model.parameters(),
-            lr=args.learning_rate,
-            weight_decay=args.weight_decay,
-        )
+        # Use fused AdamW for A100 (requires CUDA and PyTorch 2.0+)
+        use_fused = torch.cuda.is_available() and 'cuda' in str(args.device)
+        if use_fused:
+            try:
+                optimizer = optim.AdamW(
+                    model.parameters(),
+                    lr=args.learning_rate,
+                    weight_decay=args.weight_decay,
+                    fused=True,  # Fused kernel for faster updates
+                )
+                Logger("[optim] Using fused AdamW optimizer")
+            except Exception:
+                use_fused = False
+        if not use_fused:
+            optimizer = optim.AdamW(
+                model.parameters(),
+                lr=args.learning_rate,
+                weight_decay=args.weight_decay,
+            )
 
     if ddp:
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}

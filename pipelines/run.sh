@@ -34,12 +34,27 @@ Environment Variables:
   MINIMIND_DATA_SOURCE  Data source: modelscope (default) or huggingface
   MINIMIND_DATA_REPO    Dataset repo (default: gongjy/minimind_dataset)
 
+A100/GPU Optimization Variables:
+  TURBO              0=off, 1=full (Muon+compile), 2=lite (AdamW+compile)
+  USE_COMPILE        1=enable torch.compile (auto-enabled with TURBO on A100)
+  COMPILE_MODE       torch.compile mode: reduce-overhead, max-autotune (A100 default)
+  GRAD_CKPT          1=enable gradient checkpointing (saves memory, allows larger batch)
+  NUM_WORKERS        DataLoader workers (auto: 12 for A100 80GB)
+  ACCUM_STEPS        Gradient accumulation steps (auto: 1 for A100 80GB)
+  PREFETCH_FACTOR    DataLoader prefetch factor (auto: 4 for A100)
+
 Examples:
   ./scripts/run.sh                      # Auto-optimized for your GPU
   ./scripts/run.sh --smoke-test         # Quick test on CPU
   NO_VENV=1 ./scripts/run.sh            # Run without venv (Colab)
   MODEL_HIDDEN_SIZE=1024 MODEL_NUM_LAYERS=16 ./scripts/run.sh  # Train 0.2B model
   MINIMIND_DATA_SOURCE=huggingface MINIMIND_DATA_REPO=jingyaogong/minimind_dataset ./scripts/run.sh
+
+A100 Optimized Examples:
+  TURBO=2 ./scripts/run.sh              # A100 with AdamW + compile (recommended)
+  TURBO=1 ./scripts/run.sh              # A100 with Muon + compile (experimental)
+  TURBO=2 MODEL_SEQ_LEN=1024 ./scripts/run.sh  # Larger context for A100 80GB
+  TURBO=2 GRAD_CKPT=1 BATCH_SIZE=512 ./scripts/run.sh  # Max batch with grad ckpt
 USAGE
 }
 
@@ -613,6 +628,18 @@ USE_MOE=${USE_MOE:-false}
 # TURBO=2 enables optimizations without Muon (recommended for <500M params)
 TURBO=${TURBO:-0}
 USE_COMPILE=${USE_COMPILE:-0}
+COMPILE_MODE=${COMPILE_MODE:-reduce-overhead}
+
+# Auto-enable optimizations for A100
+if [ "$GPU_MEM" -ge 70000 ]; then
+  # A100: enable max-autotune for best performance (slower first iteration)
+  COMPILE_MODE=${COMPILE_MODE:-max-autotune}
+  # Enable compile by default on A100 with TURBO
+  if [ "$TURBO" -ge 1 ]; then
+    USE_COMPILE=${USE_COMPILE:-1}
+  fi
+fi
+
 if [ "$TURBO" -eq 2 ]; then
   echo "[turbo] Enabling optimizations (lite mode, AdamW + compile)"
   OPTIMIZER=${OPTIMIZER:-adamw}
@@ -633,6 +660,16 @@ elif [ "$TURBO" -eq 1 ]; then
   LOGIT_SOFTCAP=${LOGIT_SOFTCAP:-30}
   MTP_LOSS_WEIGHT=${MTP_LOSS_WEIGHT:-0.1}
   USE_COMPILE=${USE_COMPILE:-1}
+fi
+
+# torch.compile environment optimizations
+if [ "$USE_COMPILE" -eq 1 ]; then
+  export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_cache}
+  export TORCH_COMPILE_DEBUG=${TORCH_COMPILE_DEBUG:-0}
+  # Use Triton for A100 (better kernel generation)
+  if [ "$GPU_MEM" -ge 38000 ]; then
+    export TORCHINDUCTOR_TRITON_CUDAGRAPHS=${TORCHINDUCTOR_TRITON_CUDAGRAPHS:-1}
+  fi
 fi
 
 # Optimizer: adamw (default) or muon (Newton-Schulz orthogonalization)
@@ -681,38 +718,55 @@ GPU_MEM=${GPU_MEM:-$(detect_gpu_memory)}
 # Auto-configure batch size based on GPU memory
 if [ -z "${BATCH_SIZE:-}" ]; then
   if [ "$GPU_MEM" -ge 70000 ]; then
-    # A100 80GB or similar
-    BATCH_SIZE=256
+    # A100 80GB or similar - maximize throughput
+    BATCH_SIZE=384
     ACCUM_STEPS=1
-    NUM_WORKERS=8
-    echo "[gpu] A100 80GB detected, using optimized settings: batch=$BATCH_SIZE"
+    NUM_WORKERS=12
+    PREFETCH_FACTOR=4
+    echo "[gpu] A100 80GB detected, using max-throughput settings: batch=$BATCH_SIZE"
+    # A100-specific CUDA optimizations
+    export CUDA_LAUNCH_BLOCKING=0
+    export CUDA_DEVICE_MAX_CONNECTIONS=1
+    # Enable TF32 for A100 (faster than FP32, more accurate than FP16)
+    export NVIDIA_TF32_OVERRIDE=1
   elif [ "$GPU_MEM" -ge 38000 ]; then
     # A100 40GB or A6000
-    BATCH_SIZE=128
-    ACCUM_STEPS=2
+    BATCH_SIZE=192
+    ACCUM_STEPS=1
     NUM_WORKERS=8
+    PREFETCH_FACTOR=4
     echo "[gpu] 40GB+ GPU detected: batch=$BATCH_SIZE, accum=$ACCUM_STEPS"
+    export NVIDIA_TF32_OVERRIDE=1
   elif [ "$GPU_MEM" -ge 20000 ]; then
     # RTX 3090/4090 24GB
-    BATCH_SIZE=64
-    ACCUM_STEPS=4
+    BATCH_SIZE=96
+    ACCUM_STEPS=2
     NUM_WORKERS=4
+    PREFETCH_FACTOR=2
     echo "[gpu] 24GB GPU detected: batch=$BATCH_SIZE, accum=$ACCUM_STEPS"
   else
     # Smaller GPUs or CPU
     BATCH_SIZE=32
     ACCUM_STEPS=8
     NUM_WORKERS=2
+    PREFETCH_FACTOR=2
     echo "[gpu] Standard settings: batch=$BATCH_SIZE, accum=$ACCUM_STEPS"
   fi
 else
   ACCUM_STEPS=${ACCUM_STEPS:-4}
   NUM_WORKERS=${NUM_WORKERS:-4}
+  PREFETCH_FACTOR=${PREFETCH_FACTOR:-2}
 fi
 
 if [ "$NUM_GPUS" -gt 1 ]; then
   echo "[gpu] Detected $NUM_GPUS GPUs, using torchrun"
   TRAIN_CMD_PREFIX="torchrun --nproc_per_node=$NUM_GPUS"
+  # NCCL optimizations for multi-GPU A100 training
+  export NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}  # Enable InfiniBand if available
+  export NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-2}  # GPUDirect RDMA level
+  export NCCL_P2P_LEVEL=${NCCL_P2P_LEVEL:-NVL}  # Use NVLink for P2P
+  export NCCL_ASYNC_ERROR_HANDLING=1
+  echo "[nccl] Multi-GPU NCCL optimizations enabled"
 else
   echo "[gpu] Single GPU mode"
   TRAIN_CMD_PREFIX="python"
@@ -767,7 +821,7 @@ preprocess_to_bin2d() {
 }
 
 # Common DataLoader args for GPU training
-DATALOADER_ARGS="--num_workers $NUM_WORKERS --pin_memory --prefetch_factor 4 --persistent_workers"
+DATALOADER_ARGS="--num_workers $NUM_WORKERS --pin_memory --prefetch_factor ${PREFETCH_FACTOR:-4} --persistent_workers"
 
 MOE_SUFFIX=""
 if [ "$USE_MOE" = "true" ]; then
@@ -983,10 +1037,17 @@ if [ "$LOGIT_SOFTCAP" != "0" ]; then
   EXTRA_PRETRAIN_ARGS+=(--logit_softcap "$LOGIT_SOFTCAP")
 fi
 if [ "$USE_COMPILE" -eq 1 ]; then
-  EXTRA_PRETRAIN_ARGS+=(--use_compile)
+  EXTRA_PRETRAIN_ARGS+=(--use_compile --compile_mode "$COMPILE_MODE")
 fi
 if [ "${GRAD_CKPT:-0}" -eq 1 ]; then
   EXTRA_PRETRAIN_ARGS+=(--gradient_checkpointing)
+fi
+
+# A100-specific: larger sequence length for better GPU utilization
+if [ "$GPU_MEM" -ge 70000 ] && [ -z "${MODEL_SEQ_LEN_SET:-}" ]; then
+  if [ "$MODEL_SEQ_LEN" -lt 1024 ]; then
+    echo "[a100] Consider using MODEL_SEQ_LEN=1024 for better A100 utilization"
+  fi
 fi
 
 # Check if we should skip pretrain stage
