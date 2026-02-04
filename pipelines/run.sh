@@ -38,9 +38,9 @@ A100/GPU Optimization Variables:
   TURBO              0=off, 1=full (Muon+compile), 2=lite (AdamW+compile)
   USE_COMPILE        1=enable torch.compile (auto-enabled with TURBO on A100)
   COMPILE_MODE       torch.compile mode: reduce-overhead, max-autotune (A100 default)
-  GRAD_CKPT          1=enable gradient checkpointing (saves memory, allows larger batch)
-  NUM_WORKERS        DataLoader workers (auto: 12 for A100 80GB)
-  ACCUM_STEPS        Gradient accumulation steps (auto: 1 for A100 80GB)
+  GRAD_CKPT          1=enable gradient checkpointing (saves ~40% VRAM, allows 2x batch)
+  NUM_WORKERS        DataLoader workers (auto: 8 for A100)
+  ACCUM_STEPS        Gradient accumulation steps (auto: 2 for A100 80GB)
   PREFETCH_FACTOR    DataLoader prefetch factor (auto: 4 for A100)
 
 Examples:
@@ -53,8 +53,8 @@ Examples:
 A100 Optimized Examples:
   TURBO=2 ./scripts/run.sh              # A100 with AdamW + compile (recommended)
   TURBO=1 ./scripts/run.sh              # A100 with Muon + compile (experimental)
-  TURBO=2 MODEL_SEQ_LEN=1024 ./scripts/run.sh  # Larger context for A100 80GB
-  TURBO=2 GRAD_CKPT=1 BATCH_SIZE=512 ./scripts/run.sh  # Max batch with grad ckpt
+  TURBO=2 GRAD_CKPT=1 BATCH_SIZE=256 ./scripts/run.sh  # Larger batch with grad ckpt
+  TURBO=2 MODEL_SEQ_LEN=1024 BATCH_SIZE=64 ./scripts/run.sh  # Longer context
 USAGE
 }
 
@@ -622,6 +622,30 @@ MODEL_SEQ_LEN=${MODEL_SEQ_LEN:-512}
 USE_MOE=${USE_MOE:-false}
 
 # ============================================================
+# GPU detection (moved early for use in TURBO config)
+# ============================================================
+detect_gpu_count() {
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --list-gpus 2>/dev/null | wc -l | tr -d ' '
+  elif [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l | tr -d ' '
+  else
+    echo "1"
+  fi
+}
+
+detect_gpu_memory() {
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '
+  else
+    echo "0"
+  fi
+}
+
+NUM_GPUS=${NUM_GPUS:-$(detect_gpu_count)}
+GPU_MEM=${GPU_MEM:-$(detect_gpu_memory)}
+
+# ============================================================
 # Training optimizations (modded-nanogpt style)
 # ============================================================
 # TURBO=1 enables all optimizations (including Muon, may be slower on small models)
@@ -631,7 +655,7 @@ USE_COMPILE=${USE_COMPILE:-0}
 COMPILE_MODE=${COMPILE_MODE:-reduce-overhead}
 
 # Auto-enable optimizations for A100
-if [ "$GPU_MEM" -ge 70000 ]; then
+if [ "${GPU_MEM:-0}" -ge 70000 ]; then
   # A100: enable max-autotune for best performance (slower first iteration)
   COMPILE_MODE=${COMPILE_MODE:-max-autotune}
   # Enable compile by default on A100 with TURBO
@@ -667,7 +691,7 @@ if [ "$USE_COMPILE" -eq 1 ]; then
   export TORCHINDUCTOR_CACHE_DIR=${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_cache}
   export TORCH_COMPILE_DEBUG=${TORCH_COMPILE_DEBUG:-0}
   # Use Triton for A100 (better kernel generation)
-  if [ "$GPU_MEM" -ge 38000 ]; then
+  if [ "${GPU_MEM:-0}" -ge 38000 ]; then
     export TORCHINDUCTOR_TRITON_CUDAGRAPHS=${TORCHINDUCTOR_TRITON_CUDAGRAPHS:-1}
   fi
 fi
@@ -692,62 +716,41 @@ LOGIT_SOFTCAP=${LOGIT_SOFTCAP:-0}
 MTP_LOSS_WEIGHT=${MTP_LOSS_WEIGHT:-0.1}
 
 # ============================================================
-# GPU detection and auto-optimization
-# ============================================================
-detect_gpu_count() {
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi --list-gpus 2>/dev/null | wc -l | tr -d ' '
-  elif [ -n "${CUDA_VISIBLE_DEVICES:-}" ]; then
-    echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l | tr -d ' '
-  else
-    echo "1"
-  fi
-}
-
-detect_gpu_memory() {
-  if command -v nvidia-smi >/dev/null 2>&1; then
-    nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '
-  else
-    echo "0"
-  fi
-}
-
-NUM_GPUS=${NUM_GPUS:-$(detect_gpu_count)}
-GPU_MEM=${GPU_MEM:-$(detect_gpu_memory)}
-
 # Auto-configure batch size based on GPU memory
+# ============================================================
+# Note: These are conservative defaults for hidden_size=512, seq_len=512
+# Larger models or longer sequences need smaller batch sizes
 if [ -z "${BATCH_SIZE:-}" ]; then
-  if [ "$GPU_MEM" -ge 70000 ]; then
-    # A100 80GB or similar - maximize throughput
-    BATCH_SIZE=384
-    ACCUM_STEPS=1
-    NUM_WORKERS=12
+  if [ "${GPU_MEM:-0}" -ge 70000 ]; then
+    # A100 80GB - conservative default, use GRAD_CKPT=1 for larger batches
+    BATCH_SIZE=128
+    ACCUM_STEPS=2
+    NUM_WORKERS=8
     PREFETCH_FACTOR=4
-    echo "[gpu] A100 80GB detected, using max-throughput settings: batch=$BATCH_SIZE"
+    echo "[gpu] A100 80GB detected: batch=$BATCH_SIZE (use GRAD_CKPT=1 for larger)"
     # A100-specific CUDA optimizations
     export CUDA_LAUNCH_BLOCKING=0
     export CUDA_DEVICE_MAX_CONNECTIONS=1
-    # Enable TF32 for A100 (faster than FP32, more accurate than FP16)
     export NVIDIA_TF32_OVERRIDE=1
-  elif [ "$GPU_MEM" -ge 38000 ]; then
+  elif [ "${GPU_MEM:-0}" -ge 38000 ]; then
     # A100 40GB or A6000
-    BATCH_SIZE=192
-    ACCUM_STEPS=1
+    BATCH_SIZE=64
+    ACCUM_STEPS=4
     NUM_WORKERS=8
     PREFETCH_FACTOR=4
     echo "[gpu] 40GB+ GPU detected: batch=$BATCH_SIZE, accum=$ACCUM_STEPS"
     export NVIDIA_TF32_OVERRIDE=1
-  elif [ "$GPU_MEM" -ge 20000 ]; then
+  elif [ "${GPU_MEM:-0}" -ge 20000 ]; then
     # RTX 3090/4090 24GB
-    BATCH_SIZE=96
-    ACCUM_STEPS=2
+    BATCH_SIZE=32
+    ACCUM_STEPS=8
     NUM_WORKERS=4
     PREFETCH_FACTOR=2
     echo "[gpu] 24GB GPU detected: batch=$BATCH_SIZE, accum=$ACCUM_STEPS"
   else
     # Smaller GPUs or CPU
-    BATCH_SIZE=32
-    ACCUM_STEPS=8
+    BATCH_SIZE=16
+    ACCUM_STEPS=16
     NUM_WORKERS=2
     PREFETCH_FACTOR=2
     echo "[gpu] Standard settings: batch=$BATCH_SIZE, accum=$ACCUM_STEPS"
@@ -1043,10 +1046,10 @@ if [ "${GRAD_CKPT:-0}" -eq 1 ]; then
   EXTRA_PRETRAIN_ARGS+=(--gradient_checkpointing)
 fi
 
-# A100-specific: larger sequence length for better GPU utilization
-if [ "$GPU_MEM" -ge 70000 ] && [ -z "${MODEL_SEQ_LEN_SET:-}" ]; then
-  if [ "$MODEL_SEQ_LEN" -lt 1024 ]; then
-    echo "[a100] Consider using MODEL_SEQ_LEN=1024 for better A100 utilization"
+# A100-specific tips
+if [ "${GPU_MEM:-0}" -ge 70000 ]; then
+  if [ "${GRAD_CKPT:-0}" -eq 0 ]; then
+    echo "[a100] Tip: Use GRAD_CKPT=1 to enable larger batch sizes (e.g., BATCH_SIZE=256)"
   fi
 fi
 
