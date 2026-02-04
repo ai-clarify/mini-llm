@@ -609,10 +609,20 @@ USE_MOE=${USE_MOE:-false}
 # ============================================================
 # Training optimizations (modded-nanogpt style)
 # ============================================================
-# TURBO=1 enables all optimizations at once
+# TURBO=1 enables all optimizations (including Muon, may be slower on small models)
+# TURBO=2 enables optimizations without Muon (recommended for <500M params)
 TURBO=${TURBO:-0}
-if [ "$TURBO" -eq 1 ]; then
-  echo "[turbo] Enabling all modded-nanogpt optimizations"
+if [ "$TURBO" -eq 2 ]; then
+  echo "[turbo] Enabling optimizations (lite mode, AdamW)"
+  OPTIMIZER=${OPTIMIZER:-adamw}
+  ZERO_INIT_PROJ=${ZERO_INIT_PROJ:-1}
+  BACK_OUT_LAYERS=${BACK_OUT_LAYERS:-2}
+  CAUTIOUS_WD=${CAUTIOUS_WD:-0}
+  QK_NORM=${QK_NORM:-1}
+  LOGIT_SOFTCAP=${LOGIT_SOFTCAP:-30}
+  MTP_LOSS_WEIGHT=${MTP_LOSS_WEIGHT:-0.15}
+elif [ "$TURBO" -eq 1 ]; then
+  echo "[turbo] Enabling all modded-nanogpt optimizations (Muon)"
   OPTIMIZER=${OPTIMIZER:-muon}
   ZERO_INIT_PROJ=${ZERO_INIT_PROJ:-1}
   BACK_OUT_LAYERS=${BACK_OUT_LAYERS:-4}

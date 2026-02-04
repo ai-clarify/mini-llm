@@ -18,10 +18,12 @@ from torch import Tensor
 from torch.optim import Optimizer
 
 
-def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) -> Tensor:
+@torch.compile(disable=not torch.cuda.is_available())
+def zeropower_via_newtonschulz5(G: Tensor, steps: int = 3, eps: float = 1e-7) -> Tensor:
     """
     Newton-Schulz iteration to compute orthogonal matrix.
-    Approximately computes G @ (G.T @ G)^(-1/2) using 5 iterations.
+    Approximately computes G @ (G.T @ G)^(-1/2).
+    Using 3 iterations (faster) instead of 5 (more accurate).
     """
     assert G.ndim >= 2
     a, b, c = (3.4445, -4.7750, 2.0315)  # Optimized coefficients
@@ -36,11 +38,16 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 5, eps: float = 1e-7) ->
     # Normalize
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + eps)
 
-    # Newton-Schulz iterations
-    for _ in range(steps):
-        A = X.mT @ X
-        B = a * A + b * (A @ A) + c * (A @ A @ A)
-        X = X @ B
+    # Newton-Schulz iterations (unrolled for torch.compile)
+    A = X.mT @ X
+    B = a * A + b * (A @ A) + c * (A @ A @ A)
+    X = X @ B
+    A = X.mT @ X
+    B = a * A + b * (A @ A) + c * (A @ A @ A)
+    X = X @ B
+    A = X.mT @ X
+    B = a * A + b * (A @ A) + c * (A @ A @ A)
+    X = X @ B
 
     if transposed:
         X = X.mT
@@ -144,7 +151,8 @@ class Muon(Optimizer):
                 state = self.state[p]
 
                 # Check if this is a 2D weight matrix (use Muon) or 1D (use AdamW)
-                use_muon = p.ndim >= 2 and p.size(-1) >= 128 and p.size(-2) >= 128
+                # Only use Muon for larger matrices where orthogonalization helps
+                use_muon = p.ndim >= 2 and min(p.size(-1), p.size(-2)) >= 256
 
                 if use_muon:
                     # Muon update for 2D matrices

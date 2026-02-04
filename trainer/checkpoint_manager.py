@@ -134,7 +134,11 @@ def load_checkpoint(
     _unwrap_model(model).load_state_dict(model_state, strict=False)
 
     opt_state = torch.load(opt_path, map_location=device)
-    optimizer.load_state_dict(opt_state.get("optimizer", {}))
+    try:
+        optimizer.load_state_dict(opt_state.get("optimizer", {}))
+    except ValueError as e:
+        # Optimizer type changed (e.g., AdamW -> Muon), skip loading optimizer state
+        print(f"[checkpoint] Warning: Optimizer state mismatch, starting fresh optimizer: {e}")
     scaler.load_state_dict(opt_state.get("scaler", {}))
 
     if os.path.isfile(rng_path):
