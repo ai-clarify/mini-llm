@@ -30,6 +30,12 @@ from trainer.training_schedule import apply_projection_zero_init, apply_back_out
 
 warnings.filterwarnings('ignore')
 
+# CUDA optimizations
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True  # Allow TF32 for faster matmul
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True  # Auto-tune convolutions
+    torch.set_float32_matmul_precision('high')  # Use TF32 for float32 matmuls
 
 training_state = {"max_steps": None, "global_step": 0, "stop": False}
 ckpt_root = None
@@ -178,6 +184,16 @@ def init_model(lm_config):
     model = model.to(args.device)
     Logger(f'LLM可训练总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
 
+    # Gradient checkpointing to save memory
+    if args.gradient_checkpointing:
+        Logger('[optim] Enabling gradient checkpointing')
+        if hasattr(model, 'gradient_checkpointing_enable'):
+            model.gradient_checkpointing_enable()
+        else:
+            # Manual gradient checkpointing for custom models
+            from torch.utils.checkpoint import checkpoint
+            model._gradient_checkpointing = True
+
     # torch.compile for faster training (PyTorch 2.0+)
     if args.use_compile and hasattr(torch, 'compile'):
         Logger('[optim] Compiling model with torch.compile (may take a few minutes on first run)')
@@ -273,6 +289,8 @@ if __name__ == "__main__":
     parser.add_argument("--compile_mode", type=str, default="reduce-overhead",
                         choices=["default", "reduce-overhead", "max-autotune"],
                         help="torch.compile mode")
+    parser.add_argument("--gradient_checkpointing", action="store_true",
+                        help="Use gradient checkpointing to save memory (allows larger batch)")
 
     parser.add_argument("--load_from_remote", action="store_true",
                         help="Load pretrained model from /openbayes/home/out instead of local directory")

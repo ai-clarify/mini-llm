@@ -985,6 +985,9 @@ fi
 if [ "$USE_COMPILE" -eq 1 ]; then
   EXTRA_PRETRAIN_ARGS+=(--use_compile)
 fi
+if [ "${GRAD_CKPT:-0}" -eq 1 ]; then
+  EXTRA_PRETRAIN_ARGS+=(--gradient_checkpointing)
+fi
 
 # Check if we should skip pretrain stage
 SHOULD_SKIP_PRETRAIN=0
