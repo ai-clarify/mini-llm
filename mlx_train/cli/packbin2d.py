@@ -108,7 +108,8 @@ def main() -> None:
         action="store_true",
         help="Always re-tokenize even if input already has `ids`.",
     )
-    parser.add_argument("--log_interval", type=int, default=10000)
+    parser.add_argument("--log_interval", type=int, default=5000)
+    parser.add_argument("--show_progress", action="store_true", help="Show tqdm progress bar if available.")
 
     args = parser.parse_args()
 
@@ -136,6 +137,27 @@ def main() -> None:
     )
     paths = resolve_jsonl_paths(data_spec)
 
+    # Try to count total lines for progress bar
+    total_lines = None
+    if args.show_progress:
+        try:
+            total_lines = 0
+            for p in paths:
+                with open(p, "r", encoding="utf-8") as f:
+                    total_lines += sum(1 for _ in f)
+            print(f"[packbin2d] Total lines to process: {total_lines:,}")
+        except Exception:
+            total_lines = None
+
+    # Try to use tqdm for progress
+    tqdm_iter = None
+    if args.show_progress:
+        try:
+            from tqdm import tqdm
+            tqdm_iter = tqdm
+        except ImportError:
+            print("[packbin2d] Install tqdm for progress bar: pip install tqdm")
+
     out_prefix = str(args.out_prefix)
     out_dir = os.path.dirname(out_prefix) or "."
     os.makedirs(out_dir, exist_ok=True)
@@ -161,7 +183,16 @@ def main() -> None:
         lbl_bin = open(lbl_bin_path, "wb") if with_labels else None
         lbl_idx = open(lbl_idx_path, "wb") if with_labels else None
         try:
-            for obj in cast(Iterable[Dict[str, Any]], iter_jsonl(paths)):
+            data_iter: Iterable[Dict[str, Any]] = iter_jsonl(paths)
+            if tqdm_iter is not None:
+                data_iter = tqdm_iter(
+                    data_iter,
+                    total=total_lines,
+                    desc="Processing",
+                    unit=" samples",
+                    dynamic_ncols=True,
+                )
+            for obj in cast(Iterable[Dict[str, Any]], data_iter):
                 ids = None if bool(args.retokenize) else _as_ids(obj)
                 if ids is None:
                     ids = _encode_sample(obj, tokenizer=tokenizer, task=args.task)
@@ -185,14 +216,25 @@ def main() -> None:
                     lbl_offset += len(pos)
 
                 n += 1
-                if int(args.log_interval) > 0 and n % int(args.log_interval) == 0:
+                if tqdm_iter is None and int(args.log_interval) > 0 and n % int(args.log_interval) == 0:
                     dt = time.time() - t0
-                    print(f"[packbin2d] n={n} {n / max(dt, 1e-6):.0f} lines/s")
+                    rate = n / max(dt, 1e-6)
+                    eta = (total_lines - n) / rate if total_lines else 0
+                    eta_str = f" ETA: {eta/60:.1f}min" if total_lines else ""
+                    pct = f"{100*n/total_lines:.1f}%" if total_lines else "?"
+                    msg = f"\r[packbin2d] {n:,}/{total_lines or '?':,} ({pct}) {rate:.0f}/s{eta_str}    "
+                    sys.stdout.write(msg)
+                    sys.stdout.flush()
         finally:
             if lbl_bin is not None:
                 lbl_bin.close()
             if lbl_idx is not None:
                 lbl_idx.close()
+
+    # Clear the progress line if we were using inline progress
+    if tqdm_iter is None and args.show_progress and n > 0:
+        sys.stdout.write("\r" + " " * 80 + "\r")
+        sys.stdout.flush()
 
     meta = {
         "version": 1,

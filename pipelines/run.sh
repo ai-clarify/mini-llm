@@ -705,7 +705,8 @@ preprocess_to_bin2d() {
     --task "$task" \
     --tokenizer_path ./model \
     --tokenizer_type "$TOKENIZER_TYPE" \
-    --log_interval 50000 || {
+    --show_progress \
+    --log_interval 5000 || {
       echo "[preprocess] Failed, using original JSONL"
       echo "$input_path"
       return 0
