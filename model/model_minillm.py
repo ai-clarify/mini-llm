@@ -485,39 +485,63 @@ class MiniLLMAttention(nn.Module):
             key_states = key_states.view(bsz, pair_h, 2, k_len, self.q_head_dim).mean(dim=2)
             value_states = value_states.view(bsz, pair_h, 2, k_len, self.v_head_dim).mean(dim=2)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.softmax_scale
-
-        if attention_mask is not None:
-            if attention_mask.dim() == 2:
-                pad = (1.0 - attention_mask[:, None, None, :]) * -1e9
-                attn_weights = attn_weights + pad
-            else:
-                attn_weights = attn_weights + attention_mask
-
-        if q_len > 1:
-            q_positions = torch.arange(q_len, device=attn_weights.device) + past_len
-            k_positions = torch.arange(k_len, device=attn_weights.device)
-            causal = k_positions[None, :] > q_positions[:, None]
-            attn_weights = attn_weights + causal.to(attn_weights.dtype) * -1e9
-
-        if self.attn_window > 0:
-            q_positions = torch.arange(q_len, device=attn_weights.device) + past_len
-            k_positions = torch.arange(k_len, device=attn_weights.device)
-            allow = k_positions[None, :] >= (q_positions[:, None] - int(self.attn_window) + 1)
-            allow = allow & (k_positions[None, :] <= q_positions[:, None])
-            if self.attn_global_tokens > 0:
-                allow = allow | (k_positions[None, :] < int(self.attn_global_tokens))
-            attn_weights = attn_weights + (~allow).to(attn_weights.dtype) * -1e9
-
+        # Fast path: use SDPA (Flash Attention) when possible
         topk_idx = self.indexer(hidden_states=x, attention_mask=attention_mask, past_len=past_len)
-        if topk_idx is not None:
-            index_mask = attn_weights.new_full((bsz, q_len, k_len), float("-inf"))
-            index_mask.scatter_(-1, topk_idx, 0.0)
-            attn_weights = attn_weights + index_mask.unsqueeze(1)
+        use_sdpa = (
+            self.training
+            and self.attn_window == 0
+            and topk_idx is None
+            and self.attn_head_gate is None
+            and attention_mask is None
+            and past_len == 0
+            and hasattr(F, 'scaled_dot_product_attention')
+        )
 
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(query_states)
-        attn_weights = self.attn_dropout(attn_weights)
-        attn_output = torch.matmul(attn_weights, value_states)
+        if use_sdpa:
+            # Use PyTorch's SDPA with Flash Attention
+            attn_output = F.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=None,
+                dropout_p=self.attn_dropout.p if self.training else 0.0,
+                is_causal=True,
+                scale=self.softmax_scale,
+            )
+        else:
+            # Manual attention computation (fallback)
+            attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) * self.softmax_scale
+
+            if attention_mask is not None:
+                if attention_mask.dim() == 2:
+                    pad = (1.0 - attention_mask[:, None, None, :]) * -1e9
+                    attn_weights = attn_weights + pad
+                else:
+                    attn_weights = attn_weights + attention_mask
+
+            if q_len > 1:
+                q_positions = torch.arange(q_len, device=attn_weights.device) + past_len
+                k_positions = torch.arange(k_len, device=attn_weights.device)
+                causal = k_positions[None, :] > q_positions[:, None]
+                attn_weights = attn_weights + causal.to(attn_weights.dtype) * -1e9
+
+            if self.attn_window > 0:
+                q_positions = torch.arange(q_len, device=attn_weights.device) + past_len
+                k_positions = torch.arange(k_len, device=attn_weights.device)
+                allow = k_positions[None, :] >= (q_positions[:, None] - int(self.attn_window) + 1)
+                allow = allow & (k_positions[None, :] <= q_positions[:, None])
+                if self.attn_global_tokens > 0:
+                    allow = allow | (k_positions[None, :] < int(self.attn_global_tokens))
+                attn_weights = attn_weights + (~allow).to(attn_weights.dtype) * -1e9
+
+            if topk_idx is not None:
+                index_mask = attn_weights.new_full((bsz, q_len, k_len), float("-inf"))
+                index_mask.scatter_(-1, topk_idx, 0.0)
+                attn_weights = attn_weights + index_mask.unsqueeze(1)
+
+            attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).type_as(query_states)
+            attn_weights = self.attn_dropout(attn_weights)
+            attn_output = torch.matmul(attn_weights, value_states)
         if paired:
             attn_output = attn_output.repeat_interleave(2, dim=1)
         if self.attn_head_gate is not None:

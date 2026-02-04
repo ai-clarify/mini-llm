@@ -177,6 +177,12 @@ def init_model(lm_config):
 
     model = model.to(args.device)
     Logger(f'LLM可训练总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
+
+    # torch.compile for faster training (PyTorch 2.0+)
+    if args.use_compile and hasattr(torch, 'compile'):
+        Logger('[optim] Compiling model with torch.compile (may take a few minutes on first run)')
+        model = torch.compile(model, mode=args.compile_mode)
+
     return model, tokenizer
 
 
@@ -262,6 +268,12 @@ if __name__ == "__main__":
     # Pretrained model checkpoint arguments
     parser.add_argument("--pretrained_path", type=str, default=None,
                         help="Path to pretrained model checkpoint (supports /openbayes/home/out)")
+    # torch.compile for faster training
+    parser.add_argument("--use_compile", action="store_true", help="Use torch.compile for faster training")
+    parser.add_argument("--compile_mode", type=str, default="reduce-overhead",
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile mode")
+
     parser.add_argument("--load_from_remote", action="store_true",
                         help="Load pretrained model from /openbayes/home/out instead of local directory")
     args = parser.parse_args()

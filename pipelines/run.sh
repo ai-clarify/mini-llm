@@ -612,24 +612,27 @@ USE_MOE=${USE_MOE:-false}
 # TURBO=1 enables all optimizations (including Muon, may be slower on small models)
 # TURBO=2 enables optimizations without Muon (recommended for <500M params)
 TURBO=${TURBO:-0}
+USE_COMPILE=${USE_COMPILE:-0}
 if [ "$TURBO" -eq 2 ]; then
-  echo "[turbo] Enabling optimizations (lite mode, AdamW)"
+  echo "[turbo] Enabling optimizations (lite mode, AdamW + compile)"
   OPTIMIZER=${OPTIMIZER:-adamw}
   ZERO_INIT_PROJ=${ZERO_INIT_PROJ:-1}
   BACK_OUT_LAYERS=${BACK_OUT_LAYERS:-2}
   CAUTIOUS_WD=${CAUTIOUS_WD:-0}
   QK_NORM=${QK_NORM:-1}
   LOGIT_SOFTCAP=${LOGIT_SOFTCAP:-30}
-  MTP_LOSS_WEIGHT=${MTP_LOSS_WEIGHT:-0.15}
+  MTP_LOSS_WEIGHT=${MTP_LOSS_WEIGHT:-0.1}
+  USE_COMPILE=${USE_COMPILE:-1}
 elif [ "$TURBO" -eq 1 ]; then
-  echo "[turbo] Enabling all modded-nanogpt optimizations (Muon)"
+  echo "[turbo] Enabling all modded-nanogpt optimizations (Muon + compile)"
   OPTIMIZER=${OPTIMIZER:-muon}
   ZERO_INIT_PROJ=${ZERO_INIT_PROJ:-1}
   BACK_OUT_LAYERS=${BACK_OUT_LAYERS:-4}
   CAUTIOUS_WD=${CAUTIOUS_WD:-1}
   QK_NORM=${QK_NORM:-1}
   LOGIT_SOFTCAP=${LOGIT_SOFTCAP:-30}
-  MTP_LOSS_WEIGHT=${MTP_LOSS_WEIGHT:-0.15}
+  MTP_LOSS_WEIGHT=${MTP_LOSS_WEIGHT:-0.1}
+  USE_COMPILE=${USE_COMPILE:-1}
 fi
 
 # Optimizer: adamw (default) or muon (Newton-Schulz orthogonalization)
@@ -978,6 +981,9 @@ if [ "$QK_NORM" -eq 1 ]; then
 fi
 if [ "$LOGIT_SOFTCAP" != "0" ]; then
   EXTRA_PRETRAIN_ARGS+=(--logit_softcap "$LOGIT_SOFTCAP")
+fi
+if [ "$USE_COMPILE" -eq 1 ]; then
+  EXTRA_PRETRAIN_ARGS+=(--use_compile)
 fi
 
 # Check if we should skip pretrain stage
