@@ -25,6 +25,8 @@ from dataset.lm_dataset import PretrainDataset
 from checkpoint_loader import CheckpointLoader
 from trainer import checkpoint_manager
 from trainer.loss_utils import compute_mtp_loss
+from trainer.muon import Muon, get_muon_param_groups
+from trainer.training_schedule import apply_projection_zero_init, apply_back_out_scaling
 
 warnings.filterwarnings('ignore')
 
@@ -88,20 +90,24 @@ def train_epoch(epoch, wandb):
 
         if step % args.log_interval == 0 or step == iter_per_epoch - 1:
             spend_time = time.time() - start_time
+            # Calculate ETA: (time_per_step * remaining_steps) / 60
+            time_per_step = spend_time / (step + 1)
+            remaining_steps = iter_per_epoch - step - 1
+            eta_min = time_per_step * remaining_steps / 60
             Logger(
-                'Epoch:[{}/{}]({}/{}) loss:{:.6f} lr:{:.12f} epoch_Time:{}min:'.format(
+                'Epoch:[{}/{}]({}/{}) loss:{:.6f} lr:{:.12f} ETA:{:.1f}min'.format(
                     epoch + 1,
                     args.epochs,
                     step,
                     iter_per_epoch,
                     loss.item() * args.accumulation_steps,
                     optimizer.param_groups[-1]['lr'],
-                    spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60))
+                    eta_min))
 
             if (wandb is not None) and (not ddp or dist.get_rank() == 0):
                 wandb.log({"loss": loss.item() * args.accumulation_steps,
                            "lr": optimizer.param_groups[-1]['lr'],
-                           "epoch_Time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60})
+                           "eta_min": eta_min})
 
             if writer is not None and (not ddp or dist.get_rank() == 0):
                 global_step = training_state["global_step"]
@@ -239,6 +245,20 @@ if __name__ == "__main__":
     parser.add_argument("--value_mix", type=float, default=0.0)
     parser.add_argument("--logit_softcap", type=float, default=0.0)
 
+    # Optimizer arguments (modded-nanogpt style)
+    parser.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "muon"],
+                        help="Optimizer: adamw or muon (Newton-Schulz orthogonalization)")
+    parser.add_argument("--muon_lr", type=float, default=0.02, help="Learning rate for Muon (2D params)")
+    parser.add_argument("--muon_momentum", type=float, default=0.95, help="Momentum for Muon")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
+    parser.add_argument("--cautious_wd", action="store_true", help="Cautious weight decay (only when grad and param agree)")
+
+    # Training optimizations (modded-nanogpt style)
+    parser.add_argument("--zero_init_proj", action="store_true",
+                        help="Zero-init output projections (muP-like)")
+    parser.add_argument("--back_out_layers", type=int, default=0,
+                        help="Number of early layers to scale down (back out contributions)")
+
     # Pretrained model checkpoint arguments
     parser.add_argument("--pretrained_path", type=str, default=None,
                         help="Path to pretrained model checkpoint (supports /openbayes/home/out)")
@@ -301,6 +321,16 @@ if __name__ == "__main__":
         writer = SummaryWriter(log_dir=args.tensorboard_dir)
 
     model, tokenizer = init_model(lm_config)
+
+    # Apply modded-nanogpt style optimizations
+    if args.zero_init_proj:
+        Logger("[optim] Applying projection zero-init (muP-like)")
+        apply_projection_zero_init(model)
+
+    if args.back_out_layers > 0:
+        Logger(f"[optim] Applying back-out scaling to first {args.back_out_layers} layers")
+        apply_back_out_scaling(model, back_out_layers=args.back_out_layers)
+
     train_ds = PretrainDataset(
         args.data_path,
         tokenizer,
@@ -324,7 +354,30 @@ if __name__ == "__main__":
     )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+
+    # Optimizer selection
+    if args.optimizer == "muon":
+        Logger("[optim] Using Muon optimizer (Newton-Schulz orthogonalization)")
+        param_groups = get_muon_param_groups(
+            model,
+            lr=args.muon_lr,
+            adamw_lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
+        optimizer = Muon(
+            param_groups,
+            lr=args.muon_lr,
+            momentum=args.muon_momentum,
+            adamw_lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+            cautious=args.cautious_wd,
+        )
+    else:
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=args.learning_rate,
+            weight_decay=args.weight_decay,
+        )
 
     if ddp:
         model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
