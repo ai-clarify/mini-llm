@@ -698,6 +698,8 @@ preprocess_to_bin2d() {
   fi
 
   echo "[preprocess] Converting $input_path to bin2d format..."
+  # Use all available CPU cores for preprocessing
+  PREPROCESS_WORKERS=${PREPROCESS_WORKERS:-0}
   python -m mlx_train.cli.packbin2d \
     --data_path "$input_path" \
     --out_prefix "$out_prefix" \
@@ -706,6 +708,8 @@ preprocess_to_bin2d() {
     --tokenizer_path ./model \
     --tokenizer_type "$TOKENIZER_TYPE" \
     --show_progress \
+    --num_workers "$PREPROCESS_WORKERS" \
+    --chunk_size 500 \
     --log_interval 5000 || {
       echo "[preprocess] Failed, using original JSONL"
       echo "$input_path"
