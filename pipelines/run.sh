@@ -667,8 +667,10 @@ fi
 if [ "$TURBO" -eq 2 ]; then
   echo "[turbo] Enabling optimizations (lite mode, AdamW + compile)"
   OPTIMIZER=${OPTIMIZER:-adamw}
-  ZERO_INIT_PROJ=${ZERO_INIT_PROJ:-1}
-  BACK_OUT_LAYERS=${BACK_OUT_LAYERS:-2}
+  # NOTE: ZERO_INIT_PROJ disabled - incompatible with tie_word_embeddings=True
+  # When all projection outputs are zero, model degrades to embedding lookup
+  ZERO_INIT_PROJ=${ZERO_INIT_PROJ:-0}
+  BACK_OUT_LAYERS=${BACK_OUT_LAYERS:-0}
   CAUTIOUS_WD=${CAUTIOUS_WD:-0}
   QK_NORM=${QK_NORM:-1}
   LOGIT_SOFTCAP=${LOGIT_SOFTCAP:-30}
@@ -677,8 +679,9 @@ if [ "$TURBO" -eq 2 ]; then
 elif [ "$TURBO" -eq 1 ]; then
   echo "[turbo] Enabling all modded-nanogpt optimizations (Muon + compile)"
   OPTIMIZER=${OPTIMIZER:-muon}
-  ZERO_INIT_PROJ=${ZERO_INIT_PROJ:-1}
-  BACK_OUT_LAYERS=${BACK_OUT_LAYERS:-4}
+  # NOTE: ZERO_INIT_PROJ disabled - incompatible with tie_word_embeddings=True
+  ZERO_INIT_PROJ=${ZERO_INIT_PROJ:-0}
+  BACK_OUT_LAYERS=${BACK_OUT_LAYERS:-0}
   CAUTIOUS_WD=${CAUTIOUS_WD:-1}
   QK_NORM=${QK_NORM:-1}
   LOGIT_SOFTCAP=${LOGIT_SOFTCAP:-30}
